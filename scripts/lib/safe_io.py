@@ -604,6 +604,25 @@ def write_nofollow(base: str, rel: str, data: bytes, append: bool = False, exclu
     return rel if isinstance(base, int) else os.path.join(base, rel)
 
 
+def chmod_nofollow(base, rel: str, mode: int) -> None:
+    """Change file permissions on plain file base/rel through an O_NOFOLLOW fd (never follows a link)."""
+    fd = open_nofollow(base, rel)
+    try:
+        os.fchmod(fd, mode)
+    finally:
+        os.close(fd)
+
+
+def listdir_nofollow(base, rel: str) -> list[str]:
+    """Sorted directory entries of plain directory base/rel opened with O_NOFOLLOW at every component."""
+    parts = _parts(rel) if rel else []
+    dfd = dir_fd_nofollow(base, parts)
+    try:
+        return sorted(os.listdir(dfd))
+    finally:
+        os.close(dfd)
+
+
 # --------------------------------------------------------------------------- #
 # Self-test
 # --------------------------------------------------------------------------- #
@@ -822,6 +841,28 @@ def _self_test() -> int:
                 res.append(True)
         ok(all(res) and open(os.path.join(out, "v")).read() == "outside" and not os.path.exists(os.path.join(out, "new")),
            f"SI-AR2 appends through a link, a linked directory or a hard link are refused ({res})")
+
+    # S18: chmod_nofollow and listdir_nofollow work on plain paths and refuse symlinks
+    with tempfile.TemporaryDirectory() as d:
+        write_nofollow(d, "sub/a.txt", b"hello", atomic=True)
+        chmod_nofollow(d, "sub/a.txt", 0o444)
+        mode_ok = (os.stat(os.path.join(d, "sub", "a.txt")).st_mode & 0o777) == 0o444
+        chmod_nofollow(d, "sub/a.txt", 0o644)
+        entries = listdir_nofollow(d, "sub")
+        os.symlink(os.path.join(d, "sub"), os.path.join(d, "sub_link"))
+        refused_ld = False
+        try:
+            listdir_nofollow(d, "sub_link")
+        except LinkRefused:
+            refused_ld = True
+        os.symlink(os.path.join(d, "sub", "a.txt"), os.path.join(d, "a_link.txt"))
+        refused_cm = False
+        try:
+            chmod_nofollow(d, "a_link.txt", 0o444)
+        except LinkRefused:
+            refused_cm = True
+        ok(mode_ok and entries == ["a.txt"] and refused_ld and refused_cm,
+           f"S18 chmod_nofollow/listdir_nofollow work on plain paths and refuse symlinks ({mode_ok}, {entries})")
 
     if failures:
         print("FAIL:", file=sys.stderr)

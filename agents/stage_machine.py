@@ -1026,7 +1026,12 @@ def stage_inputs(run_dir: str, question: str) -> list[str]:
     sha256 in data/inputs_provenance.json. Never the evaluation tree (evals/, _truth, any case), and
     never through a link: a symlinked directory or a linked destination is refused (ValueError)."""
     staged = []
-    prov = {"inputs": {}, "cited": _provenance(run_dir).get("cited") or {}}
+    prev = _provenance(run_dir)
+    kept_acq = {k: v for k, v in (prev.get("inputs") or {}).items()
+                if isinstance(v, dict) and v.get("origin") == "acquired"}
+    prov = {"inputs": dict(kept_acq), "cited": prev.get("cited") or {}}
+    if "acquired_inventory_sha256" in prev:
+        prov["acquired_inventory_sha256"] = prev["acquired_inventory_sha256"]
     root = os.path.realpath(REPO)
     for tok in _question_paths(question):
         src = os.path.realpath(os.path.join(root, tok))
