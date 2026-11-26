@@ -3821,6 +3821,7 @@ def _self_test_derivations(ok) -> None:
         except Exception as e:  # noqa: BLE001
             rep(False, f"DI2b import allowlist: {type(e).__name__}: {e}")
     # DS1/DS2/DS3 (docs/design/acquire.md §3.3): narrowed derivation sandbox + no unsandboxed + sanitized error
+    import yaml as _yaml
     with tempfile.TemporaryDirectory() as d_acq, tempfile.TemporaryDirectory() as d_ext:
         d_acq = os.path.realpath(d_acq)
         sentinel = os.path.join(os.path.realpath(d_ext), "secret_outside.txt")
@@ -3845,7 +3846,7 @@ def _self_test_derivations(ok) -> None:
             "    w = csv.writer(g); w.writerow(['id', 'val', 'probe'])\n"
             "    for r in rows[1:]: w.writerow([r[0], r[1], seen])\n"
         )
-        open(os.path.join(d_acq, DERIVATIONS), "w", encoding="utf-8").write(yaml.safe_dump({
+        open(os.path.join(d_acq, DERIVATIONS), "w", encoding="utf-8").write(_yaml.safe_dump({
             "version": 1,
             "derivations": [{
                 "id": "acq_probe", "script": "data/derive/probe.py",
