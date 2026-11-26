@@ -11140,9 +11140,11 @@ def _self_test_acquire(ok, td: str) -> None:
                          allowlist_sha256=ACQ.load_allowlist(al_p)[1])
         _write_json(d_sg, "metadata.json", m_sg_meta)
         child_am = os.path.join(td, "t_acq_amend_child")
-        AM.amend(d_sg, patch={"id": "A_ACQ", "reason": "amend envelope",
-                              "spec": [{"set": "constraints.envelope_usd", "value": 9500}]},
-                 out=child_am, signoff=None, log=lambda *a: None)
+        patch_p = os.path.join(td, "t_acq_amend_patch.yaml")
+        yaml.safe_dump({"id": "A_ACQ", "reason": "amend envelope",
+                        "spec": [{"set": "constraints.envelope_usd", "value": 9500}]},
+                       open(patch_p, "w", encoding="utf-8"), sort_keys=False)
+        AM.amend(d_sg, patch=patch_p, out=child_am, signoff=None, log=lambda *a: None)
         c_meta = json.load(open(os.path.join(child_am, "metadata.json")))
         c_st = load_state(child_am)
         ok(os.path.isfile(os.path.join(child_am, acq_sg_rel))
