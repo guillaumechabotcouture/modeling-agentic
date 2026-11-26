@@ -1894,6 +1894,25 @@ def _narrow_ro_prefixes() -> list[str]:
     return mounts
 
 
+def _narrow_ancestor_dirs(paths: list[str], covered_dirs: set[str]) -> list[str]:
+    """Strict ancestor directories of `paths` (shallowest first) to create with mode 0755 before binding,
+    so root-started bwrap-sudo + setpriv never encounters 0700 root-owned auto-created parents."""
+    skip = {"/", "/dev", "/proc", "/tmp", "/bin", "/sbin", "/lib", "/lib64", "/lib32"} | {
+        os.path.normpath(p).rstrip("/") for p in paths if p
+    }
+    ancs: set[str] = set()
+    for p in paths:
+        cur = os.path.dirname(os.path.normpath(p))
+        while cur and cur != "/":
+            if cur not in skip and not cur.startswith("/tmp/") and not any(cur.startswith(d + "/") for d in covered_dirs):
+                ancs.add(cur)
+            nxt = os.path.dirname(cur)
+            if nxt == cur:
+                break
+            cur = nxt
+    return sorted(ancs, key=lambda d: (d.count("/"), d))
+
+
 def _bwrap_narrow_cmd(kind: str, binds: list, envargs: list, chdir: str, child: list) -> list:
     """Narrowed bubblewrap command for runs with acquired inputs (DS1): NO `--ro-bind / /`.
     Mounts only the interpreter/library prefixes, this launcher script, `work`, and declared inputs."""
@@ -1905,18 +1924,26 @@ def _bwrap_narrow_cmd(kind: str, binds: list, envargs: list, chdir: str, child: 
         ns = ["--unshare-net", "--unshare-pid", "--unshare-ipc", "--unshare-uts", "--unshare-cgroup-try"]
         drop = ["setpriv", "--reuid", uid, "--regid", gid, "--clear-groups", "--no-new-privs", "--inh-caps=-all",
                 "--bounding-set=-all", "--"]
+    ro_list = _narrow_ro_prefixes()
+    launcher = os.path.abspath(__file__)
+    bind_dests = [
+        binds[i + 2] for i in range(len(binds) - 2)
+        if binds[i] in ("--bind", "--ro-bind") and isinstance(binds[i + 2], str)
+    ]
+    covered_dirs = {os.path.normpath(p).rstrip("/") for p in ro_list if p and os.path.isdir(p)}
     top_binds: list[str] = []
     for top in ("/bin", "/sbin", "/lib", "/lib64", "/lib32"):
         if os.path.islink(top):
             top_binds += ["--symlink", os.readlink(top), top]
         elif os.path.isdir(top):
             top_binds += ["--ro-bind", top, top]
-    for p in _narrow_ro_prefixes():
+    for anc in _narrow_ancestor_dirs([*ro_list, launcher, *bind_dests], covered_dirs):
+        top_binds += ["--perms", "0755", "--dir", anc]
+    for p in ro_list:
         top_binds += ["--ro-bind", p, p]
-    launcher = os.path.abspath(__file__)
     top_binds += ["--ro-bind", launcher, launcher]
     return (["sudo", "-n"] if kind == "bwrap-sudo" else []) + [
-        "bwrap", "--dev", "/dev", "--proc", "/proc", "--tmpfs", "/tmp",
+        "bwrap", "--dev", "/dev", "--proc", "/proc", "--perms", "1777", "--tmpfs", "/tmp",
         *top_binds, *binds, *ns, "--die-with-parent", "--new-session", "--clearenv",
         *envargs, "--chdir", chdir, *drop, *child,
     ]
