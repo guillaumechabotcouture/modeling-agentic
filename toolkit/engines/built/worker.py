@@ -293,6 +293,26 @@ def _ro_mount_prefixes() -> list[str]:
     return mounts
 
 
+def _ancestor_dirs(paths: list[str]) -> list[str]:
+    """Return strict ancestor directories of `paths` (shallowest first) that bubblewrap would otherwise
+    auto-synthesize as `0700` owned by root under `bwrap-sudo` (causing EACCES after `setpriv` drops uid)."""
+    covered_dirs = {os.path.normpath(p).rstrip("/") for p in paths if p and os.path.isdir(p)}
+    skip = {"/", "/dev", "/proc", "/tmp", "/bin", "/sbin", "/lib", "/lib64", "/lib32"} | {
+        os.path.normpath(p).rstrip("/") for p in paths if p
+    }
+    ancs: set[str] = set()
+    for p in paths:
+        cur = os.path.dirname(os.path.normpath(p))
+        while cur and cur != "/":
+            if cur not in skip and not any(cur.startswith(d + "/") for d in covered_dirs):
+                ancs.add(cur)
+            nxt = os.path.dirname(cur)
+            if nxt == cur:
+                break
+            cur = nxt
+    return sorted(ancs, key=lambda d: (d.count("/"), d))
+
+
 def _bwrap_engine_cmd(kind: str, envargs: list[str], child: list[str],
                       *, ro_prefixes: list[str] | None = None) -> list[str]:
     """Build the minimal-mount bubblewrap command (§5.1): NO `--ro-bind / /`.
@@ -307,6 +327,7 @@ def _bwrap_engine_cmd(kind: str, envargs: list[str], child: list[str],
         drop = ["setpriv", "--reuid", uid, "--regid", gid, "--clear-groups", "--no-new-privs",
                 "--inh-caps=-all", "--bounding-set=-all", "--"]
 
+    mount_list = _ro_mount_prefixes() if ro_prefixes is None else list(ro_prefixes)
     binds: list[str] = []
     for top in ("/bin", "/sbin", "/lib", "/lib64", "/lib32"):
         if os.path.islink(top):
@@ -314,7 +335,11 @@ def _bwrap_engine_cmd(kind: str, envargs: list[str], child: list[str],
         elif os.path.isdir(top):
             binds += ["--ro-bind", top, top]
 
-    for p in (_ro_mount_prefixes() if ro_prefixes is None else ro_prefixes):
+    # Pre-create strict ancestor dirs with 0755 so bwrap-sudo + setpriv never hits 0700 root-owned parents
+    for anc in _ancestor_dirs(mount_list):
+        binds += ["--perms", "0755", "--dir", anc]
+
+    for p in mount_list:
         binds += ["--ro-bind", p, p]
 
     # Harness files ONLY, mounted read-only under /harness using PEP 420 namespace packages
@@ -323,9 +348,9 @@ def _bwrap_engine_cmd(kind: str, envargs: list[str], child: list[str],
     hooks_py = os.path.join(ROOT, "toolkit", "engines", "hooks.py")
     worker_py = os.path.abspath(__file__)
     binds += [
-        "--tmpfs", "/harness",
-        "--dir", "/harness/toolkit",
-        "--dir", "/harness/toolkit/engines",
+        "--perms", "0755", "--tmpfs", "/harness",
+        "--perms", "0755", "--dir", "/harness/toolkit",
+        "--perms", "0755", "--dir", "/harness/toolkit/engines",
         "--ro-bind", contract_py, "/harness/toolkit/engines/contract.py",
         "--ro-bind", hooks_py, "/harness/toolkit/engines/hooks.py",
         "--ro-bind", worker_py, "/harness/worker.py",
@@ -335,7 +360,7 @@ def _bwrap_engine_cmd(kind: str, envargs: list[str], child: list[str],
         "bwrap",
         "--dev", "/dev",
         "--proc", "/proc",
-        "--tmpfs", "/tmp",
+        "--perms", "1777", "--tmpfs", "/tmp",
         *binds,
         *ns,
         "--die-with-parent",
@@ -1233,6 +1258,24 @@ def _self_test() -> int:
                                  stdlib_d, os.path.realpath(stdlib_d)))
        and tmp_idx < bind_idx,
        f"BE18d _ro_mount_prefixes covers encodings/os/stdlib (logical+realpath) and --tmpfs /tmp precedes --ro-bind")
+
+    # BE18e: bwrap-sudo pre-creates ancestor dirs (e.g. /opt, /etc, /etc/ssl) with 0755 and /tmp with 1777
+    cmd_perm = _bwrap_engine_cmd("bwrap-sudo", [], [sys.executable, "-s", "-B", "/harness/worker.py", "_probe"],
+                                 ro_prefixes=["/usr", "/opt/runtime", "/etc/ld.so.cache", "/etc/ssl/certs"])
+    def _seq(lst: list[str], sub: list[str]) -> int:
+        for i in range(len(lst) - len(sub) + 1):
+            if lst[i:i + len(sub)] == sub:
+                return i
+        return -1
+    i_tmp = _seq(cmd_perm, ["--perms", "1777", "--tmpfs", "/tmp"])
+    i_opt_d = _seq(cmd_perm, ["--perms", "0755", "--dir", "/opt"])
+    i_opt_b = _seq(cmd_perm, ["--ro-bind", "/opt/runtime", "/opt/runtime"])
+    i_etc_d = _seq(cmd_perm, ["--perms", "0755", "--dir", "/etc"])
+    i_ssl_d = _seq(cmd_perm, ["--perms", "0755", "--dir", "/etc/ssl"])
+    i_ssl_b = _seq(cmd_perm, ["--ro-bind", "/etc/ssl/certs", "/etc/ssl/certs"])
+    i_har = _seq(cmd_perm, ["--perms", "0755", "--tmpfs", "/harness"])
+    ok(i_tmp >= 0 and 0 <= i_opt_d < i_opt_b and 0 <= i_etc_d < i_ssl_d < i_ssl_b and i_har >= 0,
+       f"BE18e bwrap-sudo pre-creates ancestor dirs 0755 before --ro-bind and /tmp 1777 ({i_tmp}, {i_opt_d}<{i_opt_b}, {i_etc_d}<{i_ssl_d}<{i_ssl_b})")
 
     # BE18: in bubblewrap sandbox (Linux CI / Coiled VMs), sentinel file outside mount set cannot be read
     sb = engine_sandbox_kind()
