@@ -449,7 +449,8 @@ def _run(run_dir, spec_rel, adopt, draws, unsigned, log, compute_kw, holder) -> 
     log(f"UQ: {u['data']['fixed_plan'][A.primary]} ({u['data']['label']})")
     cea_res = None
     if ccol is not None:
-        cea_res = CEA.run_cea(A, out0, cost0, collector=ccol, uq_level=u["data"]["interval"].get("level", 0.95))
+        cea_res = CEA.run_cea(A, out0, cost0, collector=ccol, plan=plan,
+                              uq_level=u["data"]["interval"].get("level", 0.95))
         cea_in = [arts["point"], arts["uncertainty"]]
         lt_p = ((spec.raw.get("cost_effectiveness") or {}).get("health_measure") or {}).get("life_table")
         lt_csv = lt_p.get("csv") if isinstance(lt_p, dict) else (lt_p if isinstance(lt_p, str) else None)
