@@ -448,7 +448,7 @@ def problems(spec, card=None, pk: Mapping | None = None) -> list[str]:
 def toy_cea_spec(d: str, *, standalone: bool = True) -> dict:
     """Minimal disease-agnostic valid CEA spec dictionary (with files written inside temp dir `d`)."""
     with open(os.path.join(d, "units.csv"), "w", encoding="utf-8") as f:
-        f.write("id,pop,baseline\nu1,10000,0.2\n")
+        f.write("id,pop,x\nu1,10000,0.2\n")
     with open(os.path.join(d, "life_table.csv"), "w", encoding="utf-8") as f:
         f.write("age,ex\n0,80.0\n10,70.5\n50,32.0\n80,9.0\n")
     raw = {
@@ -461,7 +461,7 @@ def toy_cea_spec(d: str, *, standalone: bool = True) -> dict:
         "decision_units": {
             "csv": "units.csv", "id": "id",
             "populations": {"all": {"column": "pop", "age_groups": ["all"]}},
-            "engine_attributes": {"baseline": {"column": "baseline"}},
+            "engine_attributes": {"x": {"column": "x"}},
         },
         "options": {
             "populations": {"total": "pop"},
@@ -561,7 +561,7 @@ def _self_test() -> int:
 
         # Negotiated price cannot also be drawn in uncertainty.sources (costs)
         raw_neg = copy.deepcopy(raw_st)
-        raw_neg["uncertainty"]["sources"].append({"kind": "costs"})
+        raw_neg["uncertainty"]["sources"].append({"kind": "costs", "items": {"cost_b": [0.8, 1.2]}})
         raw_neg["uncertainty"]["excluded"] = [x for x in raw_neg["uncertainty"]["excluded"] if x.get("kind") != "costs"]
         e_neg = schema.validate(schema.Spec(raw_neg, d, os.path.join(d, "s4.yaml")))
         ok(any("negotiated" in e for e in e_neg),
@@ -585,16 +585,17 @@ def _self_test() -> int:
         # toy_cea_spec omits life_table when deaths=window -> test lifetime + life_table
         raw_lt = copy.deepcopy(raw_st)
         raw_lt["cost_effectiveness"]["time_horizon"]["deaths"] = "lifetime"
-        raw_lt["cost_effectiveness"]["health_measure"]["events"]["deaths"] = {"death": True}
+        raw_lt["cost_effectiveness"]["health_measure"]["events"]["dalys"] = {"death": True}
         raw_lt["cost_effectiveness"]["health_measure"]["life_table"] = {
             "csv": "life_table.csv", "age": "age", "remaining": "ex", "source": "test life table",
         }
         raw_lt["cost_effectiveness"]["health_measure"]["age_at_event"] = {"all": 5.0}
         raw_lt["cost_effectiveness"]["health_measure"]["age_at_event_source"] = "midpoint"
         pairs_lt, lt_ok = load_life_table(schema.Spec(raw_lt, d, os.path.join(d, "s7.yaml")))
+        e_lt = schema.validate(schema.Spec(raw_lt, d, os.path.join(d, "s7.yaml")))
         ex5 = interpolate_life_table(pairs_lt, 5.0)
-        ok(any("objective.discounting.rate" in e for e in e_dr) and lt_ok == [] and abs(ex5 - 75.25) < 1e-12,
-           f"CE_SPEC5 discount-rate consistency enforced and life table interpolates cleanly (ex5={ex5})")
+        ok(any("objective.discounting.rate" in e for e in e_dr) and lt_ok == [] and e_lt == [] and abs(ex5 - 75.25) < 1e-12,
+           f"CE_SPEC5 discount-rate consistency enforced and life table interpolates cleanly (e_dr={e_dr}, e_lt={e_lt}, ex5={ex5})")
 
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
