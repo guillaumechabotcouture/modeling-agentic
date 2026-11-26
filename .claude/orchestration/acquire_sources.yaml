@@ -1,0 +1,384 @@
+version: 1
+# Versioned, disease-agnostic allowlist of public data and literature services for v2 ACQUIRE
+# (docs/design/acquire.md §7). Every enabled source's terms were reviewed and dated below.
+# Never names a disease, country, or subnational unit.
+
+wanted_kinds:
+  - population
+  - burden
+  - coverage
+  - trial_effect
+  - price
+  - context
+
+accepted_licences:
+  - CC-BY-4.0
+  - CC-BY-3.0
+  - CC-BY-3.0-IGO
+  - CC-BY-NC-SA-3.0-IGO
+  - CC0-1.0
+  - PUBLIC-DOMAIN-US-GOV
+  - NLM-TERMS
+  - DHS-AGGREGATE-TERMS
+  - EUROPEPMC-METADATA-OPEN
+
+sources:
+  - id: who_gho
+    holds: "WHO Global Health Observatory OData API: public health indicators by area and year"
+    status: enabled
+    requires_key: false
+    rate_limit:
+      rps: 2.0
+    licence:
+      id: CC-BY-4.0
+      terms_url: "https://www.who.int/about/policies/publishing/data-policy"
+      checked: "2026-11-26"
+      redistribution: allowed
+    endpoints:
+      indicator_catalogue:
+        host: ghoapi.azureedge.net
+        path_template: "/api/Indicator"
+        allowed_content_types: ["application/json"]
+        wanted_kinds: ["burden", "coverage", "context"]
+        catalogue_field: "IndicatorCode"
+        params:
+          $top:
+            type: int_range
+            min: 1
+            max: 500
+            required: false
+      indicator_values:
+        host: ghoapi.azureedge.net
+        path_template: "/api/{indicator_code}"
+        allowed_content_types: ["application/json"]
+        wanted_kinds: ["burden", "coverage", "context"]
+        params:
+          indicator_code:
+            type: code
+            pattern: "^[A-Za-z0-9_.-]{2,80}$"
+            from_catalogue: "who_gho:indicator_catalogue"
+            required: true
+          $top:
+            type: int_range
+            min: 1
+            max: 5000
+            required: false
+
+  - id: worldbank
+    holds: "World Bank Indicators API v2: population, demographics, income, and health expenditure"
+    status: enabled
+    requires_key: false
+    rate_limit:
+      rps: 3.0
+    licence:
+      id: CC-BY-4.0
+      terms_url: "https://datacatalog.worldbank.org/public-licenses#cc-by"
+      checked: "2026-11-26"
+      redistribution: allowed
+    endpoints:
+      indicator_catalogue:
+        host: api.worldbank.org
+        path_template: "/v2/indicator"
+        allowed_content_types: ["application/json"]
+        wanted_kinds: ["population", "context"]
+        catalogue_field: "id"
+        params:
+          format:
+            type: enum
+            values: ["json"]
+            required: true
+          per_page:
+            type: int_range
+            min: 1
+            max: 1000
+            required: false
+          page:
+            type: int_range
+            min: 1
+            max: 100
+            required: false
+      country_catalogue:
+        host: api.worldbank.org
+        path_template: "/v2/country"
+        allowed_content_types: ["application/json"]
+        wanted_kinds: ["population", "context"]
+        catalogue_field: "id"
+        params:
+          format:
+            type: enum
+            values: ["json"]
+            required: true
+          per_page:
+            type: int_range
+            min: 1
+            max: 500
+            required: false
+      indicator_values:
+        host: api.worldbank.org
+        path_template: "/v2/country/{country}/indicator/{indicator}"
+        allowed_content_types: ["application/json"]
+        wanted_kinds: ["population", "context"]
+        params:
+          country:
+            type: code
+            pattern: "^[A-Z]{2,3}(;[A-Z]{2,3}){0,10}$"
+            from_catalogue: "worldbank:country_catalogue"
+            required: true
+          indicator:
+            type: code
+            pattern: "^[A-Za-z0-9._-]{3,80}$"
+            from_catalogue: "worldbank:indicator_catalogue"
+            required: true
+          format:
+            type: enum
+            values: ["json"]
+            required: true
+          date:
+            type: pattern
+            pattern: "^[0-9]{4}(:[0-9]{4})?$"
+            required: false
+          per_page:
+            type: int_range
+            min: 1
+            max: 5000
+            required: false
+
+  - id: dhs_api
+    holds: "DHS Program aggregated indicator API (survey aggregates only; microdata excluded)"
+    status: enabled
+    requires_key: false
+    rate_limit:
+      rps: 2.0
+    licence:
+      id: DHS-AGGREGATE-TERMS
+      terms_url: "https://api.dhsprogram.com/index.html"
+      checked: "2026-11-26"
+      redistribution: allowed
+    endpoints:
+      indicator_catalogue:
+        host: api.dhsprogram.com
+        path_template: "/rest/dhs/indicators"
+        allowed_content_types: ["application/json"]
+        wanted_kinds: ["burden", "coverage"]
+        catalogue_field: "IndicatorId"
+        params:
+          f:
+            type: enum
+            values: ["json"]
+            required: false
+      country_catalogue:
+        host: api.dhsprogram.com
+        path_template: "/rest/dhs/countries"
+        allowed_content_types: ["application/json"]
+        wanted_kinds: ["burden", "coverage"]
+        catalogue_field: "DHS_CountryCode"
+        params:
+          f:
+            type: enum
+            values: ["json"]
+            required: false
+      indicator_data:
+        host: api.dhsprogram.com
+        path_template: "/rest/dhs/data"
+        allowed_content_types: ["application/json"]
+        wanted_kinds: ["burden", "coverage"]
+        params:
+          indicatorIds:
+            type: code
+            pattern: "^[A-Za-z0-9_,-]{2,120}$"
+            from_catalogue: "dhs_api:indicator_catalogue"
+            required: true
+          countryIds:
+            type: code
+            pattern: "^[A-Z,]{2,60}$"
+            from_catalogue: "dhs_api:country_catalogue"
+            required: true
+          breakdown:
+            type: enum
+            values: ["national", "subnational", "all"]
+            required: false
+          perpage:
+            type: int_range
+            min: 1
+            max: 1000
+            required: false
+          f:
+            type: enum
+            values: ["json"]
+            required: false
+
+  - id: europepmc
+    holds: "Europe PMC REST API: literature search, abstracts, and open-access full-text XML"
+    status: enabled
+    requires_key: false
+    rate_limit:
+      rps: 3.0
+    licence:
+      id: EUROPEPMC-METADATA-OPEN
+      terms_url: "https://europepmc.org/Copyright"
+      checked: "2026-11-26"
+      redistribution: per_record
+      accepted_record_licences:
+        - CC-BY-4.0
+        - CC-BY-3.0
+        - CC0-1.0
+        - cc by
+        - cc by 4.0
+        - cc0
+    endpoints:
+      search:
+        host: www.ebi.ac.uk
+        path_template: "/europepmc/webservices/rest/search"
+        allowed_content_types: ["application/json"]
+        wanted_kinds: ["trial_effect", "burden", "coverage"]
+        catalogue_field: "pmcid"
+        params:
+          query:
+            type: terms
+            required: true
+          format:
+            type: enum
+            values: ["json"]
+            required: true
+          resultType:
+            type: enum
+            values: ["lite", "core"]
+            required: false
+          pageSize:
+            type: int_range
+            min: 1
+            max: 20
+            required: false
+      fulltext_xml:
+        host: www.ebi.ac.uk
+        path_template: "/europepmc/webservices/rest/{pmcid}/fullTextXML"
+        allowed_content_types: ["application/xml", "text/xml"]
+        wanted_kinds: ["trial_effect"]
+        params:
+          pmcid:
+            type: code
+            pattern: "^PMC[0-9]{4,12}$"
+            from_catalogue: "europepmc:search"
+            required: true
+
+  - id: pubmed
+    holds: "NCBI E-utilities: literature search and abstract records (in-run use only)"
+    status: enabled
+    requires_key: false
+    rate_limit:
+      rps: 3.0
+    licence:
+      id: NLM-TERMS
+      terms_url: "https://www.ncbi.nlm.nih.gov/home/about/policies/"
+      checked: "2026-11-26"
+      redistribution: not_allowed
+    endpoints:
+      esearch:
+        host: eutils.ncbi.nlm.nih.gov
+        path_template: "/entrez/eutils/esearch.fcgi"
+        allowed_content_types: ["application/json"]
+        wanted_kinds: ["trial_effect", "burden"]
+        catalogue_field: "idlist"
+        params:
+          db:
+            type: enum
+            values: ["pubmed"]
+            required: true
+          term:
+            type: terms
+            required: true
+          retmode:
+            type: enum
+            values: ["json"]
+            required: true
+          retmax:
+            type: int_range
+            min: 1
+            max: 20
+            required: false
+      efetch:
+        host: eutils.ncbi.nlm.nih.gov
+        path_template: "/entrez/eutils/efetch.fcgi"
+        allowed_content_types: ["application/xml", "text/xml", "text/plain"]
+        wanted_kinds: ["trial_effect"]
+        params:
+          db:
+            type: enum
+            values: ["pubmed"]
+            required: true
+          id:
+            type: code
+            pattern: "^[0-9]{4,12}(,[0-9]{4,12}){0,19}$"
+            from_catalogue: "pubmed:esearch"
+            required: true
+          retmode:
+            type: enum
+            values: ["xml"]
+            required: true
+
+  - id: ctgov
+    holds: "ClinicalTrials.gov API v2: registered trials and posted summary results"
+    status: enabled
+    requires_key: false
+    rate_limit:
+      rps: 3.0
+    licence:
+      id: NLM-TERMS
+      terms_url: "https://clinicaltrials.gov/about-site/terms-conditions"
+      checked: "2026-11-26"
+      redistribution: allowed
+    endpoints:
+      studies_search:
+        host: clinicaltrials.gov
+        path_template: "/api/v2/studies"
+        allowed_content_types: ["application/json"]
+        wanted_kinds: ["trial_effect"]
+        catalogue_field: "nctId"
+        params:
+          query.term:
+            type: terms
+            required: true
+          pageSize:
+            type: int_range
+            min: 1
+            max: 20
+            required: false
+      study_detail:
+        host: clinicaltrials.gov
+        path_template: "/api/v2/studies/{nct_id}"
+        allowed_content_types: ["application/json"]
+        wanted_kinds: ["trial_effect"]
+        params:
+          nct_id:
+            type: code
+            pattern: "^NCT[0-9]{8}$"
+            from_catalogue: "ctgov:studies_search"
+            required: true
+
+  - id: un_wpp
+    holds: "UN World Population Prospects: population by age and sex"
+    status: excluded
+    reason: "bulk archives and token-gated portal API excluded in v1"
+    requires_key: true
+    rate_limit:
+      rps: 1.0
+    licence:
+      id: CC-BY-3.0-IGO
+      terms_url: "https://population.un.org/wpp/"
+      checked: "2026-11-26"
+      redistribution: allowed
+    endpoints: {}
+
+  - id: ihme_gbd
+    holds: "Global Burden of Disease aggregated estimates"
+    status: excluded
+    reason: "requires login and non-commercial redistribution terms need owner review"
+    requires_key: true
+    rate_limit:
+      rps: 1.0
+    licence:
+      id: IHME-USER-AGREEMENT
+      terms_url: "https://www.healthdata.org/data-tools-practices/data-practices/terms-and-conditions"
+      checked: "2026-11-26"
+      redistribution: not_allowed
+    endpoints: {}
