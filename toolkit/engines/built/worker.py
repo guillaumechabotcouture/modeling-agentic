@@ -16,9 +16,11 @@ from __future__ import annotations
 import base64
 import copy
 import datetime as _dt
+import encodings
 import hashlib
 import importlib.abc
 import importlib.machinery
+import importlib.util
 import json
 import math
 import os
@@ -26,6 +28,7 @@ import shutil
 import site
 import subprocess
 import sys
+import sysconfig
 import tempfile
 import threading
 import time
@@ -135,14 +138,21 @@ def _ro_mount_prefixes() -> list[str]:
     """Minimal read-only runtime paths needed for Python + numpy/scipy/starsim without mounting `/`,
     the repository, any run directory, home/temp directories, or arbitrary `sys.path` entries."""
     candidates: list[str] = []
+    runtime_paths: list[str] = []
     repo_real = os.path.realpath(ROOT)
-    forbidden = {"/", "/tmp", "/var", "/home", "/root", repo_real}
+    forbidden = {"/", "/tmp", "/var", "/home", "/root", "/bin", "/sbin", "/lib", "/lib64", "/lib32", repo_real}
 
-    def collect(path: str) -> None:
+    def _safe_prefix(path: str) -> bool:
+        return bool(path) and path not in (*forbidden, "/opt", "/usr", "/lib", "/lib64") and not path.startswith(
+            repo_real + os.sep
+        )
+
+    def collect(path: str, *, runtime: bool = False) -> None:
         if not path or not os.path.exists(path):
             return
+        norm = os.path.normpath(os.path.abspath(path))
         real = os.path.realpath(path)
-        for target in dict.fromkeys((os.path.normpath(path), os.path.normpath(real))):
+        for target in dict.fromkeys((norm, real)):
             if target in forbidden:
                 continue
             if target.startswith(repo_real + os.sep):
@@ -150,38 +160,122 @@ def _ro_mount_prefixes() -> list[str]:
                 if not (rel in (".venv", "venv") or rel.startswith((".venv/", "venv/"))):
                     continue
             candidates.append(target)
+            if runtime:
+                runtime_paths.append(target)
+
+    def collect_from_module_file(filepath: str | None, *, pkg_levels: int = 1) -> None:
+        if not filepath or not os.path.exists(filepath):
+            return
+        for base_f in dict.fromkeys((os.path.abspath(filepath), os.path.realpath(filepath))):
+            cur = os.path.dirname(base_f)
+            collect(cur, runtime=True)
+            for _ in range(pkg_levels):
+                cur = os.path.dirname(cur)
+                if _safe_prefix(cur):
+                    collect(cur, runtime=True)
+            if os.path.basename(cur) in ("lib", "lib64"):
+                pref = os.path.dirname(cur)
+                if _safe_prefix(pref):
+                    collect(pref, runtime=True)
 
     # Standard OS runtime libs and dynamic-linker config (no secrets)
     for base in ("/usr", "/etc/ld.so.cache", "/etc/ld.so.conf", "/etc/ld.so.conf.d",
                  "/etc/alternatives", "/etc/ssl/certs"):
         if os.path.exists(base):
             collect(base)
-    # Python interpreter prefixes & executable directory (never arbitrary sys.path entries)
+
+    # Python interpreter prefixes & executable directories (never arbitrary sys.path entries)
+    exe_abs = os.path.abspath(sys.executable)
     exe_real = os.path.realpath(sys.executable)
     exe_gp = os.path.dirname(os.path.dirname(exe_real))
+    base_exe = getattr(sys, "_base_executable", "") or ""
+    base_exe_real = os.path.realpath(base_exe) if base_exe and os.path.exists(base_exe) else ""
+    base_exe_gp = os.path.dirname(os.path.dirname(base_exe_real)) if base_exe_real else ""
     for cand in (
         sys.prefix,
         sys.base_prefix,
         sys.exec_prefix,
         sys.base_exec_prefix,
-        os.path.dirname(os.path.abspath(sys.executable)),
+        os.path.dirname(exe_abs),
         os.path.dirname(exe_real),
-        exe_gp if exe_gp not in (*forbidden, "/opt", "/usr") and not exe_gp.startswith(repo_real + os.sep) else "",
+        exe_gp if _safe_prefix(exe_gp) else "",
+        os.path.dirname(os.path.abspath(base_exe)) if base_exe else "",
+        os.path.dirname(base_exe_real) if base_exe_real else "",
+        base_exe_gp if _safe_prefix(base_exe_gp) else "",
     ):
         if cand:
-            collect(cand)
-    # Official site-packages directories only (never user-site or arbitrary sys.path entries)
+            collect(cand, runtime=True)
+
+    # Virtualenv pyvenv.cfg `home = ...` directory (and its parent prefix), if present
+    for cfg_dir in dict.fromkeys((sys.prefix, os.path.dirname(os.path.dirname(exe_abs)))):
+        cfg = os.path.join(cfg_dir, "pyvenv.cfg")
+        if os.path.isfile(cfg):
+            try:
+                with open(cfg, encoding="utf-8", errors="replace") as f:
+                    for line in f:
+                        k, sep, v = line.partition("=")
+                        if sep and k.strip().lower() == "home":
+                            home_dir = v.strip()
+                            if home_dir and os.path.isdir(home_dir):
+                                collect(home_dir, runtime=True)
+                                home_parent = os.path.dirname(home_dir)
+                                if _safe_prefix(home_parent):
+                                    collect(home_parent, runtime=True)
+                            break
+            except OSError:
+                pass
+
+    # Authoritative stdlib & sysconfig roots (logical and realpath, covering symlinked conda/uv/coiled layouts)
+    collect_from_module_file(getattr(encodings, "__file__", None), pkg_levels=2)
+    collect_from_module_file(getattr(os, "__file__", None), pkg_levels=1)
+    try:
+        for sp in sysconfig.get_paths().values():
+            if sp and os.path.exists(sp):
+                collect(sp, runtime=True)
+    except Exception:  # noqa: BLE001
+        pass
+    for var in ("LIBDIR", "LIBPL", "DESTLIB", "BINLIBDEST", "PREFIX", "EXEC_PREFIX", "base", "platbase"):
+        val = sysconfig.get_config_var(var)
+        if isinstance(val, str) and val and os.path.isdir(val):
+            collect(val, runtime=True)
+
+    # Official site-packages + symlink targets of core runtime & scientific libraries (never arbitrary sys.path)
     try:
         for sp in site.getsitepackages():
             if sp and os.path.isdir(sp):
-                collect(sp)
+                collect(sp, runtime=True)
     except AttributeError:
         pass
-    # Shared-library dirs needed by dynamic libpython / conda / setup-python (never repo/home/tmp)
-    for lp in (os.environ.get("LD_LIBRARY_PATH") or "").split(os.pathsep):
-        lp = lp.strip()
-        if lp and os.path.isdir(lp):
-            collect(lp)
+    for mod_name in ("math", "_json", "zlib", "numpy", "scipy", "yaml", "starsim"):
+        try:
+            spec = importlib.util.find_spec(mod_name)
+        except (ImportError, ValueError, AttributeError):
+            spec = None
+        origin = getattr(spec, "origin", None) if spec is not None else None
+        if origin and origin not in ("built-in", "frozen") and os.path.exists(origin):
+            collect_from_module_file(origin, pkg_levels=2 if os.path.basename(origin) == "__init__.py" else 1)
+
+    # Zipped stdlib archive (e.g., python314.zip) if present on sys.path (never arbitrary sys.path directories)
+    for sp in sys.path:
+        if sp and os.path.isfile(sp) and os.path.basename(sp).startswith("python") and sp.endswith(".zip"):
+            collect(sp, runtime=True)
+
+    # Shared-library & explicit Python home dirs needed by dynamic libpython / conda / setup-python
+    for env_key in ("LD_LIBRARY_PATH", "PYTHONHOME"):
+        for lp in (os.environ.get(env_key) or "").split(os.pathsep):
+            lp = lp.strip()
+            if lp and os.path.isdir(lp):
+                collect(lp, runtime=True)
+
+    # If the Python runtime lives under `/opt/<subroot>` (e.g. `/opt/coiled`, `/opt/conda`, `/opt/hostedtoolcache`),
+    # mount `/opt/<subroot>` read-only so cross-directory conda/mamba/pixi symlinks inside it resolve cleanly.
+    for rp in list(runtime_paths):
+        if rp.startswith("/opt/"):
+            parts = rp.split("/")
+            if len(parts) >= 3 and parts[2]:
+                sub = "/opt/" + parts[2]
+                if os.path.isdir(sub) and sub != repo_real and not repo_real.startswith(sub + os.sep):
+                    collect(sub)
 
     # Mount shallowest paths first so parents precede children; drop children covered by a mounted dir
     mounts: list[str] = []
@@ -239,10 +333,10 @@ def _bwrap_engine_cmd(kind: str, envargs: list[str], child: list[str],
     ]
     return (["sudo", "-n"] if kind == "bwrap-sudo" else []) + [
         "bwrap",
-        *binds,
         "--dev", "/dev",
         "--proc", "/proc",
         "--tmpfs", "/tmp",
+        *binds,
         *ns,
         "--die-with-parent",
         "--new-session",
@@ -262,17 +356,18 @@ def _minimal_env(hash_seed: str = "0", mounted_prefixes: list[str] | None = None
         if req_p not in path_parts:
             path_parts.append(req_p)
     keep["PATH"] = os.pathsep.join(path_parts)
-    if os.environ.get("LD_LIBRARY_PATH"):
-        if mounted_prefixes is None:
-            keep["LD_LIBRARY_PATH"] = os.environ["LD_LIBRARY_PATH"]
-        else:
-            ok_ld = []
-            for lp in os.environ["LD_LIBRARY_PATH"].split(os.pathsep):
-                lp_n = os.path.normpath(lp.strip()) if lp.strip() else ""
-                if lp_n and any(lp_n == m or lp_n.startswith(m.rstrip("/") + "/") for m in mounted_prefixes):
-                    ok_ld.append(lp_n)
-            if ok_ld:
-                keep["LD_LIBRARY_PATH"] = os.pathsep.join(ok_ld)
+    for env_key in ("LD_LIBRARY_PATH", "PYTHONHOME"):
+        if os.environ.get(env_key):
+            if mounted_prefixes is None:
+                keep[env_key] = os.environ[env_key]
+            else:
+                ok_parts = []
+                for lp in os.environ[env_key].split(os.pathsep):
+                    lp_n = os.path.normpath(lp.strip()) if lp.strip() else ""
+                    if lp_n and any(lp_n == m or lp_n.startswith(m.rstrip("/") + "/") for m in mounted_prefixes):
+                        ok_parts.append(lp_n)
+                if ok_parts:
+                    keep[env_key] = os.pathsep.join(ok_parts)
     return dict(
         keep,
         HOME="/tmp",
@@ -299,7 +394,11 @@ def _probe_engine_bwrap(kind: str) -> tuple[bool, str]:
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=30, stdin=subprocess.DEVNULL)
         if r.returncode == 0 and r.stdout.strip() == "OK":
             return True, ""
-        return False, f"{kind}: rc={r.returncode} err={r.stderr.strip()[-200:]!r} out={r.stdout.strip()[-80:]!r}"
+        return False, (
+            f"{kind}: rc={r.returncode} err={r.stderr.strip()[-350:]!r} out={r.stdout.strip()[-80:]!r} "
+            f"exe={sys.executable!r} pre={sys.prefix!r} base={sys.base_prefix!r} "
+            f"enc={getattr(encodings, '__file__', None)!r} mounts={prefixes!r}"
+        )
     except (OSError, subprocess.SubprocessError) as e:
         return False, f"{kind}: {type(e).__name__}: {e}"
 
@@ -1115,6 +1214,25 @@ def _self_test() -> int:
         ext_real = os.path.realpath(ext_dir)
         ok(ext_dir not in cmd_ext and ext_real not in cmd_ext,
            "BE18c _bwrap_engine_cmd ignores arbitrary sys.path directories")
+
+    # BE18d: stdlib (encodings, os, sysconfig stdlib) covered by _ro_mount_prefixes() and --tmpfs /tmp precedes binds
+    ro_pref = _ro_mount_prefixes()
+    def _covered(p: str) -> bool:
+        if not p:
+            return True
+        pn = os.path.normpath(os.path.abspath(p))
+        return any(pn == m or pn.startswith(m.rstrip("/") + "/") for m in ro_pref)
+    enc_f = getattr(encodings, "__file__", "") or ""
+    os_f = getattr(os, "__file__", "") or ""
+    stdlib_d = sysconfig.get_path("stdlib") or ""
+    cmd_ord = _bwrap_engine_cmd("bwrap", [], [sys.executable, "-s", "-B", "/harness/worker.py", "_probe"],
+                                ro_prefixes=ro_pref)
+    tmp_idx = cmd_ord.index("--tmpfs")
+    bind_idx = cmd_ord.index("--ro-bind")
+    ok(all(_covered(p) for p in (enc_f, os.path.realpath(enc_f), os_f, os.path.realpath(os_f),
+                                 stdlib_d, os.path.realpath(stdlib_d)))
+       and tmp_idx < bind_idx,
+       f"BE18d _ro_mount_prefixes covers encodings/os/stdlib (logical+realpath) and --tmpfs /tmp precedes --ro-bind")
 
     # BE18: in bubblewrap sandbox (Linux CI / Coiled VMs), sentinel file outside mount set cannot be read
     sb = engine_sandbox_kind()
