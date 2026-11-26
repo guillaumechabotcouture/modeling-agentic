@@ -204,10 +204,54 @@ def _engine_registry(run_dir, spec, signer, spec_bytes=None, **_ctx) -> list:
     return out
 
 
+def _acquired_inventory(run_dir, spec, signer, spec_bytes=None, mode=None, record=None, capture=None, **_ctx) -> list:
+    """Verify acquired input inventory, unlisted spec citations, and sign-off binding (§4, §5, T_ACQ_SIGN)."""
+    if not run_dir:
+        return []
+    from agents import acquire as ACQ
+    from lib.safe_io import LinkRefused
+    rec = record
+    if rec is None and mode in ("status", "launch", "resume"):
+        from toolkit.spec import signoff as SO
+        rec = SO._spec_record(run_dir)
+    rec_inv = rec.get("acquired_inventory_sha256") if isinstance(rec, dict) else None
+    has_acq = ACQ.has_acquired(run_dir)
+    if not has_acq and rec_inv is None:
+        return []
+    probs: list[str] = []
+    try:
+        v = ACQ.verify_inventory(run_dir)
+        cur_inv = v.get("inventory_sha256")
+    except (ACQ.ArtifactTampered, LinkRefused, OSError) as e:
+        if isinstance(capture, dict) and capture.get("evidence_status") in (None, "ok"):
+            capture["evidence_status"] = "changed"
+        return [f"artifact_tampered: {e}"]
+    probs += ACQ.unlisted_acquired_citations(run_dir, getattr(spec, "raw", None))
+    if mode == "sign" and cur_inv is not None:
+        from toolkit.spec import signoff as SO
+        from lib.safe_io import read_nofollow
+        try:
+            sb = read_nofollow(run_dir, SO.SHEET)[0]
+            src = SO.sheet_sources(sb.decode("utf-8", "replace"))
+            if src is not None and src.get("acquired_inventory_sha256") != cur_inv:
+                probs.append("acquired_inventory_changed: sign-off sheet acquired_inventory_sha256 is stale; regenerate sheet")
+        except FileNotFoundError:
+            pass
+        except (LinkRefused, OSError) as e:
+            probs.append(f"artifact_tampered: {e}")
+    if mode in ("status", "launch", "resume") and isinstance(rec, dict):
+        if rec_inv != cur_inv:
+            if isinstance(capture, dict) and capture.get("evidence_status") in (None, "ok"):
+                capture["evidence_status"] = "changed"
+            probs.append("acquired_inventory_changed: acquired inventory digest differs from sign-off record")
+    return probs
+
+
 CHECKS = {"engine_registry": _engine_registry, "build_request": _build_request,
           "benchmark_eligibility": _benchmark_eligibility,
-          "net_effect_posterior": _net_effect_posterior, "calibration_scale": _calibration_scale}
-CONTEXT_CHECKS: set = {"engine_registry", "build_request"}  # checks called with the context: fn(run_dir, spec, signer, spec_bytes=, ...)
+          "net_effect_posterior": _net_effect_posterior, "calibration_scale": _calibration_scale,
+          "acquired_inventory": _acquired_inventory}
+CONTEXT_CHECKS: set = {"engine_registry", "build_request", "acquired_inventory"}  # checks called with the context: fn(run_dir, spec, signer, spec_bytes=, ...)
 
 
 def register(name: str, fn, context: bool = False) -> None:

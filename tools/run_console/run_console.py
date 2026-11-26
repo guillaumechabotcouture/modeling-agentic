@@ -72,7 +72,7 @@ FALLBACK_PRICE = {"in": 5.0, "out": 25.0, "cache_write": 6.25, "cache_read": 0.5
 HISTORY_TURNS = 12
 # Character budgets for the run context (each part says when it was cut).
 BUDGET = {"results": 12000, "gate": 3000, "blockers": 6000, "tests": 3000, "timeline": 3000, "owner": 3000}
-OPTIONAL_STATES = ("FIX_LOOP", "OWNER_DECISION", "PRESENTATION")   # the stepper hides them when never entered
+OPTIONAL_STATES = ("ACQUIRE", "FIX_LOOP", "OWNER_DECISION", "PRESENTATION")   # the stepper hides them when never entered
 STALE_S = 1800.0               # a progress record not updated for this long is not live
 CLOUD_MIN_S = 60.0             # each cloud refresh attaches to a cluster: never more often than this
 
@@ -2494,16 +2494,16 @@ def _self_test() -> int:
         ok(err is None and by["OWNER_DECISION"] == "waiting" and by["GATE"] == "done" and by["FIX_LOOP"] == "done"
            and by["WRITE"] == "todo" and sp["fix_rounds"] == 1 and sp["round"] == 2,
            f"RC1a stepper: done, waiting, todo and one fix-loop round ({by}, {sp['fix_rounds']})")
-        ok([s["state"] for s in sp["stages"]] == [s for s in states() if s != "PRESENTATION"]
-           and states()[0] == "SPEC" and states()[-1] == "FINAL",
+        ok([s["state"] for s in sp["stages"]] == [s for s in states() if s not in ("ACQUIRE", "PRESENTATION")]
+           and states()[0] == "ACQUIRE" and states()[-1] == "FINAL",
            "RC1b the stage list is stage_machine.STATES, without optional states never entered")
         rd2 = _toy_run(os.path.join(td, "runs", "proj", "run2"), "WRITE", None,
                        path=("SPEC", "SIGN", "EVIDENCE", "ENGINE_CHOICE", "CONFIGURE", "ANALYZE", "CRITIQUE", "GATE",
                              "WRITE"))
         by2 = {s["state"]: s["status"] for s in stepper(load_run_state(rd2)[0])["stages"]}
-        ok("FIX_LOOP" not in by2 and "OWNER_DECISION" not in by2 and "PRESENTATION" not in by2
+        ok("ACQUIRE" not in by2 and "FIX_LOOP" not in by2 and "OWNER_DECISION" not in by2 and "PRESENTATION" not in by2
            and by2["WRITE"] == "current" and by2["FINAL"] == "todo",
-           f"RC1c FIX_LOOP, OWNER_DECISION and PRESENTATION are collapsed when never entered ({by2})")
+           f"RC1c ACQUIRE, FIX_LOOP, OWNER_DECISION and PRESENTATION are collapsed when never entered ({by2})")
         rd3 = _toy_run(os.path.join(td, "runs", "other", "run3"), "FINAL", None, "run_failed",
                        path=("SPEC", "SIGN", "EVIDENCE", "ENGINE_CHOICE", "CONFIGURE", "ANALYZE", "FINAL"))
         sp3 = stepper(load_run_state(rd3)[0])["stages"]

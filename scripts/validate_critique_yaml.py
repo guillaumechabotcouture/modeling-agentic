@@ -192,6 +192,11 @@ _NON_DECLARABLE_KINDS = frozenset({
     "declared_finding_changes_decision",
     # Phase 49 β: the owner declined the declaration.
     "scope_declaration_declined",
+    # v2 ACQUIRE (§§3.3, 5): quoted-span violations, unlisted acquired citations, acquired derivation failures
+    "observation_quote_not_found",
+    "observation_acquired_unbound",
+    "acquired_input_unlisted",
+    "derivation_failed_on_acquired",
 })
 _NON_DECLARABLE_SUFFIXES = ("_invalid", "_unknown_verdict",
                             "_not_script_produced", "_stale")

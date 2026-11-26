@@ -1295,6 +1295,198 @@ def verify_inventory(run_dir: str) -> dict:
     return {"ok": True, "files": len(expected_files), "inventory_sha256": inv_sha, "restored_modes": restored_modes}
 
 
+def has_acquired(run_dir: str) -> bool:
+    """True when `run_dir` carries any acquired tree, manifest, or provenance markers."""
+    run_dir = os.path.abspath(run_dir)
+    if os.path.lexists(os.path.join(run_dir, ACQUIRED_ROOT)) or os.path.lexists(os.path.join(run_dir, MANIFEST_REL)):
+        return True
+    try:
+        prov = _load_provenance(run_dir)
+    except ArtifactTampered:
+        return True
+    if "acquired_inventory_sha256" in prov:
+        return True
+    return any(isinstance(v, Mapping) and v.get("origin") == "acquired" for v in (prov.get("inputs") or {}).values())
+
+
+def read_manifest(run_dir: str) -> tuple[dict | None, bytes | None]:
+    """Read `evidence/acquired_manifest.json` via safe_io; (None, None) when absent."""
+    try:
+        raw, _ = SIO.read_nofollow(run_dir, MANIFEST_REL)
+    except FileNotFoundError:
+        return None, None
+    except SIO.LinkRefused as e:
+        raise ArtifactTampered("artifact_tampered", f"{MANIFEST_REL}: {e}") from None
+    try:
+        doc = json.loads(raw.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError) as e:
+        raise ArtifactTampered("artifact_tampered", f"{MANIFEST_REL}: {e}") from None
+    if not isinstance(doc, dict):
+        raise ArtifactTampered("artifact_tampered", f"{MANIFEST_REL}: top-level mapping required")
+    return doc, raw
+
+
+def allowlisted_hosts(allowlist_path: str = DEFAULT_ALLOWLIST) -> set[str]:
+    """All lowercase hostnames declared by enabled endpoints in `acquire_sources.yaml`."""
+    try:
+        doc, _ = load_allowlist(allowlist_path)
+    except AllowlistError:
+        return set()
+    hosts: set[str] = set()
+    for s in doc.get("sources") or ():
+        for ep in (s.get("endpoints") or {}).values():
+            h = str(ep.get("host") or "").strip().lower()
+            if h:
+                hosts.add(h)
+    return hosts
+
+
+def unlisted_acquired_citations(run_dir: str, spec_doc: Mapping | None) -> list[str]:
+    """Check that every `data/inputs/acquired/...` path cited by `spec_doc` (outside `_views/`) is listed in
+    `evidence/acquired_manifest.json` (`acquired_input_unlisted`; docs/design/acquire.md §5)."""
+    if not isinstance(spec_doc, Mapping):
+        return []
+    import pipeline as _P
+    try:
+        cited = list(_P.cited_paths(dict(spec_doc), run_dir))
+    except Exception:  # noqa: BLE001
+        cited = []
+    acq_cited = [
+        p.replace("\\", "/") for p in cited
+        if str(p).replace("\\", "/").startswith(ACQUIRED_ROOT + "/")
+        and not str(p).replace("\\", "/").startswith(VIEWS_ROOT + "/")
+    ]
+    if not acq_cited:
+        return []
+    try:
+        man, _ = read_manifest(run_dir)
+    except ArtifactTampered as e:
+        return [f"acquired_input_unlisted: {e}"]
+    listed = set((man or {}).get("files") or ())
+    return [
+        f"acquired_input_unlisted: spec cites {p}, which is not listed in {MANIFEST_REL}"
+        for p in sorted(set(acq_cited)) if p not in listed
+    ]
+
+
+def acquired_sheet_lines(
+    run_dir: str,
+    manifest_bytes: bytes | None = None,
+    spec_doc: Mapping | None = None,
+    dossier_bytes: bytes | None = None,
+) -> list[str]:
+    """Render the SIGN sheet subsection for acquired inputs, outgoing queries, and rejected fetches (§5)."""
+    if manifest_bytes is None:
+        try:
+            _, manifest_bytes = read_manifest(run_dir)
+        except ArtifactTampered as e:
+            return ["### Acquired inputs (fetched by the harness)", "", f"ERROR: {e}", ""]
+    if manifest_bytes is None:
+        return []
+    try:
+        man = json.loads(manifest_bytes.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError) as e:
+        return ["### Acquired inputs (fetched by the harness)", "", f"ERROR: manifest unreadable ({e})", ""]
+    if not isinstance(man, dict):
+        return []
+    files = man.get("files") if isinstance(man.get("files"), dict) else {}
+    queries = man.get("queries") if isinstance(man.get("queries"), list) else []
+    rejected = man.get("rejected") if isinstance(man.get("rejected"), list) else []
+
+    # Map acquired path / fetch_id -> where it is used (derivations, spec citations, dossier quotes)
+    used_by: dict[str, list[str]] = {p: [] for p in files}
+    id_to_path = {str(e.get("fetch_id") or ""): p for p, e in files.items() if isinstance(e, Mapping)}
+    try:
+        import pipeline as _P
+        ders, _, _ = _P.load_derivations(run_dir)
+        for d in ders:
+            for inp in d.get("inputs") or ():
+                if inp in used_by:
+                    used_by[inp].append(f"derivation:{d.get('id')}")
+    except Exception:  # noqa: BLE001
+        pass
+    if isinstance(spec_doc, Mapping):
+        try:
+            import pipeline as _P
+            for cp in _P.cited_paths(dict(spec_doc), run_dir):
+                if cp in used_by:
+                    used_by[cp].append("spec")
+        except Exception:  # noqa: BLE001
+            pass
+    if dossier_bytes:
+        try:
+            ddoc = yaml.safe_load(dossier_bytes.decode("utf-8")) or {}
+            for dk, dv in (ddoc.get("inputs") or {}).items() if isinstance(ddoc, dict) else ():
+                if not isinstance(dv, dict):
+                    continue
+                for obs in dv.get("observations") or ():
+                    acq = obs.get("acquired") if isinstance(obs, dict) else None
+                    if isinstance(acq, dict):
+                        pth = id_to_path.get(str(acq.get("id") or ""))
+                        if pth in used_by:
+                            used_by[pth].append(f"dossier:{dk}")
+        except Exception:  # noqa: BLE001
+            pass
+
+    out = [
+        "### Acquired inputs (fetched by the harness)",
+        "",
+        "| file | source | retrieved | sha256 | size, type | licence | wanted | used by |",
+        "|---|---|---|---|---|---|---|---|",
+    ]
+    if not files:
+        out.append("| (none promoted) | - | - | - | - | - | - | - |")
+    for p, e in sorted(files.items()):
+        if not isinstance(e, Mapping):
+            continue
+        lic = e.get("licence") if isinstance(e.get("licence"), Mapping) else {}
+        lic_txt = f"{sanitize_label(str(lic.get('id') or '-'))} ({lic.get('terms_url') or '-'})"
+        if lic.get("redistribution") == "not_allowed":
+            lic_txt += "; redistribution not allowed"
+        src_txt = f"{sanitize_label(str(e.get('source_id') or '-'))}.{sanitize_label(str(e.get('endpoint') or '-'))} ({e.get('url') or '-'})"
+        wanted_txt = ", ".join(sanitize_label(str(w)) for w in (e.get("wanted") or ())) or "-"
+        ub = ", ".join(sorted(set(used_by.get(p) or ()))) or "unused"
+        out.append(
+            f"| `{p}` | {src_txt} | {e.get('retrieved_at') or '-'} | `{str(e.get('sha256') or '')[:12]}` "
+            f"| {e.get('bytes') or 0} B, `{e.get('content_type') or '-'}` | {lic_txt} | {wanted_txt} | {ub} |"
+        )
+    out += [
+        "",
+        "#### Outgoing acquisition queries",
+        "",
+        "| source | endpoint | parameters | status |",
+        "|---|---|---|---|",
+    ]
+    if not queries:
+        out.append("| (none) | - | - | - |")
+    for q in queries:
+        if not isinstance(q, Mapping):
+            continue
+        params_s = json.dumps(q.get("params") or {}, sort_keys=True)
+        out.append(
+            f"| `{sanitize_label(str(q.get('source_id') or '-'))}` | `{sanitize_label(str(q.get('endpoint') or '-'))}` "
+            f"| `{params_s}` | `{sanitize_label(str(q.get('status') or '-'))}` |"
+        )
+    out += [
+        "",
+        "#### Fetched and not promoted",
+        "",
+        "| fetch_id | code | reason |",
+        "|---|---|---|",
+    ]
+    if not rejected:
+        out.append("| (none) | - | - |")
+    for r in rejected:
+        if not isinstance(r, Mapping):
+            continue
+        out.append(
+            f"| `{str(r.get('fetch_id') or '')[:12]}` | `{sanitize_label(str(r.get('code') or '-'))}` "
+            f"| {sanitize_label(str(r.get('reason') or '-'), max_len=160)} |"
+        )
+    out.append("")
+    return out
+
+
 # --------------------------------------------------------------------------- Local fixture server & self-test (AQ1-AQ18)
 class AcquireFixtureServer:
     """In-process synthetic HTTP fixture server for AQ2-AQ18 self-tests (zero external network)."""

@@ -59,7 +59,7 @@ NOT_COPIED = {STATE, "metadata.json", RECORD, REQUEST, "decision_spec.signoff.js
               "budget_ledger.json", "progress.md", "copied_run.json", "_task_input.json", "done_when_registry.json",
               "scope_declaration.yaml", "impact_ledger.jsonl"}
 NOT_COPIED_PREFIX = ("critique_", "fix_plan_", "fix_impact", "fix_progress")
-NOT_COPIED_DIRS = ("models/decision_tests",)     # the parent's decision-test results: the child tests again
+NOT_COPIED_DIRS = ("models/decision_tests", "acquire/quarantine")     # the parent's decision-test results and stale acquire temp files
 OPS = ("set", "add", "remove")
 
 
@@ -610,16 +610,31 @@ def amend(parent, patch=None, from_request=False, out=None, signoff=None, repo=R
         raise
     os.rename(stage, child)
     pin = pipeline_id.code_pin(repo)
+    parent_meta = {}
+    try:
+        parent_meta = json.loads(open(os.path.join(parent, "metadata.json"), encoding="utf-8").read()) or {}
+    except (OSError, ValueError):
+        parent_meta = {}
+    acq_meta = {
+        k: parent_meta[k]
+        for k in ("acquire", "acquired_inventory_sha256", "allowlist_version", "allowlist_sha256")
+        if k in parent_meta
+    }
     meta = {"pipeline": "v2", "question": st.get("question"), "signoff": mode, "max_rounds": st.get("max_rounds"),
             "parent_run": {"run_dir": parent, "run_state_sha256": st_sha}, "parent_spec_sha256": signed,
             "parent_spec_signed": bool(signed), "code_pin": pin, "amendment": label, "patch_sha256": psha,
             "producer": PRODUCER, "created": _dt.datetime.now(_dt.timezone.utc).isoformat(timespec="seconds"),
-            "motivated_by": why}
+            "motivated_by": why, **acq_meta}
     write_nofollow(child, "metadata.json", json.dumps(meta, indent=2).encode(), atomic=True)
     rounds = st.get("max_rounds") if type(st.get("max_rounds")) is int and st["max_rounds"] > 0 else 3
     keep = ("question", "gate_mode", "budget_usd", "task_cap_usd", "v2_rules", "derived_inputs",
-            "derive_unsandboxed", "world_model_stages")
-    cst = {**{k: st[k] for k in keep if k in st}, "max_rounds": rounds, "state": "SIGN", "round": 1, "signoff": mode, "spent_usd": 0.0,
+            "derive_unsandboxed", "world_model_stages", "acquire")
+    acq_child = dict(st["acquired"]) if isinstance(st.get("acquired"), dict) and st.get("acquired") else None
+    if acq_child is not None:
+        acq_child["closed"] = True    # amended child reuses parent's acquired bytes and never re-fetches (§2.4)
+    cst = {**{k: st[k] for k in keep if k in st},
+           **({"acquired": acq_child} if acq_child is not None else {}),
+           "max_rounds": rounds, "state": "SIGN", "round": 1, "signoff": mode, "spent_usd": 0.0,
            "paused": "awaiting_signoff", "status": None, "tries": {}, "journal": {},
            "history": [{"at": meta["created"], "from": None, "to": "SIGN",
                         "why": f"amendment {label} of {parent} ({len(changes)} change(s)): {reason1}"[:500]}]}

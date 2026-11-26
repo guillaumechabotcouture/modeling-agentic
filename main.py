@@ -1471,7 +1471,8 @@ def _main_v2_run(args, ident: dict, run_path: str, question: str) -> int:
         question, run_path, tasks, max_rounds=args.max_rounds, signoff=args.signoff,
         budget_usd=args.max_budget_usd, derive_unsandboxed=derive_un,
         engine_unsandboxed=engine_un,
-        engine_build_usd=getattr(args, "engine_build_usd", None)),
+        engine_build_usd=getattr(args, "engine_build_usd", None),
+        acquire="auto" if getattr(args, "acquire", False) else "off"),
         run_path,
         store=_store_chain)
     print(f"v2 status: {status}", flush=True)
@@ -1504,6 +1505,9 @@ def main() -> int:
     parser.add_argument("--engine-build-usd", type=float, default=None,
                         help="Dollar cap for the agent-built engine lane (default $40, clamped to harness max); "
                              "pass a higher cap on --resume after an engine_build_cap budget pause.")
+    parser.add_argument("--acquire", action="store_true",
+                        help="Enable the v2 ACQUIRE state before SPEC to fetch public inputs from the allowlist "
+                             "when the question supplies no files (off by default; docs/design/acquire.md).")
     parser.add_argument("--methods-critic", action="store_true",
                         help="Accepted for existing launch configs; unused by v2 (it added critique-methods to v1's STAGE 6).")
     parser.add_argument("--signoff", choices=["owner", "lead", "none"], default="owner",

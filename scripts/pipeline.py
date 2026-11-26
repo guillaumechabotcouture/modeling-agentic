@@ -1602,8 +1602,8 @@ TABULAR = (".csv", ".tsv")
 # Resource caps (RLIMIT_AS, RLIMIT_CPU, RLIMIT_FSIZE, RLIMIT_NPROC) and the wall-clock timeout.
 LIMITS = {"memory_bytes": 4 << 30, "cpu_s": 600, "file_bytes": 1 << 30, "nproc": 1024, "wall_s": 900}
 DERIVATION_CODES = ("units_not_derived", "data_ref_not_derived", "derivation_stale", "derivation_failed",
-                    "derivation_nondeterministic", "derivation_unsandboxed", "input_column_unaccounted",
-                    "ignored_column_used")
+                    "derivation_failed_on_acquired", "derivation_nondeterministic", "derivation_unsandboxed",
+                    "input_column_unaccounted", "ignored_column_used")
 _SANDBOX: list = []
 
 

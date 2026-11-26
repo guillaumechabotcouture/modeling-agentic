@@ -166,6 +166,9 @@ _AGENT_TOOLS = {"Agent", "Task"}
 # Environment variable prefixes holding cloud / third-party credentials.
 # They are only passed to agent subprocesses when cloud execution is on.
 CLOUD_ENV_PREFIXES = ("AZ_", "AZURE_", "OPENAI_", "AWS_", "GOOGLE_")
+# SDK authentication variables kept when blanking credential patterns for the ACQUIRE task (docs/design/acquire.md §3.1).
+ACQUIRE_SDK_AUTH_VARS = frozenset({"ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN"})
+_ACQUIRE_CRED_RE = re.compile(r"(?:_TOKEN$|_KEY$|SECRET|PASSWORD|^COILED_|^GH_|^GITHUB_)", re.I)
 
 
 # ---------------------------------------------------------------------------
@@ -946,6 +949,20 @@ def filtered_env(environ: dict[str, str], allow_cloud: bool) -> dict[str, str]:
     overrides.update(cache_env(environ))
     if not allow_cloud:
         overrides.update({k: "" for k in environ if k.startswith(CLOUD_ENV_PREFIXES)})
+    return overrides
+
+
+def acquire_env(environ: dict[str, str]) -> dict[str, str]:
+    """Stricter environment overrides for the v2 ACQUIRE task (docs/design/acquire.md §3.1, S_ACQ_ENV).
+
+    Applies `filtered_env(..., allow_cloud=False)` and additionally blanks every environment variable
+    matching credential patterns (`*_TOKEN`, `*_KEY`, `*SECRET*`, `*PASSWORD*`, `COILED_*`, `GH_*`,
+    `GITHUB_*`), preserving only the SDK's own authentication variables.
+    """
+    overrides = filtered_env(environ, allow_cloud=False)
+    for k in environ:
+        if k not in ACQUIRE_SDK_AUTH_VARS and _ACQUIRE_CRED_RE.search(k):
+            overrides[k] = ""
     return overrides
 
 

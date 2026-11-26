@@ -43,6 +43,7 @@ class TaskResult:
 
 
 class Tasks(Protocol):
+    def acquire(self, question: str, run_dir: str, packet: dict) -> TaskResult: ...
     def draft_spec(self, question: str, run_dir: str, feedback: list[str] | None) -> TaskResult: ...
     def sign_spec(self, run_dir: str) -> TaskResult: ...
     def draft_evidence(self, run_dir: str, rel: str, required: dict, feedback: list) -> TaskResult: ...
@@ -121,6 +122,19 @@ class StubTasks:
             self._crashes[name] -= 1
             raise RuntimeError(f"stub: {name} interrupted")
         return TaskResult(ok, output, float(self.s.get("usd", 0.0)), note)
+
+    def acquire(self, question, run_dir, packet):
+        """script['acquire']: callable(question, run_dir, packet) -> dict | TaskResult | False | None, or dict/False."""
+        acq = self.s.get("acquire")
+        res = acq(question, run_dir, packet) if callable(acq) else acq
+        if isinstance(res, TaskResult):
+            self.calls.append("acquire")
+            return res
+        if res is False:
+            return self._r("acquire", False, note="stub acquire failed")
+        if isinstance(res, dict):
+            return self._r("acquire", True, output=res, note=f"kept {len(res.get('keep') or [])}")
+        return self._r("acquire", True, output={"keep": [], "wanted_map": {}}, note="kept 0")
 
     def draft_spec(self, question, run_dir, feedback):
         spec = self.s.get("spec")
