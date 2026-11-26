@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import math
 import os
+import re
 import sys
 from collections.abc import Callable, Mapping
 
@@ -473,7 +474,531 @@ def compose_perspective_totals(
     return out
 
 
-# --------------------------------------------------------------------------- Self-test (CE1-CE3, CE7, CE11-CE13)
+# --------------------------------------------------------------------------- Probabilistic CEA (§5.7)
+def _interval_stats(vals: np.ndarray, level: float) -> dict:
+    a = (1.0 - float(level)) / 2.0
+    v = np.asarray(vals, dtype=float)
+    return {
+        "mean": float(np.mean(v)),
+        "median": float(np.median(v)),
+        "sd": float(np.std(v, ddof=1)) if v.size > 1 else 0.0,
+        "ci_low": float(np.quantile(v, a)),
+        "ci_high": float(np.quantile(v, 1.0 - a)),
+    }
+
+
+def probabilistic_summary(
+    draws_by_strategy: Mapping[str, tuple[np.ndarray, np.ndarray]],
+    reference: str,
+    thresholds: list[dict],
+    *,
+    ceac_grid: list[float] | None = None,
+    level: float = 0.95,
+    population: float = 1.0,
+    ref_health_loss_draws: np.ndarray | None = None,
+) -> dict:
+    """Probabilistic CEA over the uncertainty draws (§5.7): ΔC/ΔE intervals, quadrant shares,
+    CEAC (summing to 1), CEAF (argmax of expected NMB per Fenwick et al. 2001), EVPI with SE,
+    and ICER at the means under §5.4 guard (never an ICER interval)."""
+    strat_names = list(draws_by_strategy.keys())
+    if len(strat_names) < 2 or reference not in draws_by_strategy:
+        raise ValueError("probabilistic_summary requires >=2 strategies including reference")
+    c_mat = np.vstack([np.asarray(draws_by_strategy[s][0], dtype=float) for s in strat_names])
+    e_mat = np.vstack([np.asarray(draws_by_strategy[s][1], dtype=float) for s in strat_names])
+    if c_mat.shape != e_mat.shape or c_mat.ndim != 2 or c_mat.shape[1] == 0:
+        raise ValueError("probabilistic_summary: mismatched or empty draw arrays")
+    n_strat, n_draws = c_mat.shape
+    ref_idx = strat_names.index(reference)
+    ref_c, ref_e = c_mat[ref_idx], e_mat[ref_idx]
+    ref_hl_mean = float(np.mean(ref_health_loss_draws)) if ref_health_loss_draws is not None else 0.0
+
+    dc_int: dict[str, dict] = {}
+    de_int: dict[str, dict] = {}
+    quad: dict[str, dict] = {}
+    icer_means: dict[str, dict] = {}
+    for idx, s in enumerate(strat_names):
+        dc = c_mat[idx] - ref_c
+        de = e_mat[idx] - ref_e
+        dc_int[s] = _interval_stats(dc, level)
+        de_int[s] = _interval_stats(de, level)
+        quad[s] = {
+            "ne": float(np.mean((de > 0.0) & (dc > 0.0))),
+            "se": float(np.mean((de > 0.0) & (dc <= 0.0))),
+            "sw": float(np.mean((de <= 0.0) & (dc <= 0.0))),
+            "nw": float(np.mean((de <= 0.0) & (dc > 0.0))),
+        }
+        st_m, iv_m = evaluate_ratio_guard(float(np.mean(dc)), float(np.mean(de)), ref_health=ref_hl_mean)
+        icer_means[s] = {"status": st_m, "icer": iv_m}
+
+    th_lams = [float(t["lambda"] if "lambda" in t else t["usd_per_unit"]) for t in thresholds]
+    if ceac_grid is None:
+        lam_max = max(th_lams) * 2.0 if th_lams else 1000.0
+        lam_max = max(lam_max, 1.0)
+        base_grid = np.linspace(0.0, lam_max, 25).tolist()
+        lam_grid = sorted({float(x) for x in (*base_grid, *th_lams)})
+    else:
+        lam_grid = sorted({float(x) for x in (*ceac_grid, *th_lams)})
+
+    shares: dict[str, list[float]] = {s: [] for s in strat_names}
+    ceaf: list[str] = []
+    lam_to_idx: dict[float, int] = {}
+    for j, lam in enumerate(lam_grid):
+        lam_to_idx[lam] = j
+        nmb = lam * e_mat - c_mat
+        best_d = np.max(nmb, axis=0)
+        tol = 1e-12 * np.maximum(1.0, np.abs(best_d))
+        wins = nmb >= (best_d[None, :] - tol[None, :])
+        n_win = np.maximum(1, np.sum(wins, axis=0))
+        frac = wins / n_win[None, :]
+        for idx, s in enumerate(strat_names):
+            shares[s].append(float(np.mean(frac[idx])))
+        mean_nmb = np.mean(nmb, axis=1)
+        ceaf.append(strat_names[int(np.argmax(mean_nmb))])
+
+    pop = max(float(population), 1.0)
+    th_out: dict[str, dict] = {}
+    for t in thresholds:
+        tid = str(t["id"])
+        lam = float(t["lambda"] if "lambda" in t else t["usd_per_unit"])
+        nmb = lam * e_mat - c_mat
+        mean_nmb = np.mean(nmb, axis=1)
+        ceaf_idx = int(np.argmax(mean_nmb))
+        ceaf_s = strat_names[ceaf_idx]
+        best_d = np.max(nmb, axis=0)
+        gains = np.maximum(0.0, best_d - nmb[ceaf_idx])
+        evpi = float(np.mean(gains))
+        evpi_se = float(np.std(gains, ddof=1) / math.sqrt(n_draws)) if n_draws > 1 else 0.0
+        p_ce = shares[ceaf_s][lam_to_idx[lam]]
+        th_out[tid] = {
+            "lambda": lam,
+            "expected_nmb": {s: float(mean_nmb[idx]) for idx, s in enumerate(strat_names)},
+            "ceaf_chosen": ceaf_s,
+            "p_cost_effective": float(p_ce),
+            "p_cost_effective_pct": float(100.0 * p_ce),
+            "evpi": evpi,
+            "evpi_se": evpi_se,
+            "evpi_per_person": evpi / pop,
+        }
+
+    min_draws = int(load_thresholds()["min_draws"])
+    return {
+        "draws": int(n_draws),
+        "status": "computed" if n_draws >= min_draws else "indicative",
+        "quadrant_share": quad,
+        "delta_cost_interval": dc_int,
+        "delta_health_interval": de_int,
+        "icer_at_means": icer_means,
+        "ceac": {"lambda": lam_grid, "share": shares, "ceaf": ceaf},
+        "thresholds": th_out,
+    }
+
+
+# --------------------------------------------------------------------------- Run collector, artifact & claims (§7)
+def _cid(name: str) -> str:
+    return re.sub(r"[^A-Za-z0-9_.\-]", "_", str(name))
+
+
+def _population_total(A) -> float:
+    units = [A.by_id[i] for i in A.ids]
+    tot = 0.0
+    for u in units:
+        for col in ("population", "pop", "n_people", "cohort_size"):
+            if col in u and u[col] is not None:
+                try:
+                    v = float(u[col])
+                    if v > 0.0:
+                        tot += v
+                        break
+                except (TypeError, ValueError):
+                    pass
+    return tot if tot > 0.0 else float(max(len(units), 1))
+
+
+def extract_events_and_prog_costs(A, out: Mapping, *, cost_overrides: Mapping[str, float] | None = None) -> tuple[dict, dict]:
+    """Aggregate engine outcomes by age group and unfloored per-item programme costs (`floor=False`) per strategy."""
+    ce = A.spec.raw["cost_effectiveness"]
+    strategies = list(ce["strategies"])
+    hm_events = list((ce["health_measure"].get("events") or {}).keys())
+    cc_outcomes = [str(cc["outcome"]) for cc in (ce.get("consequence_costs") or [])]
+    needed_outcomes = list(dict.fromkeys([*hm_events, *cc_outcomes]))
+
+    units = [A.by_id[i] for i in A.ids]
+    alloc = dict(A.alloc)
+    if cost_overrides:
+        items_copy = []
+        for it in alloc.get("cost_items") or []:
+            it2 = dict(it)
+            if str(it2["id"]) in cost_overrides:
+                it2["value"] = float(cost_overrides[str(it2["id"])])
+            items_copy.append(it2)
+        alloc["cost_items"] = items_copy
+    fn = lambda u, p: out[str(u[A.spec.uid])]["cost"][p]  # noqa: E731
+    cm = acosts.cost_matrix(alloc, units, outcome=fn, floor=False)
+
+    events_by_s: dict[str, dict[str, dict[str, float]]] = {s: {oc: {} for oc in needed_outcomes} for s in strategies}
+    prog_by_s: dict[str, dict[str, float]] = {s: {} for s in strategies}
+    for i in A.ids:
+        row_u = out[i]
+        yg_u = row_u.get("y_group") or {}
+        y_u = row_u.get("y") or {}
+        for s in strategies:
+            for oc in needed_outcomes:
+                by_g = (yg_u.get(s) or {}).get(oc)
+                if isinstance(by_g, Mapping) and by_g:
+                    for g, val in by_g.items():
+                        events_by_s[s][oc][str(g)] = events_by_s[s][oc].get(str(g), 0.0) + float(val)
+                elif s in y_u and oc in y_u[s]:
+                    events_by_s[s][oc]["all"] = events_by_s[s][oc].get("all", 0.0) + float(y_u[s][oc])
+            for iid, val in cm[i][s]["items"].items():
+                prog_by_s[s][iid] = prog_by_s[s].get(iid, 0.0) + float(val)
+    return events_by_s, prog_by_s
+
+
+class Collector:
+    """Hooks into `uncertainty.run`'s `on_draw(out, events, cost, sampled)` so CEA reads the run's exact draws (§5.7)."""
+
+    def __init__(self, A):
+        self.A = A
+        self.ce = A.spec.raw["cost_effectiveness"]
+        self.perspectives = list(self.ce["perspectives"])
+        self.strategies = list(self.ce["strategies"])
+        self.life_table = None
+        th = self.ce["time_horizon"]
+        hm = self.ce["health_measure"]
+        if th.get("deaths") == "lifetime" and any(
+            isinstance(cfg, Mapping) and cfg.get("death") is True for cfg in (hm.get("events") or {}).values()
+        ):
+            self.life_table, errs = CEASPEC.load_life_table(A.spec)
+            if errs:
+                raise ValueError("; ".join(errs))
+        self.costs: dict[str, dict[str, list[float]]] = {
+            p: {s: [] for s in self.strategies} for p in self.perspectives
+        }
+        self.health: dict[str, dict[str, list[float]]] = {
+            p: {s: [] for s in self.strategies} for p in self.perspectives
+        }
+        self.ref_hl: list[float] = []
+        self.n_draws = 0
+
+    def add(self, out, events, cost, sampled=None) -> None:
+        smp = sampled or {}
+        w_ov = {k[3:]: float(v) for k, v in smp.items() if isinstance(k, str) and k.startswith("hw:")}
+        c_mult = {k[5:]: float(v) for k, v in smp.items() if isinstance(k, str) and k.startswith("cost:")}
+        evs, prog = extract_events_and_prog_costs(self.A, out)
+        units = [self.A.by_id[i] for i in self.A.ids]
+        tot = compose_perspective_totals(
+            self.A.spec, units, evs, prog, life_table=self.life_table, weight_overrides=w_ov, cost_mult=c_mult,
+        )
+        for p in self.perspectives:
+            for s in self.strategies:
+                c_val, e_val = tot[p]["strategies_ce"][s]
+                self.costs[p][s].append(float(c_val))
+                self.health[p][s].append(float(e_val))
+        self.ref_hl.append(float(tot[self.perspectives[0]]["ref_health_loss"]))
+        self.n_draws += 1
+
+
+def _strategy_record_with_status(row: dict, is_ref: bool) -> dict:
+    """Expose §7 strategy row where `status` is `"icer"` only in the valid north-east frontier case."""
+    out = dict(row)
+    if out["status"] == "frontier":
+        if is_ref and out["frontier_rank"] == 0:
+            out["status"] = "reference"
+        elif out["icer_status"] is not None:
+            out["status"] = out["icer_status"]
+    return out
+
+
+def run_cea(A, out0: Mapping, cost0: Mapping, collector: Collector | None = None, *, uq_level: float = 0.95) -> dict:
+    """Compute the full `analysis/cost_effectiveness.yaml` payload (§7) from the point evaluation and UQ collector."""
+    ce = A.spec.raw["cost_effectiveness"]
+    ref = ce["reference"]
+    perspectives = list(ce["perspectives"])
+    thresholds = list(ce["thresholds"])
+    hm = ce["health_measure"]
+    th = ce["time_horizon"]
+    units = [A.by_id[i] for i in A.ids]
+    pop = _population_total(A)
+
+    life_table = collector.life_table if collector is not None else None
+    if life_table is None and th.get("deaths") == "lifetime" and any(
+        isinstance(cfg, Mapping) and cfg.get("death") is True for cfg in (hm.get("events") or {}).values()
+    ):
+        life_table, errs = CEASPEC.load_life_table(A.spec)
+        if errs:
+            raise ValueError("; ".join(errs))
+
+    evs0, prog0 = extract_events_and_prog_costs(A, out0)
+    tot0 = compose_perspective_totals(A.spec, units, evs0, prog0, life_table=life_table)
+    horizon_len = max(float(th["stop"]) - float(th["start"]), 1e-12)
+
+    persp_out: dict[str, dict] = {}
+    for p in perspectives:
+        ce_map = tot0[p]["strategies_ce"]
+        inc = incremental_analysis(ce_map, ref, ref_health_loss=tot0[p]["ref_health_loss"])
+        strat_rows = {s: _strategy_record_with_status(r, s == ref) for s, r in inc["strategies"].items()}
+        prob = None
+        if collector is not None and collector.n_draws > 0:
+            dbs = {s: (np.asarray(collector.costs[p][s]), np.asarray(collector.health[p][s])) for s in ce["strategies"]}
+            prob = probabilistic_summary(
+                dbs, ref, thresholds, level=uq_level, population=pop,
+                ref_health_loss_draws=np.asarray(collector.ref_hl, dtype=float),
+            )
+        th_rec: dict[str, dict] = {}
+        for t in thresholds:
+            tid = str(t["id"])
+            lam = float(t["lambda"] if "lambda" in t else t["usd_per_unit"])
+            ch = nmb_choice(ce_map, lam, reference=ref, frontier=inc["frontier"])
+            entry = {
+                "lambda": lam,
+                "chosen": ch["chosen"],
+                "nmb": ch["nmb"],
+                "tie": ch["tie"],
+            }
+            if prob is not None:
+                pt = prob["thresholds"][tid]
+                entry.update(
+                    ceaf_chosen=pt["ceaf_chosen"],
+                    p_cost_effective=pt["p_cost_effective"],
+                    p_cost_effective_pct=pt["p_cost_effective_pct"],
+                    evpi=pt["evpi"],
+                    evpi_se=pt["evpi_se"],
+                    evpi_per_person=pt["evpi_per_person"],
+                )
+            th_rec[tid] = entry
+
+        # Evaluated price grids & threshold prices (§5.5, §5.6)
+        item_comp = {str(it["id"]): str(it["component"]) for it in (A.spec.raw["options"].get("cost_items") or [])}
+        prices_out: dict[str, dict] = {}
+        for pr in (ce.get("prices") or []):
+            pid = str(pr["id"])
+            iid = str(pr["cost_item"])
+            target = str(pr["strategy"]) if pr.get("strategy") else next(
+                (s for s in ce["strategies"] if item_comp.get(iid) in (A.pk.get(s) or ())),
+                next(s for s in ce["strategies"] if s != ref),
+            )
+            lo, hi = float(pr["range"][0]), float(pr["range"][1])
+            grid = [float(x) for x in pr["grid"]]
+
+            def _eval_at_price(pval: float, _iid: str = iid, _p: str = p) -> dict[str, tuple[float, float]]:
+                _, prog_p = extract_events_and_prog_costs(A, out0, cost_overrides={_iid: float(pval)})
+                t_p = compose_perspective_totals(A.spec, units, evs0, prog_p, life_table=life_table)
+                return t_p[_p]["strategies_ce"]
+
+            t_by_lam: dict[str, dict] = {}
+            last_cells = []
+            for t in thresholds:
+                tid = str(t["id"])
+                t_lam = float(t["lambda"] if "lambda" in t else t["usd_per_unit"])
+                tp = threshold_price(_eval_at_price, target, t_lam, lo, hi, grid)
+                last_cells = tp["cells"]
+                t_by_lam[tid] = {
+                    "status": tp["status"],
+                    "value": tp["value"],
+                    "bracket_lo": tp["bracket"][0] if tp.get("bracket") else None,
+                    "bracket_hi": tp["bracket"][1] if tp.get("bracket") else None,
+                    "bracket": tp.get("bracket"),
+                }
+            prices_out[pid] = {"cost_item": iid, "strategy": target, "grid": grid, "cells": last_cells, "threshold": t_by_lam}
+
+        # Undiscounted budget impact per year by payer (§5.9)
+        first_chosen = th_rec[str(thresholds[0]["id"])]["chosen"]
+        payers_map = {str(k): str(v) for k, v in (ce.get("payers") or {}).items()}
+        prices_cfg = A.spec.raw["options"].get("prices") or {}
+        bi_by_payer: dict[str, float] = {py: 0.0 for py in CEASPEC.PAYERS}
+        for s_tag, sign in ((first_chosen, 1.0), (ref, -1.0)):
+            for iid, raw_c in (prog0.get(s_tag) or {}).items():
+                bi_by_payer[payers_map.get(iid, "health_system")] += sign * float(raw_c) / horizon_len
+            for cc in (ce.get("consequence_costs") or []):
+                n_ev = sum(float(v) for v in (evs0[s_tag].get(str(cc["outcome"])) or {}).values())
+                u_val = float(cc["value"]) * acosts._factor(cc, prices_cfg)
+                bi_by_payer[str(cc["payer"])] += sign * n_ev * u_val / horizon_len
+
+        p_block: dict = {
+            "strategies": strat_rows,
+            "frontier": inc["frontier"],
+            "thresholds": th_rec,
+            "prices": prices_out,
+            "budget_impact": {"chosen": first_chosen, "reference": ref, "annual_by_payer": bi_by_payer},
+        }
+        if prob is not None:
+            p_block["uncertainty"] = {
+                "draws": prob["draws"],
+                "status": prob["status"],
+                "quadrant_share": prob["quadrant_share"],
+                "delta_cost_interval": prob["delta_cost_interval"],
+                "delta_health_interval": prob["delta_health_interval"],
+                "icer_at_means": prob["icer_at_means"],
+            }
+            p_block["ceac"] = prob["ceac"]
+        persp_out[p] = p_block
+
+    agree: dict[str, str] = {}
+    if len(perspectives) >= 2:
+        p0, p1 = perspectives[0], perspectives[1]
+        for t in thresholds:
+            tid = str(t["id"])
+            c0 = persp_out[p0]["thresholds"][tid]["chosen"]
+            c1 = persp_out[p1]["thresholds"][tid]["chosen"]
+            agree[tid] = "agree" if c0 == c1 else "differ"
+
+    first_p = perspectives[0]
+    first_t = str(thresholds[0]["id"])
+    hl_chosen = persp_out[first_p]["thresholds"][first_t]["chosen"]
+    hl_row = persp_out[first_p]["strategies"][hl_chosen]
+    headline = {
+        "perspective": first_p,
+        "threshold_id": first_t,
+        "lambda": float(thresholds[0]["lambda"] if "lambda" in thresholds[0] else thresholds[0]["usd_per_unit"]),
+        "chosen": hl_chosen,
+        "reference": ref,
+        "status": hl_row["status"],
+        "delta_cost": hl_row["delta_cost_vs_ref"],
+        "delta_health": hl_row["delta_health_vs_ref"],
+        "icer": hl_row["icer"] if hl_row["status"] == "icer" else None,
+    }
+    return {
+        "perspectives": persp_out,
+        "perspectives_agree": agree,
+        "headline": headline,
+        "health_measure": {"kind": hm["kind"], "events": hm["events"]},
+        "timing": (ce.get("discounting") or {}).get("timing", "uniform_accrual"),
+        "population": pop,
+        "switching": [],
+    }
+
+
+def claims(_c, art_rel: str, cea_data: dict, spec, uq_interval: dict | None = None) -> list[dict]:
+    """Emit §7 cost-effectiveness claims; `.icer` claims are emitted ONLY when strategy status is `"icer"`."""
+    raw = spec.raw if hasattr(spec, "raw") else spec
+    ce = raw["cost_effectiveness"]
+    prices_cfg = raw["options"].get("prices") or {}
+    cur = str(prices_cfg.get("currency") or "USD")
+    byr = int(prices_cfg.get("base_year") or ce["discounting"]["base_year"])
+    cur_unit = f"{cur} ({byr})"
+    hkind = ce["health_measure"]["kind"]
+    h_unit = "DALYs averted" if hkind == "dalys" else "QALYs gained"
+    icer_unit = f"{cur_unit} per {'DALY averted' if hkind == 'dalys' else 'QALY gained'}"
+
+    out: list[dict] = []
+    for p, pdoc in cea_data["perspectives"].items():
+        pc = _cid(p)
+        uq_p = pdoc.get("uncertainty")
+        for s, row in pdoc["strategies"].items():
+            sc = _cid(s)
+            base_f = f"data.perspectives.{p}.strategies.{s}"
+            out.append(_c(f"cea.{pc}.{sc}.cost", "currency", art_rel, f"{base_f}.cost", cur_unit))
+            out.append(_c(f"cea.{pc}.{sc}.health", "scalar", art_rel, f"{base_f}.health", h_unit))
+            if uq_p is not None and uq_interval is not None:
+                out.append(_c(
+                    f"cea.{pc}.{sc}.delta_cost", "currency", art_rel,
+                    f"data.perspectives.{p}.uncertainty.delta_cost_interval.{s}.median", cur_unit, interval=uq_interval,
+                ))
+                out.append(_c(
+                    f"cea.{pc}.{sc}.delta_health", "scalar", art_rel,
+                    f"data.perspectives.{p}.uncertainty.delta_health_interval.{s}.median", h_unit, interval=uq_interval,
+                ))
+            else:
+                out.append(_c(f"cea.{pc}.{sc}.delta_cost", "currency", art_rel, f"{base_f}.delta_cost_vs_ref", cur_unit))
+                out.append(_c(f"cea.{pc}.{sc}.delta_health", "scalar", art_rel, f"{base_f}.delta_health_vs_ref", h_unit))
+            out.append(_c(f"cea.{pc}.{sc}.status", "label", art_rel, f"{base_f}.status"))
+            if row.get("status") == "icer" and row.get("icer") is not None:
+                out.append(_c(f"cea.{pc}.{sc}.icer", "currency", art_rel, f"{base_f}.icer", icer_unit))
+
+        for tid, tdoc in pdoc["thresholds"].items():
+            tc = _cid(tid)
+            tf = f"data.perspectives.{p}.thresholds.{tid}"
+            out.append(_c(f"cea.{pc}.{tc}.chosen", "label", art_rel, f"{tf}.chosen"))
+            for s in tdoc["nmb"]:
+                out.append(_c(f"cea.{pc}.{tc}.{_cid(s)}.nmb", "currency", art_rel, f"{tf}.nmb.{s}", cur_unit))
+            if "p_cost_effective_pct" in tdoc:
+                out.append(_c(f"cea.{pc}.{tc}.p_ce", "percentage", art_rel, f"{tf}.p_cost_effective_pct", "%"))
+                out.append(_c(f"cea.{pc}.{tc}.evpi", "currency", art_rel, f"{tf}.evpi", cur_unit))
+                out.append(_c(f"cea.{pc}.{tc}.evpi_per_person", "currency", art_rel, f"{tf}.evpi_per_person", cur_unit))
+
+        for pid, prdoc in (pdoc.get("prices") or {}).items():
+            prc = _cid(pid)
+            for tid, tr in (prdoc.get("threshold") or {}).items():
+                tc = _cid(tid)
+                pf = f"data.perspectives.{p}.prices.{pid}.threshold.{tid}"
+                out.append(_c(f"cea.{pc}.{prc}.{tc}.status", "label", art_rel, f"{pf}.status"))
+                if tr.get("value") is not None:
+                    out.append(_c(f"cea.{pc}.{prc}.{tc}.threshold", "currency", art_rel, f"{pf}.value", cur_unit))
+                    out.append(_c(f"cea.{pc}.{prc}.{tc}.bracket_lo", "currency", art_rel, f"{pf}.bracket_lo", cur_unit))
+                    out.append(_c(f"cea.{pc}.{prc}.{tc}.bracket_hi", "currency", art_rel, f"{pf}.bracket_hi", cur_unit))
+
+    for tid in cea_data.get("perspectives_agree") or {}:
+        tc = _cid(tid)
+        out.append(_c(f"cea.perspectives_agree.{tc}", "label", art_rel, f"data.perspectives_agree.{tid}"))
+
+    hl = cea_data["headline"]
+    out.append(_c("cea.headline.chosen", "label", art_rel, "data.headline.chosen"))
+    out.append(_c("cea.headline.status", "label", art_rel, "data.headline.status"))
+    out.append(_c("cea.headline.delta_cost", "currency", art_rel, "data.headline.delta_cost", cur_unit))
+    out.append(_c("cea.headline.delta_health", "scalar", art_rel, "data.headline.delta_health", h_unit))
+    if hl.get("status") == "icer" and hl.get("icer") is not None:
+        out.append(_c("cea.headline.icer", "currency", art_rel, "data.headline.icer", icer_unit))
+    return out
+
+
+def results_lines(cea_data: dict, spec) -> list[str]:
+    """Render the §7 cost-effectiveness section for `results.md`, with every number and verdict as a claim."""
+    L = ["", "## Cost-effectiveness", ""]
+    L.append(
+        "Headline choice (first perspective, first threshold): **[CLAIM:cea.headline.chosen]** "
+        "(status: [CLAIM:cea.headline.status]; incremental cost vs reference: [CLAIM:cea.headline.delta_cost]; "
+        "incremental health vs reference: [CLAIM:cea.headline.delta_health]"
+        + ("; ICER: [CLAIM:cea.headline.icer]" if cea_data["headline"].get("status") == "icer" else "")
+        + ")."
+    )
+    for p, pdoc in cea_data["perspectives"].items():
+        pc = _cid(p)
+        L += ["", f"### Perspective: {p}", "",
+              "| Strategy | Cost | Health | ΔCost vs ref | ΔHealth vs ref | Status | ICER |",
+              "|---|---:|---:|---:|---:|---|---:|"]
+        for s, row in pdoc["strategies"].items():
+            sc = _cid(s)
+            icer_cell = f"[CLAIM:cea.{pc}.{sc}.icer]" if row.get("status") == "icer" and row.get("icer") is not None else "—"
+            L.append(
+                f"| {s} | [CLAIM:cea.{pc}.{sc}.cost] | [CLAIM:cea.{pc}.{sc}.health] | "
+                f"[CLAIM:cea.{pc}.{sc}.delta_cost] | [CLAIM:cea.{pc}.{sc}.delta_health] | "
+                f"[CLAIM:cea.{pc}.{sc}.status] | {icer_cell} |"
+            )
+        L += ["", "| Threshold | Chosen | P(cost-effective) | EVPI | EVPI / person |",
+              "|---|---|---:|---:|---:|"]
+        for tid, tdoc in pdoc["thresholds"].items():
+            tc = _cid(tid)
+            if "p_cost_effective_pct" in tdoc:
+                L.append(
+                    f"| {tid} | [CLAIM:cea.{pc}.{tc}.chosen] | [CLAIM:cea.{pc}.{tc}.p_ce] | "
+                    f"[CLAIM:cea.{pc}.{tc}.evpi] | [CLAIM:cea.{pc}.{tc}.evpi_per_person] |"
+                )
+            else:
+                L.append(f"| {tid} | [CLAIM:cea.{pc}.{tc}.chosen] | — | — | — |")
+        if pdoc.get("prices"):
+            L += ["", "| Price input | Threshold | Status | Threshold price | Bracket |",
+                  "|---|---|---|---:|---|"]
+            for pid, prdoc in pdoc["prices"].items():
+                prc = _cid(pid)
+                for tid, tr in (prdoc.get("threshold") or {}).items():
+                    tc = _cid(tid)
+                    if tr.get("value") is not None:
+                        L.append(
+                            f"| {pid} | {tid} | [CLAIM:cea.{pc}.{prc}.{tc}.status] | "
+                            f"[CLAIM:cea.{pc}.{prc}.{tc}.threshold] | "
+                            f"[[CLAIM:cea.{pc}.{prc}.{tc}.bracket_lo], [CLAIM:cea.{pc}.{prc}.{tc}.bracket_hi]] |"
+                        )
+                    else:
+                        L.append(f"| {pid} | {tid} | [CLAIM:cea.{pc}.{prc}.{tc}.status] | — | — |")
+    if cea_data.get("perspectives_agree"):
+        L += ["", "Perspective agreement by threshold: " + ", ".join(
+            f"{tid}: [CLAIM:cea.perspectives_agree.{_cid(tid)}]" for tid in cea_data["perspectives_agree"]
+        ) + "."]
+    L.append("")
+    return L
+
+
+# --------------------------------------------------------------------------- Self-test (CE1-CE4, CE6-CE13, CE15)
 def _self_test() -> int:
     fails: list[str] = []
 
@@ -571,6 +1096,148 @@ def _self_test() -> int:
         hh_a = tot["societal"]["costs_by_payer"]["pkg_a"]["household"]
         ok(hh_a > 0.0 and abs(soc_a - (hs_a + hh_a)) < 1e-9,
            f"CE13 societal total ({soc_a:.2f}) equals health_system ({hs_a:.2f}) + household ({hh_a:.2f})")
+
+    # CE4: Drummond et al. (4th ed., 2015, Ch. 4 Table 4.5) mutually exclusive programmes with SD & ED
+    drum_st = {"A": (4147.0, 0.593), "B": (8363.0, 0.658), "C": (8907.0, 0.787), "D": (9078.0, 0.758)}
+    inc4 = incremental_analysis(drum_st, "A")
+    st4 = inc4["strategies"]
+    ok(inc4["frontier"] == ["A", "C"]
+       and st4["D"]["status"] == "dominated" and st4["D"]["vs"] == "C"
+       and st4["B"]["status"] == "extendedly_dominated" and st4["B"]["vs"] == ["A", "C"]
+       and abs(st4["C"]["icer"] - (8907.0 - 4147.0) / (0.787 - 0.593)) < 1e-6,
+       f"CE4 Drummond et al. (2015, 4th ed., Table 4.5) frontier={inc4['frontier']}, C ICER={st4['C']['icer']:.2f}")
+
+    # CE6: Gray et al. (2011, Ch. 2 Table 2.1) incremental table + probabilistic CEAC exercise
+    gray_st = {"A": (0.0, 0.0), "B": (10000.0, 0.40), "C": (22000.0, 0.55), "D": (25000.0, 0.50), "E": (40000.0, 1.00)}
+    inc6 = incremental_analysis(gray_st, "A")
+    st6 = inc6["strategies"]
+    rng6 = np.random.default_rng(2011)
+    n6 = 4000
+    gray_draws = {
+        "A": (np.zeros(n6), np.zeros(n6)),
+        "B": (rng6.normal(10000.0, 1000.0, n6), rng6.normal(0.40, 0.04, n6)),
+        "E": (rng6.normal(40000.0, 3000.0, n6), rng6.normal(1.00, 0.08, n6)),
+    }
+    p6 = probabilistic_summary(gray_draws, "A", [{"id": "t35", "lambda": 35000.0}, {"id": "t80", "lambda": 80000.0}])
+    ceac_sums6 = [sum(p6["ceac"]["share"][s][j] for s in gray_draws) for j in range(len(p6["ceac"]["lambda"]))]
+    ok(inc6["frontier"] == ["A", "B", "E"]
+       and st6["D"]["status"] == "dominated"
+       and st6["C"]["status"] == "extendedly_dominated" and st6["C"]["vs"] == ["B", "E"]
+       and abs(st6["B"]["icer"] - 25000.0) < 1e-6 and abs(st6["E"]["icer"] - 50000.0) < 1e-6
+       and all(abs(x - 1.0) < 1e-9 for x in ceac_sums6)
+       and p6["thresholds"]["t35"]["ceaf_chosen"] == "B" and p6["thresholds"]["t80"]["ceaf_chosen"] == "E",
+       f"CE6 Gray et al. (2011, Table 2.1) frontier={inc6['frontier']}, CEAC sums to 1, CEAF switches B->E")
+
+    # CE8: Fenwick et al. (2001) — CEAF picks highest expected NMB even when another strategy has higher CEAC
+    n8 = 1000
+    b_nmb_c = np.where(np.arange(n8) < 700, 90.0, 140.0)   # at lam=100, E=1 -> NMB(B)=+10 (70%) or -40 (30%), mean=-5
+    dbs8 = {"A": (np.zeros(n8), np.zeros(n8)), "B": (b_nmb_c, np.ones(n8))}
+    p8 = probabilistic_summary(dbs8, "A", [{"id": "t100", "lambda": 100.0}], ceac_grid=[100.0])
+    ok(p8["ceac"]["share"]["B"][0] > 0.69 and p8["thresholds"]["t100"]["ceaf_chosen"] == "A"
+       and abs(p8["thresholds"]["t100"]["p_cost_effective"] - 0.30) < 1e-9,
+       f"CE8 Fenwick (2001): B has CEAC {p8['ceac']['share']['B'][0]:.2f} but CEAF picks A (p_ce={p8['thresholds']['t100']['p_cost_effective']:.2f})")
+
+    # CE9: Analytic normal CEAC — ΔE ~ N(1, 0.5^2), ΔC ~ N(300, 200^2), lam=500 -> Φ(200 / sqrt(102500)) ≈ 0.7339
+    rng9 = np.random.default_rng(9001)
+    n9 = 20000
+    de9 = rng9.normal(1.0, 0.5, n9)
+    dc9 = rng9.normal(300.0, 200.0, n9)
+    p9 = probabilistic_summary({"A": (np.zeros(n9), np.zeros(n9)), "B": (dc9, de9)}, "A",
+                               [{"id": "t500", "lambda": 500.0}], ceac_grid=[500.0])
+    z9 = (500.0 * 1.0 - 300.0) / math.sqrt(500.0 ** 2 * 0.25 + 200.0 ** 2)
+    phi9 = 0.5 * (1.0 + math.erf(z9 / math.sqrt(2.0)))
+    mc_se9 = math.sqrt(phi9 * (1.0 - phi9) / n9)
+    got9 = p9["ceac"]["share"]["B"][0]
+    ok(abs(got9 - phi9) < 4.0 * mc_se9,
+       f"CE9 analytic normal CEAC at lam=500: got {got9:.4f}, exact {phi9:.4f} (4*SE={4*mc_se9:.4f})")
+
+    # CE10: Unit normal loss EVPI — ΔNMB ~ N(10, 20^2) -> EVPI = σ φ(μ/σ) + μ Φ(μ/σ) - max(0, μ) ≈ 3.9559
+    rng10 = np.random.default_rng(10001)
+    n10 = 20000
+    dnmb10 = rng10.normal(10.0, 20.0, n10)
+    # Set lam=1, E=dnmb10, C=0 so NMB(B) - NMB(A) = dnmb10
+    p10 = probabilistic_summary({"A": (np.zeros(n10), np.zeros(n10)), "B": (np.zeros(n10), dnmb10)}, "A",
+                                [{"id": "t1", "lambda": 1.0}], ceac_grid=[1.0])
+    mu10, sig10 = 10.0, 20.0
+    r10 = mu10 / sig10
+    exact_evpi10 = sig10 * (math.exp(-0.5 * r10 * r10) / math.sqrt(2.0 * math.pi)) + mu10 * (
+        0.5 * (1.0 + math.erf(r10 / math.sqrt(2.0)))) - max(0.0, mu10)
+    got10 = p10["thresholds"]["t1"]["evpi"]
+    se10 = p10["thresholds"]["t1"]["evpi_se"]
+    ok(abs(got10 - exact_evpi10) < 4.0 * max(se10, 0.05),
+       f"CE10 unit normal loss EVPI: got {got10:.3f} (SE={se10:.3f}), exact {exact_evpi10:.3f}")
+
+    # CE15: Collector reads uncertainty.run's exact draws without extra evaluations; uncertainty.yaml byte-identical
+    import copy
+    from toolkit.analysis import artifacts as ART, claims as CL, core as CORE, model as MOD, uncertainty as UQ
+    with tempfile.TemporaryDirectory() as d15:
+        raw_base = CEASPEC.toy_cea_spec(d15, standalone=False)
+        raw_base["uncertainty"] = {
+            "draws": 15, "seed": 77,
+            "sources": [{"kind": "engine_parameters"}],
+            "excluded": [
+                {"kind": "calibration", "reason": "toy test"},
+                {"kind": "costs", "reason": "negotiated price grid"},
+                {"kind": "emulator", "reason": "direct evaluation"},
+                {"kind": "health_weights", "reason": "held fixed in CE15 parity check"},
+            ],
+        }
+        raw_no_cea = copy.deepcopy(raw_base)
+        raw_no_cea.pop("cost_effectiveness", None)
+        raw_no_cea["uncertainty"]["excluded"] = [
+            x for x in raw_no_cea["uncertainty"]["excluded"] if x.get("kind") != "health_weights"
+        ]
+        sp_no = schema.Spec(raw_no_cea, d15, os.path.join(d15, "spec_no.yaml"))
+        sp_ce = schema.Spec(raw_base, d15, os.path.join(d15, "spec_ce.yaml"))
+        m_no = MOD.DirectModel(sp_no)
+        m_ce = MOD.DirectModel(sp_ce)
+        A_no = CORE.Analysis(sp_no, m_no)
+        A_ce = CORE.Analysis(sp_ce, m_ce)
+        z_no = {i: None for i in A_no.ids}
+        out_no, ben_no, cost_no = A_no.evaluate(A_no.theta0, z_no)
+        plan_no = A_no.solve(ben_no, cost_no)["choice"]
+        u_no = UQ.run(A_no, plan_no, "total_averted", draws=15, seed=77)
+        z_ce = {i: None for i in A_ce.ids}
+        out_ce, ben_ce, cost_ce = A_ce.evaluate(A_ce.theta0, z_ce)
+        plan_ce = A_ce.solve(ben_ce, cost_ce)["choice"]
+        ccol15 = Collector(A_ce)
+        u_ce = UQ.run(A_ce, plan_ce, "total_averted", draws=15, seed=77, on_draw=ccol15.add)
+        # Note: draw_plan/excludes lists `health_weights` only when CEA section is present; compare draws & quantiles
+        u_no_cmp = {k: v for k, v in u_no["data"].items() if k not in ("excludes", "label", "interval", "draw_plan")}
+        u_ce_cmp = {k: v for k, v in u_ce["data"].items() if k not in ("excludes", "label", "interval", "draw_plan")}
+        y_no = yaml.safe_dump(ART.plain(u_no_cmp), sort_keys=False)
+        y_ce = yaml.safe_dump(ART.plain(u_ce_cmp), sort_keys=False)
+        cea_doc15 = run_cea(A_ce, out_ce, cost_ce, collector=ccol15, uq_level=0.95)
+        st15 = ART.Store(d15, "sha", True, {"name": "toy"})
+        rel15 = st15.write("cost_effectiveness", cea_doc15, PRODUCER, [])
+        cl15 = claims(CL._c, rel15, cea_doc15, sp_ce, uq_interval=u_ce["data"]["interval"])
+        rl15 = results_lines(cea_doc15, sp_ce)
+        os.makedirs(os.path.join(d15, "models"), exist_ok=True)
+        with open(os.path.join(d15, "models", "claims_spec.yaml"), "w", encoding="utf-8") as f:
+            yaml.safe_dump({"producer": PRODUCER, "produced_by": "harness", "claims": cl15}, f, sort_keys=False)
+        B15, R15 = CL._scripts()
+        bdoc15, berrs15 = B15.write(d15)
+        loaded15 = R15.load_claims(os.path.join(d15, "models", "claims_ledger.yaml"))
+        _, unres15 = R15.render_text("\n".join(rl15), loaded15)
+        # Also verify health_weights stream draws hw:cases without altering engine_parameters draws
+        raw_hw = copy.deepcopy(raw_base)
+        raw_hw["uncertainty"]["sources"].append({"kind": "health_weights"})
+        raw_hw["uncertainty"]["excluded"] = [
+            x for x in raw_hw["uncertainty"]["excluded"] if x.get("kind") != "health_weights"
+        ]
+        sp_hw = schema.Spec(raw_hw, d15, os.path.join(d15, "spec_hw.yaml"))
+        A_hw = CORE.Analysis(sp_hw, MOD.DirectModel(sp_hw))
+        out_hw, ben_hw, cost_hw = A_hw.evaluate(A_hw.theta0, {i: None for i in A_hw.ids})
+        plan_hw = A_hw.solve(ben_hw, cost_hw)["choice"]
+        ccol_hw = Collector(A_hw)
+        u_hw = UQ.run(A_hw, plan_hw, "total_averted", draws=15, seed=77, on_draw=ccol_hw.add)
+        ok(y_no == y_ce and ccol15.n_draws == 15 and m_ce.runs == m_no.runs
+           and u_hw["data"]["fixed_plan"] == u_no["data"]["fixed_plan"]
+           and "hw:cases" in (u_hw["report"].get("parameter_samples") or {})
+           and cea_doc15["perspectives"]["health_system"]["uncertainty"]["draws"] == 15
+           and cea_doc15["perspectives"]["health_system"]["uncertainty"]["status"] == "indicative"
+           and not berrs15 and not (bdoc15 or {}).get("unresolved") and not unres15,
+           f"CE15 uncertainty draws identical with/without CEA & with health_weights stream (runs={m_ce.runs}), collector reads exact 15 draws, claims+results render ({len(loaded15)} claims, unres={unres15})")
 
     if fails:
         print(f"FAILED: {len(fails)} case(s)")

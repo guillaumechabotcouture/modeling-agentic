@@ -168,12 +168,14 @@ def _spec_rows(A, claimable=False) -> list[dict]:
 
 
 def write(A, run_dir, arts, point, uq, stab, sens, dts, cal, emu_acc, pv=None, burden=None, anchor=None,
-          voi=None, wiring=None) -> dict:
+          voi=None, wiring=None, cea=None) -> dict:
     B, R = _scripts()
-    from toolkit.analysis import value_of_information as VOI, wiring as WR
+    from toolkit.analysis import cea as CEA, value_of_information as VOI, wiring as WR
     spec = {"producer": PRODUCER, "produced_by": "harness",
             "claims": claim_spec(A, arts, point, uq, stab, dts, cal, burden, anchor) + variant_claims(A, arts, pv)
-            + (VOI.claims(_c, arts["value_of_information"], voi) if voi is not None else [])}
+            + (VOI.claims(_c, arts["value_of_information"], voi) if voi is not None else [])
+            + (CEA.claims(_c, arts["cost_effectiveness"], cea, A.spec, uq_interval=uq.get("interval"))
+               if cea is not None else [])}
     from toolkit.analysis.artifacts import _safe_io
     _safe_io().write_nofollow(run_dir, SPEC_REL.replace(os.sep, "/"),
                               yaml.safe_dump(spec, sort_keys=False, width=120).encode(), atomic=True)
@@ -184,6 +186,7 @@ def write(A, run_dir, arts, point, uq, stab, sens, dts, cal, emu_acc, pv=None, b
         raise RuntimeError(f"claims ledger: unresolved harness claims {doc['unresolved'][:3]}")
     claims = R.load_claims(os.path.join(run_dir, "models", "claims_ledger.yaml"))
     text = (results_template(A, point, uq, stab, sens, dts, cal, emu_acc, burden, anchor) + variants_markdown(A, pv)
+            + ("\n" + "\n".join(CEA.results_lines(cea, A.spec)) if cea is not None else "")
             + ("\n" + "\n".join(VOI.results_lines(voi)) if voi is not None else "")
             + ("\n" + "\n".join(WR.results_lines(wiring)) if wiring is not None else ""))
     rendered, unresolved = R.render_text(text, claims)

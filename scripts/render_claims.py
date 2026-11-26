@@ -291,16 +291,38 @@ _VALID_KINDS = frozenset({
     "scalar", "count", "label", "percentage", "currency", "citation",
 })
 _NUMERIC_KINDS = frozenset({"scalar", "count", "percentage", "currency"})
+_FORBIDDEN_ICER_STATUSES = frozenset({
+    "dominated", "extendedly_dominated", "dominant", "no_health_difference",
+    "less_health_lower_cost", "identical", "reference",
+})
+
+
+def _icer_status_problem(cid: str, claims_map: dict[str, dict]) -> str | None:
+    """CE3 guard: an `.icer` claim is refused when its sibling `.status` claim is a non-ICER state."""
+    if not cid.endswith(".icer"):
+        return None
+    sib = claims_map.get(cid[:-5] + ".status")
+    if isinstance(sib, dict):
+        st = str(sib.get("value") or "").strip()
+        if st in _FORBIDDEN_ICER_STATUSES:
+            return f"ICER claim {cid!r} is forbidden when sibling status is {st!r}"
+    return None
 
 
 def load_claims(ledger_path: str) -> dict[str, dict]:
     """Read the ledger and return {claim_id: claim_dict}.
 
     Validates internal consistency: ci_low <= value <= ci_high for
-    scalar/percentage claims that declare CIs. Raises ValueError on
+    scalar/percentage claims that declare CIs, and refuses planted `.icer`
+    claims for dominated/degenerate strategies (CE3). Raises ValueError on
     schema violations.
     """
-    return _validate_claims(_read_claims(ledger_path), ledger_path)
+    out = _validate_claims(_read_claims(ledger_path), ledger_path)
+    for cid in list(out):
+        why = _icer_status_problem(cid, out)
+        if why:
+            raise ValueError(f"{ledger_path}: {why}")
+    return out
 
 
 def _read_claims(ledger_path: str) -> list:
@@ -338,6 +360,11 @@ def load_claims_tolerant(ledger_path: str) -> tuple[dict[str, dict], dict[str, s
             good.pop(name, None)
             continue
         good.update(one)
+    for cid in list(good):
+        why = _icer_status_problem(cid, good)
+        if why:
+            bad[cid] = f"{ledger_path}: {why}"
+            good.pop(cid, None)
     return good, bad
 
 
@@ -417,6 +444,13 @@ def _validate_claims(raw: list, ledger_path: str, start: int = 0) -> dict[str, d
                     raise ValueError(
                         f"{ledger_path}: claims[{i}] {cid!r} CI bounds "
                         f"violated: {flo} <= {fv} <= {fhi}")
+        if cid.endswith(".icer"):
+            if kind not in _NUMERIC_KINDS or float(v) <= 0.0:
+                raise ValueError(
+                    f"{ledger_path}: claims[{i}] {cid!r} ICER claim must be a strictly positive finite number")
+            if c.get("ci_low") is not None or c.get("ci_high") is not None or c.get("interval") is not None:
+                raise ValueError(
+                    f"{ledger_path}: claims[{i}] {cid!r} ICER claims must not carry intervals (use CE plane/CEAC)")
         out[cid] = c
     return out
 
@@ -1105,6 +1139,45 @@ def _self_test() -> int:
                 raised.append(type(e).__name__)
         ok(raised == ["AttributeError", "ValueError"],
            f"RCL_ISOLATE5 load_claims is unchanged for a ledger that is a list; the tolerant reader refuses it ({raised})")
+
+    # CE3_RCL: planted .icer claim refused when strategy status is dominated/degenerate, negative, or carries interval
+    with tempfile.TemporaryDirectory() as d:
+        lp = os.path.join(d, "cea.yaml")
+        for bad_name, rows in (
+            ("dominated_icer", [
+                {"id": "cea.health_system.s1.status", "claim_kind": "label", "value": "dominated"},
+                {"id": "cea.health_system.s1.icer", "claim_kind": "currency", "value": 500.0},
+            ]),
+            ("sw_icer", [
+                {"id": "cea.health_system.s2.status", "claim_kind": "label", "value": "less_health_lower_cost"},
+                {"id": "cea.health_system.s2.icer", "claim_kind": "currency", "value": 100.0},
+            ]),
+            ("negative_icer", [
+                {"id": "cea.health_system.s3.icer", "claim_kind": "currency", "value": -50.0},
+            ]),
+            ("interval_icer", [
+                {"id": "cea.health_system.s4.icer", "claim_kind": "currency", "value": 250.0,
+                 "ci_low": 100.0, "ci_high": 400.0},
+            ]),
+        ):
+            with open(lp, "w") as f:
+                yaml.safe_dump({"claims": rows}, f)
+            strict_bad = False
+            try:
+                load_claims(lp)
+            except ValueError:
+                strict_bad = True
+            good_t, bad_t = load_claims_tolerant(lp)
+            ok(strict_bad and any(k.endswith(".icer") for k in bad_t) and not any(k.endswith(".icer") for k in good_t),
+               f"CE3_RCL {bad_name}: planted .icer refused by load_claims and load_claims_tolerant ({bad_t})")
+        with open(lp, "w") as f:
+            yaml.safe_dump({"claims": [
+                {"id": "cea.health_system.s_ok.status", "claim_kind": "label", "value": "frontier"},
+                {"id": "cea.health_system.s_ok.icer", "claim_kind": "currency", "value": 350.0,
+                 "units": "USD (2025) per DALY averted"},
+            ]}, f)
+        ok_map = load_claims(lp)
+        ok("cea.health_system.s_ok.icer" in ok_map, "CE3_RCL valid frontier .icer accepted")
 
     if failures:
         print(f"FAIL: {len(failures)} case(s)", file=sys.stderr)
