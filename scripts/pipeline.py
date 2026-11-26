@@ -1756,6 +1756,188 @@ def _bwrap_cmd(kind: str, binds: list, envargs: list, chdir: str, child: list) -
         "--new-session", "--clearenv", *envargs, "--chdir", chdir, *drop, *child]
 
 
+ACQUIRED_PREFIX = "data/inputs/acquired/"
+
+
+def _has_acquired_inputs(run_dir: str, ders: list | None = None) -> bool:
+    """True when the run carries any acquired input tree, provenance marker, or derivation input (DS1/DS2)."""
+    if os.path.lexists(os.path.join(run_dir, "data", "inputs", "acquired")):
+        return True
+    try:
+        with open(os.path.join(run_dir, INPUTS_PROVENANCE), encoding="utf-8") as f:
+            doc = json.load(f)
+        if isinstance(doc, dict):
+            if "acquired_inventory_sha256" in doc:
+                return True
+            if any(isinstance(v, dict) and v.get("origin") == "acquired" for v in (doc.get("inputs") or {}).values()):
+                return True
+    except (OSError, ValueError):
+        pass
+    if ders and any(str(i).startswith(ACQUIRED_PREFIX) for d in ders for i in (d.get("inputs") or [])):
+        return True
+    return False
+
+
+def _narrow_ro_prefixes() -> list[str]:
+    """Minimal read-only runtime mounts for derivations reading acquired inputs (DS1: no `--ro-bind / /`)."""
+    import encodings
+    import importlib.util
+    import site
+    import sysconfig
+
+    candidates: list[str] = []
+    runtime_paths: list[str] = []
+    repo_real = os.path.realpath(REPO)
+    forbidden = {"/", "/tmp", "/var", "/home", "/root", "/bin", "/sbin", "/lib", "/lib64", "/lib32", repo_real}
+
+    def _safe_prefix(p: str) -> bool:
+        return bool(p) and p not in (*forbidden, "/opt", "/usr") and not p.startswith(repo_real + os.sep)
+
+    def collect(path: str, *, runtime: bool = False) -> None:
+        if not path or not os.path.exists(path):
+            return
+        for target in dict.fromkeys((os.path.normpath(os.path.abspath(path)), os.path.realpath(path))):
+            if target in forbidden:
+                continue
+            if target.startswith(repo_real + os.sep):
+                rel = os.path.relpath(target, repo_real).replace(os.sep, "/")
+                if not (rel in (".venv", "venv") or rel.startswith((".venv/", "venv/"))):
+                    continue
+            candidates.append(target)
+            if runtime:
+                runtime_paths.append(target)
+
+    def collect_mod_file(fp: str | None, levels: int = 1) -> None:
+        if not fp or not os.path.exists(fp):
+            return
+        for bf in dict.fromkeys((os.path.abspath(fp), os.path.realpath(fp))):
+            cur = os.path.dirname(bf)
+            collect(cur, runtime=True)
+            for _ in range(levels):
+                cur = os.path.dirname(cur)
+                if _safe_prefix(cur):
+                    collect(cur, runtime=True)
+            if os.path.basename(cur) in ("lib", "lib64") and _safe_prefix(os.path.dirname(cur)):
+                collect(os.path.dirname(cur), runtime=True)
+
+    for base in ("/usr", "/etc/ld.so.cache", "/etc/ld.so.conf", "/etc/ld.so.conf.d", "/etc/alternatives"):
+        if os.path.exists(base):
+            collect(base)
+    exe_abs, exe_real = os.path.abspath(sys.executable), os.path.realpath(sys.executable)
+    exe_gp = os.path.dirname(os.path.dirname(exe_real))
+    base_exe = getattr(sys, "_base_executable", "") or ""
+    base_real = os.path.realpath(base_exe) if base_exe and os.path.exists(base_exe) else ""
+    for cand in (
+        sys.prefix, sys.base_prefix, sys.exec_prefix, sys.base_exec_prefix,
+        os.path.dirname(exe_abs), os.path.dirname(exe_real), exe_gp if _safe_prefix(exe_gp) else "",
+        os.path.dirname(os.path.abspath(base_exe)) if base_exe else "",
+        os.path.dirname(base_real) if base_real else "",
+    ):
+        if cand:
+            collect(cand, runtime=True)
+    for cfg_d in dict.fromkeys((sys.prefix, os.path.dirname(os.path.dirname(exe_abs)))):
+        cfg = os.path.join(cfg_d, "pyvenv.cfg")
+        if os.path.isfile(cfg):
+            try:
+                for ln in open(cfg, encoding="utf-8", errors="replace"):
+                    k, sep, v = ln.partition("=")
+                    if sep and k.strip().lower() == "home" and os.path.isdir(v.strip()):
+                        collect(v.strip(), runtime=True)
+                        if _safe_prefix(os.path.dirname(v.strip())):
+                            collect(os.path.dirname(v.strip()), runtime=True)
+                        break
+            except OSError:
+                pass
+    collect_mod_file(getattr(encodings, "__file__", None), levels=2)
+    collect_mod_file(getattr(os, "__file__", None), levels=1)
+    for sp in sysconfig.get_paths().values():
+        if sp and os.path.exists(sp):
+            collect(sp, runtime=True)
+    for var in ("LIBDIR", "LIBPL", "DESTLIB", "BINLIBDEST", "PREFIX", "EXEC_PREFIX"):
+        val = sysconfig.get_config_var(var)
+        if isinstance(val, str) and val and os.path.isdir(val):
+            collect(val, runtime=True)
+    try:
+        for sp in site.getsitepackages():
+            if sp and os.path.isdir(sp):
+                collect(sp, runtime=True)
+    except AttributeError:
+        pass
+    for mod in ("numpy", "pandas", "yaml"):
+        try:
+            spec = importlib.util.find_spec(mod)
+        except (ImportError, ValueError, AttributeError):
+            spec = None
+        orig = getattr(spec, "origin", None) if spec is not None else None
+        if orig and orig not in ("built-in", "frozen") and os.path.exists(orig):
+            collect_mod_file(orig, levels=2 if os.path.basename(orig) == "__init__.py" else 1)
+    for env_k in ("LD_LIBRARY_PATH", "PYTHONHOME"):
+        for lp in (os.environ.get(env_k) or "").split(os.pathsep):
+            if lp.strip() and os.path.isdir(lp.strip()):
+                collect(lp.strip(), runtime=True)
+    for rp in list(runtime_paths):
+        if rp.startswith("/opt/"):
+            parts = rp.split("/")
+            if len(parts) >= 3 and parts[2]:
+                sub = "/opt/" + parts[2]
+                if os.path.isdir(sub) and sub != repo_real and not repo_real.startswith(sub + os.sep):
+                    collect(sub)
+
+    mounts, seen_dirs, seen = [], [], set()
+    for target in sorted(dict.fromkeys(candidates), key=lambda p: (p.count("/"), p)):
+        if target in seen or any(target.startswith(d.rstrip("/") + "/") for d in seen_dirs):
+            continue
+        seen.add(target)
+        mounts.append(target)
+        if os.path.isdir(target) and not os.path.islink(target):
+            seen_dirs.append(target)
+    return mounts
+
+
+def _bwrap_narrow_cmd(kind: str, binds: list, envargs: list, chdir: str, child: list) -> list:
+    """Narrowed bubblewrap command for runs with acquired inputs (DS1): NO `--ro-bind / /`.
+    Mounts only the interpreter/library prefixes, this launcher script, `work`, and declared inputs."""
+    uid, gid = str(os.getuid()), str(os.getgid())
+    if kind == "bwrap":
+        ns = ["--unshare-all", "--uid", uid, "--gid", gid]
+        drop = []
+    else:
+        ns = ["--unshare-net", "--unshare-pid", "--unshare-ipc", "--unshare-uts", "--unshare-cgroup-try"]
+        drop = ["setpriv", "--reuid", uid, "--regid", gid, "--clear-groups", "--no-new-privs", "--inh-caps=-all",
+                "--bounding-set=-all", "--"]
+    top_binds: list[str] = []
+    for top in ("/bin", "/sbin", "/lib", "/lib64", "/lib32"):
+        if os.path.islink(top):
+            top_binds += ["--symlink", os.readlink(top), top]
+        elif os.path.isdir(top):
+            top_binds += ["--ro-bind", top, top]
+    for p in _narrow_ro_prefixes():
+        top_binds += ["--ro-bind", p, p]
+    launcher = os.path.abspath(__file__)
+    top_binds += ["--ro-bind", launcher, launcher]
+    return (["sudo", "-n"] if kind == "bwrap-sudo" else []) + [
+        "bwrap", "--dev", "/dev", "--proc", "/proc", "--tmpfs", "/tmp",
+        *top_binds, *binds, *ns, "--die-with-parent", "--new-session", "--clearenv",
+        *envargs, "--chdir", chdir, *drop, *child,
+    ]
+
+
+def _safe_acquired_err(err: str, script: str, inputs: list) -> str:
+    """Sanitize a derivation failure on an acquired input: exception class, script line, and input path only (§3.3)."""
+    exc_cls = "RuntimeError"
+    for ln in reversed((err or "").splitlines()):
+        m = re.match(r"^\s*([A-Za-z_][A-Za-z0-9_.]*(?:Error|Exception|Warning|Exit))(?:\s*:|$)", ln)
+        if m:
+            exc_cls = m.group(1)
+            break
+    line_no = None
+    for m in re.finditer(r'File "[^"]*' + re.escape(os.path.basename(script)) + r'", line (\d+)', err or ""):
+        line_no = int(m.group(1))
+    acq_in = [i for i in inputs if str(i).startswith(ACQUIRED_PREFIX)]
+    where = f"{script}:{line_no}" if line_no is not None else script
+    return f"{exc_cls} at {where} (inputs: {', '.join(acq_in[:3])})"
+
+
 def _bwrap_probe(kind: str) -> bool:
     try:
         r = subprocess.run(_bwrap_cmd(kind, [], ["--setenv", "PATH", os.environ.get("PATH", "/usr/bin:/bin")], "/",
@@ -1822,7 +2004,8 @@ def _strip_columns(src: str, dest: str, cols: list[str]) -> None:
             w.writerow([row[i] for i in keep if i < len(row)])
 
 
-def _run_derivation(d: dict, run_dir: str, kind: str, lim: dict, strip: dict | None = None) -> dict:
+def _run_derivation(d: dict, run_dir: str, kind: str, lim: dict, strip: dict | None = None,
+                    narrow: bool = False) -> dict:
     """One run of one derivation in a private work directory (removed by the caller: `work`). The script sees its
     declared inputs (read-only), its own outputs' directories (writable) and nothing else of the run directory."""
     work = os.path.realpath(tempfile.mkdtemp(prefix="derive_"))
@@ -1851,6 +2034,9 @@ def _run_derivation(d: dict, run_dir: str, kind: str, lim: dict, strip: dict | N
     env = _env(work)
     if kind == "none":
         cmd = child
+    elif narrow:
+        envargs = [a for k, v in env.items() for a in ("--setenv", k, v)]
+        cmd = _bwrap_narrow_cmd(kind, ["--bind", work, work, *mounts], envargs, work, child)
     else:
         envargs = [a for k, v in env.items() for a in ("--setenv", k, v)]
         cmd = _bwrap_cmd(kind, ["--tmpfs", run_dir, "--remount-ro", run_dir,     # the run directory is not visible
@@ -1946,6 +2132,11 @@ def derive(run_dir: str, unsandboxed_ok: bool = False, limits: dict | None = Non
         rk = ((e or {}).get("sandbox") or {}).get("kind")
         return (isinstance(e, dict) and e.get("ok") and _current(d, e, run_dir) is None
                 and (rk != "none" or found is None))
+    acq_run = _has_acquired_inputs(run_dir, ders)
+    if kind is None and acq_run and not all(current(d) for d in ders):
+        rep.update(ok=False, problems=[{"code": "derivation_unsandboxed_acquired", "id": None, "claim":
+                   "runs with acquired inputs require a real Linux bubblewrap sandbox; --derive-unsandboxed is refused"}])
+        return rep
     if kind is None and not unsandboxed_ok and not all(current(d) for d in ders):
         rep.update(ok=False, problems=[{"code": "derivation_unsandboxed", "id": None, "claim":
                    f"no sandbox on this machine ({sys.platform}): derivations run only in Linux namespaces (bubblewrap). "
@@ -1965,7 +2156,8 @@ def derive(run_dir: str, unsandboxed_ok: bool = False, limits: dict | None = Non
                  "script": {"path": d["script"], "sha256": _sha(os.path.join(run_dir, d["script"]))},
                  "inputs": {i: _sha(os.path.join(run_dir, i)) for i in d["inputs"]}, "outputs": {},
                  "ok": False, "code": "derivation_failed", "reason": "", "cap": None,
-                 "sandbox": {"kind": kind, "limits": lim}, "python": sys.version.split()[0], "libraries": _libraries(),
+                 "sandbox": {"kind": kind, "narrow": bool(acq_run and kind != "none"), "limits": lim},
+                 "python": sys.version.split()[0], "libraries": _libraries(),
                  "runtime_s": None, "stderr_tail": "", "runs": 0}
         entries[sid] = entry
         from lib.safe_io import remove_nofollow, LinkRefused
@@ -1983,15 +2175,21 @@ def derive(run_dir: str, unsandboxed_ok: bool = False, limits: dict | None = Non
             why.append(f"script {d['script']} is missing")
         else:
             why += [f"refused import: {x}" for x in import_problems(os.path.join(run_dir, d["script"]))]
+        uses_acq = any(str(i).startswith(ACQUIRED_PREFIX) for i in d["inputs"])
         runs = []
         try:
             if not why:
-                runs.append(_run_derivation(d, run_dir, kind, lim))
+                runs.append(_run_derivation(d, run_dir, kind, lim, narrow=acq_run))
                 r1 = runs[0]
-                entry.update(runs=1, runtime_s=r1["runtime_s"], stderr_tail=r1["err"][-800:], cap=r1["cap"])
+                entry.update(runs=1, runtime_s=r1["runtime_s"],
+                             stderr_tail="" if uses_acq else r1["err"][-800:], cap=r1["cap"])
                 if r1["rc"] != 0:
-                    why.append(f"the script failed (exit {r1['rc']})" + (f": the {r1['cap']} cap ({lim[r1['cap']]}) "
-                                                                         "was reached" if r1["cap"] else ""))
+                    if uses_acq:
+                        entry["code"] = "derivation_failed_on_acquired"
+                        why.append(_safe_acquired_err(r1["err"], d["script"], d["inputs"]))
+                    else:
+                        why.append(f"the script failed (exit {r1['rc']})" + (f": the {r1['cap']} cap ({lim[r1['cap']]}) "
+                                                                             "was reached" if r1["cap"] else ""))
                 if r1["undeclared"]:
                     why.append(f"undeclared output(s): {', '.join(sorted(r1['undeclared'])[:5])}")
                 if r1["input_written"]:
@@ -2000,7 +2198,7 @@ def derive(run_dir: str, unsandboxed_ok: bool = False, limits: dict | None = Non
                 if not why and miss:
                     why.append(f"declared output(s) not written: {', '.join(miss)}")
             if not why:
-                runs.append(_run_derivation(d, run_dir, kind, lim))
+                runs.append(_run_derivation(d, run_dir, kind, lim, narrow=acq_run))
                 entry["runs"] = 2
                 if runs[1]["rc"] != 0 or runs[1]["outputs"] != runs[0]["outputs"]:
                     entry["code"] = "derivation_nondeterministic"
@@ -2008,7 +2206,7 @@ def derive(run_dir: str, unsandboxed_ok: bool = False, limits: dict | None = Non
                                + ", ".join(o for o in d["outputs"] if runs[1]["outputs"].get(o) != runs[0]["outputs"].get(o)))
             strip = _ignored_columns(d, run_dir) if not why else {}
             if strip:
-                runs.append(_run_derivation(d, run_dir, kind, lim, strip=strip))
+                runs.append(_run_derivation(d, run_dir, kind, lim, strip=strip, narrow=acq_run))
                 entry["runs"] = 3
                 entry["ignored_columns_checked"] = strip
                 if runs[-1]["rc"] != 0 or runs[-1]["outputs"] != runs[0]["outputs"]:
@@ -3622,6 +3820,74 @@ def _self_test_derivations(ok) -> None:
                 f"{codes(r)} {e['reason'][:100]!r}")
         except Exception as e:  # noqa: BLE001
             rep(False, f"DI2b import allowlist: {type(e).__name__}: {e}")
+    # DS1/DS2/DS3 (docs/design/acquire.md §3.3): narrowed derivation sandbox + no unsandboxed + sanitized error
+    import yaml as _yaml
+    with tempfile.TemporaryDirectory() as d_acq, tempfile.TemporaryDirectory() as d_ext:
+        d_acq = os.path.realpath(d_acq)
+        sentinel = os.path.join(os.path.realpath(d_ext), "secret_outside.txt")
+        open(sentinel, "w", encoding="utf-8").write("TOP_SECRET_OUTSIDE")
+        acq_rel = "data/inputs/acquired/svc/raw.csv"
+        os.makedirs(os.path.join(d_acq, os.path.dirname(acq_rel)), exist_ok=True)
+        os.makedirs(os.path.join(d_acq, "data", "derive"), exist_ok=True)
+        raw_csv = "id,val\nu1,42\n"
+        open(os.path.join(d_acq, acq_rel), "w", encoding="utf-8").write(raw_csv)
+        open(os.path.join(d_acq, INPUTS_PROVENANCE), "w", encoding="utf-8").write(json.dumps({
+            "inputs": {acq_rel: {"origin": "acquired", "sha256": _sha(os.path.join(d_acq, acq_rel))}},
+            "acquired_inventory_sha256": "deadbeef",
+        }))
+        open(os.path.join(d_acq, "data", "derive", "probe.py"), "w", encoding="utf-8").write(
+            "import argparse, csv\n"
+            "ap = argparse.ArgumentParser()\n"
+            "ap.add_argument('--inputs', nargs='+'); ap.add_argument('--outputs', nargs='+')\n"
+            "a = ap.parse_args()\n"
+            f"try:\n    seen = open({sentinel!r}).read()\nexcept OSError:\n    seen = 'BLOCKED'\n"
+            "with open(a.inputs[0]) as f, open(a.outputs[0], 'w', newline='') as g:\n"
+            "    rows = list(csv.reader(f))\n"
+            "    w = csv.writer(g); w.writerow(['id', 'val', 'probe'])\n"
+            "    for r in rows[1:]: w.writerow([r[0], r[1], seen])\n"
+        )
+        open(os.path.join(d_acq, DERIVATIONS), "w", encoding="utf-8").write(_yaml.safe_dump({
+            "version": 1,
+            "derivations": [{
+                "id": "acq_probe", "script": "data/derive/probe.py",
+                "inputs": [acq_rel], "outputs": ["data/derived/out.csv"],
+                "columns": {"uses": {acq_rel: ["id", "val"]}, "ignores": {}},
+            }],
+        }))
+        # DS2: --derive-unsandboxed refused whenever acquired inputs exist
+        saved = list(_SANDBOX)
+        _SANDBOX[:] = [None]
+        try:
+            r_ds2 = derive(d_acq, unsandboxed_ok=True)
+        finally:
+            _SANDBOX[:] = saved
+        rep(not r_ds2["ok"] and codes(r_ds2) == ["derivation_unsandboxed_acquired"],
+            f"DS2 --derive-unsandboxed is refused for a run with acquired inputs: {codes(r_ds2)}")
+        # DS1: narrowed sandbox blocks reading files outside declared inputs (real bwrap on Linux; cmd check on macOS)
+        if sandbox_kind() is not None:
+            r_ds1 = derive(d_acq)
+            out_txt = open(os.path.join(d_acq, "data/derived/out.csv"), encoding="utf-8").read() if r_ds1["ok"] else ""
+            rec_ds1 = json.load(open(os.path.join(d_acq, DERIVATIONS_RECORD)))["derivations"]["acq_probe"]
+            rep(r_ds1["ok"] and "BLOCKED" in out_txt and "TOP_SECRET_OUTSIDE" not in out_txt
+                and rec_ds1["sandbox"].get("narrow") is True,
+                f"DS1 narrowed derivation sandbox blocks reading outside sentinel ({r_ds1['ok']}, {out_txt.strip()!r})")
+            # DS3: failure on acquired input returns derivation_failed_on_acquired with no acquired data prose
+            open(os.path.join(d_acq, "data", "derive", "probe.py"), "w", encoding="utf-8").write(
+                "import sys\nsys.stderr.write('SECRET_DATA_PROSE_99\\n')\nraise ValueError('SECRET_DATA_PROSE_99')\n"
+            )
+            r_ds3 = derive(d_acq)
+            blob = json.dumps(r_ds3) + open(os.path.join(d_acq, DERIVATIONS_RECORD), encoding="utf-8").read()
+            rep(not r_ds3["ok"] and codes(r_ds3) == ["derivation_failed_on_acquired"]
+                and "ValueError" in r_ds3["problems"][0]["claim"] and "SECRET_DATA_PROSE_99" not in blob,
+                f"DS3 acquired derivation error returns code/class/line without data prose ({codes(r_ds3)})")
+        else:
+            cmd_n = _bwrap_narrow_cmd("bwrap", [], [], "/tmp", [sys.executable, "-c", "pass"])
+            no_root = not any(cmd_n[i:i + 3] == ["--ro-bind", "/", "/"] for i in range(len(cmd_n) - 2))
+            s_err = _safe_acquired_err('File "data/derive/probe.py", line 2\nValueError: SECRET_DATA_PROSE_99',
+                                       "data/derive/probe.py", [acq_rel])
+            rep(no_root and "ValueError" in s_err and "SECRET_DATA_PROSE_99" not in s_err,
+                f"DS1/DS3 narrowed bwrap command omits --ro-bind / / and sanitizes acquired errors ({s_err})")
+
     # DI13: the new harness code and its messages name no disease, place or intervention (CLAUDE.md convention).
     try:
         src = open(os.path.abspath(__file__), encoding="utf-8").read()
