@@ -6146,19 +6146,20 @@ def _self_test() -> int:
             except Exception as e:  # noqa: BLE001
                 ok(False, f"RC16 configs/{f} loads: {e}")
     # AQ20 (docs/design/acquire.md §§8, 10): refuse --acquire on eval configs and private: true questions
+    import types as _aq_types
     with tempfile.TemporaryDirectory() as td_aq:
         q_priv = os.path.join(td_aq, "q_priv.md")
         q_pub = os.path.join(td_aq, "q_pub.md")
         open(q_priv, "w", encoding="utf-8").write("private: true\nHow to allocate?\n")
         open(q_pub, "w", encoding="utf-8").write("How to allocate?\n")
-        c_eval = types.SimpleNamespace(flags=["--v2", "--acquire"], storage_prefix="runs/evals/q1",
-                                       required_files=["data/evals/q1/u.csv"], question_file=q_pub)
-        c_priv = types.SimpleNamespace(flags=["--v2", "--acquire"], storage_prefix="runs/custom/q2",
-                                       required_files=[], question_file=q_priv)
-        c_ok = types.SimpleNamespace(flags=["--v2", "--acquire"], storage_prefix="runs/custom/q3",
-                                     required_files=[], question_file=q_pub)
-        c_eval_off = types.SimpleNamespace(flags=["--v2"], storage_prefix="runs/evals/q1",
+        c_eval = _aq_types.SimpleNamespace(flags=["--v2", "--acquire"], storage_prefix="runs/evals/q1",
                                            required_files=["data/evals/q1/u.csv"], question_file=q_pub)
+        c_priv = _aq_types.SimpleNamespace(flags=["--v2", "--acquire"], storage_prefix="runs/custom/q2",
+                                           required_files=[], question_file=q_priv)
+        c_ok = _aq_types.SimpleNamespace(flags=["--v2", "--acquire"], storage_prefix="runs/custom/q3",
+                                         required_files=[], question_file=q_pub)
+        c_eval_off = _aq_types.SimpleNamespace(flags=["--v2"], storage_prefix="runs/evals/q1",
+                                               required_files=["data/evals/q1/u.csv"], question_file=q_pub)
         ok(bool(acquire_flag_problems(c_eval)) and bool(acquire_flag_problems(c_priv))
            and not acquire_flag_problems(c_ok) and not acquire_flag_problems(c_eval_off),
            "AQ20 run_cluster refuses --acquire on eval configs and private: true questions, allows public custom runs")

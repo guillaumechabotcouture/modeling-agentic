@@ -11130,6 +11130,9 @@ def _self_test_acquire(ok, td: str) -> None:
 
         # T_ACQ_AMEND: amendment child carries acquired bytes, provenance, record, manifest, metadata fields,
         # and closed acquisition state (without copying acquire/quarantine/)
+        st_sg.state = "FINAL"
+        st_sg.status = "completed"
+        save_state(d_sg, st_sg)
         os.makedirs(os.path.join(d_sg, "acquire", "quarantine"), exist_ok=True)
         open(os.path.join(d_sg, "acquire", "quarantine", "scratch.part"), "w").write("drop")
         m_sg_meta = json.load(open(os.path.join(d_sg, "metadata.json")))
