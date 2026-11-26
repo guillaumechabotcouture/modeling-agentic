@@ -553,6 +553,7 @@ def _load_record(run_dir: str, allowlist_ver: int, allowlist_sha: str) -> dict:
         "fetches": {},
         "catalogue_codes": {},
         "intents": {},
+        "rejected": {},
     }
 
 
@@ -777,6 +778,7 @@ class Fetcher:
         found_by: str | None = None,
     ) -> dict:
         """Fetch an allowlisted endpoint into quarantine, returning fetch id, metadata, and sanitized preview."""
+        self.record = _load_record(self.run_dir, int(self.allowlist["version"]), self.allowlist_sha)
         src = self.allowlist["_by_id"].get(source_id)
         if src is None:
             raise FetchRefused("fetch_refused", f"unknown source {source_id!r}")
@@ -1063,7 +1065,12 @@ def promote(
     _recover_intents(run_dir, rec, prov, allowlist)
 
     promoted: list[str] = []
-    rejected: list[dict] = []
+    rec_rejected: dict[str, dict] = dict(rec.get("rejected") or {})
+    rec["rejected"] = rec_rejected
+
+    def _reject(fid_: str, code_: str, reason_: str) -> None:
+        rec_rejected.setdefault(fid_, {"fetch_id": fid_, "code": code_, "reason": reason_})
+
     total_promoted_bytes = sum(
         int(e.get("bytes") or 0) for e in (prov.get("inputs") or {}).values()
         if isinstance(e, Mapping) and e.get("origin") == "acquired"
@@ -1074,21 +1081,24 @@ def promote(
         frec = rec["fetches"].get(fid)
         # Step 1: recorded fetch id from this run & allowlist version
         if frec is None or frec.get("status") != "ok":
-            rejected.append({"fetch_id": fid, "code": "acquire_unrecorded", "reason": "fetch id not recorded ok"})
+            _reject(fid, "acquire_unrecorded", "fetch id not recorded ok")
             continue
         # Idempotent if already promoted (AQ15)
         if frec.get("promoted_rel") and frec["promoted_rel"] in prov["inputs"]:
             promoted.append(frec["promoted_rel"])
             continue
+        # Idempotent if already rejected in an earlier promote() call (AQ15)
+        if fid in rec_rejected and not frec.get("quarantine_rel"):
+            continue
         src_id, ep_name = str(frec["source_id"]), str(frec["endpoint"])
         src = allowlist["_by_id"].get(src_id)
         ep = src["endpoints"].get(ep_name) if src and src["status"] == "enabled" and not src["requires_key"] else None
         if src is None or ep is None:
-            rejected.append({"fetch_id": fid, "code": "acquire_unrecorded", "reason": "source/endpoint not enabled"})
+            _reject(fid, "acquire_unrecorded", "source/endpoint not enabled")
             continue
         q_rel = frec.get("quarantine_rel")
         if not q_rel:
-            rejected.append({"fetch_id": fid, "code": "acquire_unrecorded", "reason": "quarantined file missing"})
+            _reject(fid, "acquire_unrecorded", "quarantined file missing")
             continue
 
         # Step 6 (read & hash via safe_io; AQ9, AQ17)
@@ -1101,7 +1111,7 @@ def promote(
         if len(raw) == 0 or len(raw) > max_file_bytes or (total_promoted_bytes + len(raw)) > max_run_bytes:
             SIO.remove_nofollow(run_dir, q_rel, missing_ok=True)
             frec["quarantine_rel"] = None
-            rejected.append({"fetch_id": fid, "code": "acquire_oversized", "reason": f"size {len(raw)} out of bounds"})
+            _reject(fid, "acquire_oversized", f"size {len(raw)} out of bounds")
             continue
 
         # Step 3: content-type header + byte sniff agreement (AQ7)
@@ -1109,8 +1119,8 @@ def promote(
         if ct_clean is None or ct_clean not in set(ep["allowed_content_types"]):
             SIO.remove_nofollow(run_dir, q_rel, missing_ok=True)
             frec["quarantine_rel"] = None
-            rejected.append({"fetch_id": fid, "code": "acquire_type_mismatch",
-                             "reason": f"header/sniff mismatch or disallowed type ({frec.get('content_type')!r})"})
+            _reject(fid, "acquire_type_mismatch",
+                    f"header/sniff mismatch or disallowed type ({frec.get('content_type')!r})")
             continue
 
         # Step 4: strict parse (AQ8)
@@ -1118,7 +1128,7 @@ def promote(
         if not ok_parse:
             SIO.remove_nofollow(run_dir, q_rel, missing_ok=True)
             frec["quarantine_rel"] = None
-            rejected.append({"fetch_id": fid, "code": "acquire_unparseable", "reason": perr})
+            _reject(fid, "acquire_unparseable", perr)
             continue
 
         # Step 5: licence + per-record licence check (AQ11)
@@ -1126,7 +1136,7 @@ def promote(
         if not ok_lic:
             SIO.remove_nofollow(run_dir, q_rel, missing_ok=True)
             frec["quarantine_rel"] = None
-            rejected.append({"fetch_id": fid, "code": "acquire_licence_unclear", "reason": lerr})
+            _reject(fid, "acquire_licence_unclear", lerr)
             continue
 
         # Step 7: promotion intent, atomic no-follow copy, re-hash, chmod 0444 (AQ10, AQ15b)
@@ -1177,6 +1187,7 @@ def promote(
         SIO.chmod_nofollow(run_dir, dest_rel, 0o444)
 
         if _stop_after_copy:
+            rejected = [rec_rejected[k] for k in sorted(rec_rejected)]
             return {"interrupted": True, "promoted": promoted, "rejected": rejected}
 
         # Step 8: provenance, sanitized view, close intent, remove quarantined file
@@ -1198,10 +1209,11 @@ def promote(
         if fid not in keep_unique and frec.get("quarantine_rel"):
             SIO.remove_nofollow(run_dir, frec["quarantine_rel"], missing_ok=True)
             frec["quarantine_rel"] = None
-            rejected.append({"fetch_id": fid, "code": "not_kept", "reason": "not listed in keep"})
+            _reject(fid, "not_kept", "not listed in keep")
     _save_record(run_dir, rec)
 
     # Step 9: inventory digest & manifest
+    rejected = [rec_rejected[k] for k in sorted(rec_rejected)]
     inv_sha = _write_manifest_and_digest(run_dir, prov, rec, rejected)
     return {"promoted": promoted, "rejected": rejected, "inventory_sha256": inv_sha}
 
