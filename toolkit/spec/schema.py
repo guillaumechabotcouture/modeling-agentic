@@ -186,18 +186,21 @@ OPTIONAL_KINDS = {"priors": "engine parameters with published ranges (engine-car
                             "drawn from their declared priors"}
 UNCERTAINTY_SHORT = {"engine_parameters": "engine parameters", "calibration": "calibration", "costs": "unit costs",
                      "emulator": "emulator error", "burden_anchor": "external burden estimates",
-                     "unit_rates": "per-unit measured rates"}
+                     "unit_rates": "per-unit measured rates", "health_weights": "health-measure weights"}
 # F6 S2-5d: declared or excluded only when validation.burden has anchor rows with an interval (burden.py checks it)
 CONDITIONAL_KINDS = {"burden_anchor": "the anchors' external burden estimates (validation.burden), lognormal within "
                                       "each published interval",
                      # hb3 fix 5: declared or excluded only when the engine declares per-unit sampling (its card)
                      "unit_rates": "each unit's measured rates, drawn from their sampling error as the engine card "
-                                   "declares (engine unit_sampling), independently across units"}
+                                   "declares (engine unit_sampling), independently across units",
+                     # CEA design §4.3: declared or excluded only when cost_effectiveness.health_measure has weight ranges
+                     "health_weights": "health-measure disability/utility weights with declared ranges "
+                                       "(cost_effectiveness.health_measure)"}
 UNIT_RATES = "unit_rates"
 # W0-B: `perturb` is the one generic test (toolkit/spec/perturb.py); the others are aliases compiled to it
 DECISION_TEST_TYPES = ("perturb", "interaction_rescale", "parameter_value", "group_rule", "envelope", "cost_items",
                        "unit_attribute", "calibration_target", "outcome_ratio", "burden_scale", "boundary_engine")
-DELIVERABLE_KINDS = ("package_per_unit", "estimates")    # estimates: no allocation units (toolkit/spec/estimates.py)
+DELIVERABLE_KINDS = ("package_per_unit", "estimates", "cost_effectiveness")    # estimates/cost_effectiveness: no allocation file
 PLAN_RULES = ("point", "expected_value")     # deliverable.plan (toolkit/analysis/plan_rule.py); absent: point
 CALIBRATION_FIELDS = {
     "emulator_inversion": ("attribute", "range", "target_column", "window", "metric"),
@@ -486,7 +489,7 @@ class Spec:
     # ---- options and constraints, in toolkit/alloc form
     def alloc_spec(self) -> dict:
         """The toolkit/alloc spec: options plus the constraints (one place to read eligibility and caps)."""
-        o, c = self.raw["options"], self.raw["constraints"]
+        o, c = self.raw["options"], self.raw.get("constraints") or {}
         a = {k: copy.deepcopy(v) for k, v in o.items() if k in ("components", "packages", "prices", "cost_items")}
         p = o.get("packages")
         if isinstance(p, dict) and p.get("generate") is True and p.get("within_envelope") is True:
@@ -1236,10 +1239,11 @@ def with_engine(s: Spec, ref, config: dict | None = None) -> Spec:
 def _validate_pending(s: Spec) -> list[str]:
     """engine: auto before the choice: everything that does not need the engine card."""
     r = s.raw
-    from toolkit.spec import estimates as ES
+    from toolkit.spec import cea as CEA, estimates as ES
     if ES.is_estimates(r):              # no allocation units: its own sections (v2d §2.3)
         return ES.validate_pending(s)
-    bad = [f"missing section {k}" for k in REQUIRED if k not in r]
+    req = tuple(k for k in REQUIRED if k != "constraints") if CEA.is_cea(r) else REQUIRED
+    bad = [f"missing section {k}" for k in req if k not in r]
     if bad:
         return bad
     if r["schema_version"] != SCHEMA_VERSION:
@@ -1283,12 +1287,14 @@ def _validate_pending(s: Spec) -> list[str]:
             bad.append(f"decision test {dt.get('id')}: with (companion parameters) is only for a parameter_value "
                        "test")
     bad += _validate_deliverable(s)
+    if CEA.has_cea(r):
+        bad += CEA.problems(s, card=None, pk=s.packages())
     return bad
 
 
 def _validate(s: Spec) -> list[str]:
     r = s.raw
-    from toolkit.spec import estimates as ES
+    from toolkit.spec import cea as CEA, estimates as ES
     if ES.is_estimates(r):              # no allocation units: its own sections (v2d §2.3)
         bad = ES.validate_pending(s)
         if bad:
@@ -1300,7 +1306,8 @@ def _validate(s: Spec) -> list[str]:
         if not isinstance(eng, Engine):
             return ["engine does not implement the Engine contract (describe, parameters, run)"]
         return ES.validate(s, eng)
-    bad = [f"missing section {k}" for k in REQUIRED if k not in r]
+    req = tuple(k for k in REQUIRED if k != "constraints") if CEA.is_cea(r) else REQUIRED
+    bad = [f"missing section {k}" for k in req if k not in r]
     if bad:
         return bad
     if r["schema_version"] != SCHEMA_VERSION:
@@ -1406,13 +1413,14 @@ def _validate(s: Spec) -> list[str]:
     a = s.alloc_spec()
     bad += [f"options: {e}" for e in acosts.validate(a, cols)]
     bad += [f"constraints: {e}" for e in apackages.validate(a, units)]
-    c = r["constraints"]
-    if not _isnum(c.get("envelope_usd")):
-        bad.append("constraints.envelope_usd: a number")
-    elif s.budget() <= 0:
-        bad.append("constraints: envelope_usd must exceed the fixed costs")
-    if "envelope_exact" in c and not isinstance(c.get("envelope_exact"), bool):
-        bad.append("constraints.envelope_exact: true or false")
+    c = r.get("constraints") or {}
+    if not CEA.is_cea(r):
+        if not _isnum(c.get("envelope_usd")):
+            bad.append("constraints.envelope_usd: a number")
+        elif s.budget() <= 0:
+            bad.append("constraints: envelope_usd must exceed the fixed costs")
+        if "envelope_exact" in c and not isinstance(c.get("envelope_exact"), bool):
+            bad.append("constraints.envelope_exact: true or false")
     for g in c.get("group_rules") or []:
         if not isinstance(g, dict) or not g.get("id"):
             bad.append("constraints.group_rules: each rule needs an id")
@@ -1468,6 +1476,8 @@ def _validate(s: Spec) -> list[str]:
     bad += PRI.problems(s)
     bad += _validate_analysis(s, card, pnames, cols, pk)
     bad += _validate_deliverable(s)
+    if CEA.has_cea(r):
+        bad += CEA.problems(s, card=card, pk=pk)
     from toolkit.analysis import burden as BV
     bad += BV.load_references(s)[1]
     return bad
@@ -1861,7 +1871,7 @@ def _validate_analysis(s, card, pnames, cols, pk) -> list[str]:
         thr = an.get(k, 0.10)
         if not (_isnum(thr) and 0 <= thr <= 1):
             bad.append(f"analysis.{k}: a fraction in [0, 1]")
-    rules = {g.get("id") for g in s.raw["constraints"].get("group_rules") or []}
+    rules = {g.get("id") for g in (s.raw.get("constraints") or {}).get("group_rules") or []}
     cost_ids = {it.get("id") for it in s.raw["options"].get("cost_items") or []}
     for dt in an.get("decision_tests") or []:
         i = dt.get("id")
@@ -2048,6 +2058,10 @@ def _validate_deliverable(s) -> list[str]:
     bad = []
     if d.get("kind") not in DELIVERABLE_KINDS:
         bad.append(f"deliverable.kind: one of {DELIVERABLE_KINDS}")
+    if d.get("kind") == "cost_effectiveness":
+        if d.get("plan") is not None:
+            bad.append("deliverable.plan: applies to a package_per_unit deliverable")
+        return bad
     if not str(d.get("allocation_file") or "").endswith(".csv"):
         bad.append("deliverable.allocation_file: a .csv path")
     cols = d.get("columns") or {}

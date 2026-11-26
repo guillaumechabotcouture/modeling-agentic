@@ -133,3 +133,12 @@ uncertainty:
   # an eval run's interval drawn over structural ratios only was orders of magnitude below it; a real interval from
   # sampled data or published ranges is far wider. Proposal for the owner's review.
   interval_rel_width_min: 1.0e-3
+cost_effectiveness:
+  # Cost-effectiveness deliverable (docs/design/cost-effectiveness-deliverable.md §5.4, §5.7, §6).
+  # Proposals for the owner's review; code reads them from here and restates none.
+  effect_floor_rel: 1.0e-6       # north-east ICER ratio guard: relative floor on reference health loss
+  effect_floor_abs: 1.0e-12      # absolute floor on incremental health difference
+  nmb_tie_rel: 1.0e-12           # relative tolerance for reporting an exact NMB tie
+  min_draws: 100                 # below this draw count, CEAC and EVPI carry status `indicative`
+  max_switch_evaluations: 8      # maximum real evaluations per switching-value bisection
+  switch_bracket_rel: 0.01       # target switching bracket width as a fraction of the declared range
