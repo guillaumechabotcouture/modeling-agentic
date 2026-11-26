@@ -2269,25 +2269,34 @@ def _cea_art(R):
     return doc, first_p, doc["perspectives"][first_p]
 
 
+def _cea_fig(t, w, h, *, left: float = 0.12):
+    fig = _fig(t, w, h)
+    fh = fig.get_figheight()
+    ax = fig.add_axes([left, 0.55 / fh, 0.96 - left, _top(fig, 0.62) - 0.55 / fh])
+    FS.style(ax, t, grid="both")
+    return fig, ax
+
+
 def _cea_frontier(R, t):
     doc, p, pdoc = _cea_art(R)
     st = pdoc.get("strategies") or {}
     fr = list(pdoc.get("frontier") or [])
     if len(st) < 2:
         raise Missing("cost_effectiveness artifact has fewer than 2 strategies")
-    fig, ax = _fig(t, 6.8, 4.4)
+    fig, ax = _cea_fig(t, 6.8, 4.4)
     xs = [float(st[s]["health"]) for s in st]
     ys = [float(st[s]["cost"]) for s in st]
     ax.scatter(xs, ys, color=t["muted"], s=45, zorder=3)
     if fr:
         ax.plot([float(st[s]["health"]) for s in fr], [float(st[s]["cost"]) for s in fr],
-                color=t["accent"], lw=2.0, marker="o", ms=7, zorder=4, label="Frontier")
+                color=t["cat"][0], lw=2.0, marker="o", ms=7, zorder=4, label="Frontier")
     for s, r in st.items():
         ax.annotate(s, (float(r["health"]), float(r["cost"])), textcoords="offset points", xytext=(5, 4),
                     fontsize=8, color=t["ink"])
     ax.set_xlabel("Incremental health gained vs reference")
     ax.set_ylabel("Discounted cost")
-    ax.ticklabel_format(style="plain", useOffset=False)
+    FS.set_axis_format(ax, "x")
+    FS.set_axis_format(ax, "y", "money")
     ax.legend(frameon=False, fontsize=8)
     rows = [{"strategy": s, "cost": r["cost"], "health": r["health"], "status": r["status"], "icer": r.get("icer")}
             for s, r in st.items()]
@@ -2300,19 +2309,20 @@ def _cea_plane(R, t):
     uq = pdoc.get("uncertainty") or {}
     if not st:
         raise Missing("no strategies in cost_effectiveness artifact")
-    fig, ax = _fig(t, 6.8, 4.4)
+    fig, ax = _cea_fig(t, 6.8, 4.4)
     ax.axhline(0.0, color=t["grid"], lw=1.0)
     ax.axvline(0.0, color=t["grid"], lw=1.0)
     rows = []
-    for s, r in st.items():
+    for idx, (s, r) in enumerate(st.items()):
         de, dc = float(r.get("delta_health_vs_ref", 0.0)), float(r.get("delta_cost_vs_ref", 0.0))
-        ax.scatter([de], [dc], s=55, zorder=4, label=s)
+        ax.scatter([de], [dc], s=55, color=t["cat"][idx % len(t["cat"])], zorder=4, label=s)
         ax.annotate(s, (de, dc), textcoords="offset points", xytext=(5, 4), fontsize=8, color=t["ink"])
         qs = (uq.get("quadrant_share") or {}).get(s) or {}
         rows.append({"strategy": s, "delta_health": de, "delta_cost": dc, **qs})
     ax.set_xlabel("Incremental health (ΔE vs reference)")
     ax.set_ylabel("Incremental cost (ΔC vs reference)")
-    ax.ticklabel_format(style="plain", useOffset=False)
+    FS.set_axis_format(ax, "x")
+    FS.set_axis_format(ax, "y", "money")
     ax.legend(frameon=False, fontsize=8)
     return fig, f"Cost-effectiveness plane ({p})", f"Incremental cost vs incremental health against reference ({p}).", rows, "cost-effectiveness plane"
 
@@ -2324,15 +2334,16 @@ def _cea_ceac(R, t):
     shares = ceac.get("share") or {}
     if not lams or not shares:
         raise Missing("no CEAC draws recorded in cost_effectiveness artifact")
-    fig, ax = _fig(t, 6.8, 4.4)
-    for s, vals in shares.items():
-        ax.plot(lams, [100.0 * float(v) for v in vals], lw=1.8, label=s)
+    fig, ax = _cea_fig(t, 6.8, 4.4)
+    for idx, (s, vals) in enumerate(shares.items()):
+        ax.plot(lams, [100.0 * float(v) for v in vals], color=t["cat"][idx % len(t["cat"])], lw=1.8, label=s)
     for tid, td in (pdoc.get("thresholds") or {}).items():
         ax.axvline(float(td["lambda"]), color=t["muted"], ls="--", lw=1.0)
     ax.set_xlabel("Threshold λ (cost per unit health)")
     ax.set_ylabel("Probability cost-effective (%)")
     ax.set_ylim(-2, 102)
-    ax.ticklabel_format(style="plain", useOffset=False)
+    FS.set_axis_format(ax, "x", "money")
+    FS.set_axis_format(ax, "y")
     ax.legend(frameon=False, fontsize=8)
     rows = [{"lambda": lams[j], **{s: shares[s][j] for s in shares}} for j in range(len(lams))]
     return fig, f"Cost-effectiveness acceptability curves ({p})", f"Share of draws with highest NMB across threshold λ ({p}).", rows, "CEAC and frontier"
@@ -2347,14 +2358,15 @@ def _cea_price_grid(R, t):
     cells = prices[pid].get("cells") or []
     if not cells:
         raise Missing(f"price grid {pid} has no evaluated cells")
-    fig, ax = _fig(t, 6.6, 4.0)
+    fig, ax = _cea_fig(t, 6.6, 4.0)
     xs = [float(c["price"]) for c in cells]
     ys = [float(c["margin"]) for c in cells]
-    ax.plot(xs, ys, marker="o", color=t["accent"], lw=2.0)
+    ax.plot(xs, ys, marker="o", color=t["cat"][0], lw=2.0)
     ax.axhline(0.0, color=t["muted"], ls="--", lw=1.0)
     ax.set_xlabel(f"Evaluated price ({pid})")
     ax.set_ylabel("NMB margin vs best alternative")
-    ax.ticklabel_format(style="plain", useOffset=False)
+    FS.set_axis_format(ax, "x", "money")
+    FS.set_axis_format(ax, "y", "money")
     rows = [{"price": c["price"], "chosen": c["chosen"], "margin": c["margin"]} for c in cells]
     return fig, f"Evaluated price grid ({pid})", f"Net monetary benefit margin across evaluated prices for {pid}.", rows, "evaluated price grid"
 
@@ -2370,16 +2382,17 @@ def _cea_threshold_price(R, t):
     pts = [(float(th_defs[tid]["lambda"]), tr) for tid, tr in th_map.items() if tid in th_defs]
     if not pts:
         raise Missing(f"no threshold-price evaluations for {pid}")
-    fig, ax = _fig(t, 6.6, 4.0)
+    fig, ax = _cea_fig(t, 6.6, 4.0)
     rows = []
     for lam, tr in sorted(pts):
         v = tr.get("value")
         if v is not None:
-            ax.scatter([lam], [float(v)], color=t["accent"], s=55, zorder=4)
+            ax.scatter([lam], [float(v)], color=t["cat"][0], s=55, zorder=4)
         rows.append({"lambda": lam, "status": tr.get("status"), "threshold_price": v})
     ax.set_xlabel("Threshold λ")
     ax.set_ylabel(f"Threshold price ({pid})")
-    ax.ticklabel_format(style="plain", useOffset=False)
+    FS.set_axis_format(ax, "x", "money")
+    FS.set_axis_format(ax, "y", "money")
     return fig, f"Threshold price ({pid})", f"Computed threshold prices at declared λ values for {pid}.", rows, "threshold price by lambda"
 
 
@@ -2391,11 +2404,12 @@ def _cea_evpi(R, t):
     if not pts:
         raise Missing("no EVPI values recorded in cost_effectiveness artifact")
     pts.sort()
-    fig, ax = _fig(t, 6.6, 4.0)
-    ax.plot([x[0] for x in pts], [x[1] for x in pts], marker="o", color=t["accent"], lw=2.0)
+    fig, ax = _cea_fig(t, 6.6, 4.0)
+    ax.plot([x[0] for x in pts], [x[1] for x in pts], marker="o", color=t["cat"][0], lw=2.0)
     ax.set_xlabel("Threshold λ")
     ax.set_ylabel("Total EVPI")
-    ax.ticklabel_format(style="plain", useOffset=False)
+    FS.set_axis_format(ax, "x", "money")
+    FS.set_axis_format(ax, "y", "money")
     rows = [{"lambda": lam, "evpi": ev, "evpi_per_person": pp} for lam, ev, pp in pts]
     return fig, f"Expected value of perfect information ({p})", f"EVPI at declared decision thresholds ({p}).", rows, "EVPI across thresholds"
 
@@ -2405,19 +2419,19 @@ def _cea_switching(R, t):
     sw = [r for r in (doc.get("switching") or []) if isinstance(r.get("range"), list) and len(r["range"]) == 2]
     if not sw:
         raise Missing("no ranged switching tests recorded in cost_effectiveness artifact")
-    fig, ax = _fig(t, 6.8, max(3.4, 0.55 * len(sw) + 1.5))
+    fig, ax = _cea_fig(t, 6.8, max(3.4, 0.55 * len(sw) + 1.5), left=0.26)
     rows = []
     for idx, r in enumerate(sw):
         lo, hi = float(r["range"][0]), float(r["range"][1])
         ax.plot([lo, hi], [idx, idx], color=t["muted"], lw=4.0, solid_capstyle="round")
         for tid, tr in (r.get("thresholds") or {}).items():
             if tr.get("flip_lo") is not None and tr.get("flip_hi") is not None:
-                ax.plot([float(tr["flip_lo"]), float(tr["flip_hi"])], [idx, idx], color=t["accent"], lw=6.0)
+                ax.plot([float(tr["flip_lo"]), float(tr["flip_hi"])], [idx, idx], color=t["cat"][0], lw=6.0)
         rows.append({"test_id": r["test_id"], "input": r["input"], "lo": lo, "hi": hi})
     ax.set_yticks(range(len(sw)))
     ax.set_yticklabels([r["input"] for r in sw], fontsize=8)
     ax.set_xlabel("Tested input range (switching bracket highlighted)")
-    ax.ticklabel_format(axis="x", style="plain", useOffset=False)
+    FS.set_axis_format(ax, "x")
     return fig, "Switching-value tests", "Tested ranges with evaluated switching brackets marked.", rows, "CEA switching tests"
 
 
@@ -2427,16 +2441,17 @@ def _cea_by_package(R, t):
     by_pkg = plan_doc.get("by_package") or {}
     if not by_pkg:
         raise Missing("no allocation add-on by_package summary in cost_effectiveness artifact")
-    fig, ax = _fig(t, 6.6, 4.2)
+    fig, ax = _cea_fig(t, 6.6, 4.2)
     rows = []
-    for pk, r in by_pkg.items():
+    for idx, (pk, r) in enumerate(by_pkg.items()):
         de, dc = float(r["delta_health"]), float(r["delta_cost"])
-        ax.scatter([de], [dc], s=60, zorder=4)
+        ax.scatter([de], [dc], s=60, color=t["cat"][idx % len(t["cat"])], zorder=4)
         ax.annotate(pk, (de, dc), textcoords="offset points", xytext=(5, 4), fontsize=8, color=t["ink"])
         rows.append({"package": pk, "units": r["units"], "delta_cost": dc, "delta_health": de, "status": r["status"]})
     ax.set_xlabel("Incremental health gained vs comparator")
     ax.set_ylabel("Incremental discounted cost vs comparator")
-    ax.ticklabel_format(style="plain", useOffset=False)
+    FS.set_axis_format(ax, "x")
+    FS.set_axis_format(ax, "y", "money")
     return fig, "Cost-effectiveness by package in plan", "Incremental discounted cost against health gained per allocated package.", rows, "CEA by package"
 
 
