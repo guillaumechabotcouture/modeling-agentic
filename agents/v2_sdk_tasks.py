@@ -214,7 +214,8 @@ Task: build the agent-built engine `{engine_id}` into `{work_dir}` from the sign
 and `engine_build/request.json`. You have no shell; use `mcp__engine__try` (runs static checks S1-S4
 and public cases of checks A1-A8) and `mcp__engine__run` (one sandboxed evaluation within request domains)
 to test your working copy (shared 30-call cap). You may read `{repo}/toolkit/engines/contract.py` (always
-use that full repo path, not a relative path inside the run directory). Write ONLY inside `{work_dir}`:
+use that full repo path, not a relative path inside the run directory). Write ONLY these files inside `{work_dir}`
+(NEVER create scratch `.txt`/`.tmp` files there — you have no delete tool and static check S1 rejects any stray file):
 - `engine.py` defining `class Model` implementing the signed contract (and optional sibling `.py` helpers)
 - `card.yaml` matching `describe()` with `benchmarks: []`, `assumptions`, and `limitations`
 - `ENGINE_NOTES.md` documenting equations, assumptions, and limitations in plain language
@@ -233,8 +234,10 @@ Rules:
 - The engine carries trial effects over to the setting (principle 3); its own burden is a validation
   check, not the basis of the decision.
 - It must declare and use EXACTLY the parameters the signed request names (name, kind, value, lo, hi,
-  units, source). Every non-inert input must move its declared `expected_effects` outputs with the
-  declared sign inside the dynamics (never via post-hoc formulas or tiny epsilon terms).
+  units, source; omit `lo`/`hi` when omitted in the request). Read the resolved `params` mapping directly
+  (do not `dict(params)` copy it) so A6 parameter-read tracking records every read. Every non-inert input
+  must move its declared `expected_effects` outputs with the declared sign inside the dynamics (never via
+  post-hoc formulas or tiny epsilon terms).
 - Obey static checks S1-S4 in {out_in}: module top level may contain ONLY imports, simple constant
   assignments, `def`, and `class` (NO module-level `try/except`, `if`, `for`, or bare expression calls);
   no dynamic `getattr(obj, var_name)` with non-literal attribute names; no file/process/network/interpreter
