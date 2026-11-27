@@ -3558,14 +3558,34 @@ class Machine:
         a10 = checks.get("A10") or {}
         a8_amend = a8.get("status") == "fail" and a8.get("routing") == "spec_amendment"
         a10_unid = list(a10.get("unidentified") or [])
-        dt_names = {
-            str(dt.get("parameter") or dt.get("id") or "")
-            for dt in ((spec_raw.get("analysis") or {}).get("decision_tests") or [])
-            if isinstance(dt, dict)
+        dt_names: set[str] = set()
+        for dt in ((spec_raw.get("analysis") or {}).get("decision_tests") or []):
+            if isinstance(dt, dict):
+                for key in ("parameter", "id"):
+                    if dt.get(key):
+                        dt_names.add(str(dt[key]))
+                for item in (dt.get("set") or []):
+                    if isinstance(item, dict) and item.get("parameter"):
+                        dt_names.add(str(item["parameter"]))
+        cal_cfg = spec_raw.get("calibration") if isinstance(spec_raw.get("calibration"), dict) else {}
+        cal_method = "joint" if cal_cfg.get("joint") else str(cal_cfg.get("method") or "none")
+        cal_priors = cal_cfg.get("priors") if isinstance(cal_cfg.get("priors"), dict) else {}
+        a10_classes = a10.get("classes") if isinstance(a10.get("classes"), dict) else {}
+        # Under `calibration.method: posterior`, every prior-dominated parameter with a declared prior
+        # receives an automatic `prior_range_<p>` decision test during ANALYZE (and schema.py forbids
+        # declaring `prior_range_<p>` manually in the spec).
+        auto_prior_range = {
+            p for p in a10_unid
+            if cal_method == "posterior"
+            and a10_classes.get(p) == "prior_dominated"
+            and p in cal_priors
         }
         ee = (build_decl.get("request") or {}).get("expected_effects") or {}
-        a10_uncovered = [p for p in a10_unid if p in ee and p not in dt_names]
-        if a8_amend or a10_uncovered:
+        a10_uncovered = [
+            p for p in a10_unid
+            if p in ee and p not in dt_names and p not in auto_prior_range
+        ]
+        if a8_amend or (adm.get("status") == "admitted" and a10_uncovered):
             probs = list(a8.get("problems") or []) if a8_amend else []
             if a10_uncovered:
                 probs.append(f"A10 unidentified decision-moving parameter(s) without covering decision_test: {a10_uncovered}")
@@ -10792,6 +10812,55 @@ def _self_test_built_engine(ok, td: str) -> None:
        and any(f.get("kind") == "built_engine_snapshot_invalid" and "size mismatch" in str(f.get("claim")) for f in hf_rr),
        f"BE17_REF_RESUME budget pause during build_reference resumes cleanly on final try ({paused_ok}, {s_rr_end}) "
        f"and harness_findings runs built_engine_gate ({[f.get('kind') for f in hf_rr]})")
+
+    # BE_A10_PRIOR: posterior prior_dominated params with declared calibration.priors are auto-covered by
+    # ANALYZE's prior_range_<p> tests and proceed to ENGINE_REVIEW; non-posterior unidentified params still route to SPEC.
+    import yaml as _yaml
+    a10_res = {}
+    for label, cal_decl, a10_cls in (
+        ("post", {"method": "posterior", "parameters": ["base_scale"],
+                  "priors": {"base_scale": {"dist": "uniform", "range": [0.5, 1.5], "source": "test"}}},
+         "prior_dominated"),
+        ("lik", {"method": "likelihood", "parameters": ["base_scale"]}, "unidentified"),
+    ):
+        d_ap, T_ap, st_ap = _mk_run(f"be_a10_{label}", signoff="lead")
+        m_ap = Machine(d_ap, T_ap, st_ap, backend=fast_b, log=lambda *a: None, cross_engine_check=False)
+        for _ in range(10):
+            if m_ap.st.state == "ENGINE_ADMIT" or m_ap.st.state == "FINAL" or m_ap.st.paused:
+                break
+            m_ap.step()
+        sp_p = os.path.join(d_ap, AB.SPEC_FILE)
+        sp_d = _yaml.safe_load(open(sp_p))
+        sp_d["calibration"] = cal_decl
+        with open(sp_p, "w", encoding="utf-8") as _sf:
+            _yaml.safe_dump(sp_d, _sf, sort_keys=False)
+        orig_adm_ap = BADM.admit
+
+        def _stub_adm(run_dir, snap_sha, *_a, _cls=a10_cls, **_kw):
+            doc = {
+                "status": "admitted",
+                "hidden_commitment": "0" * 64,
+                "snapshot_sha256": snap_sha,
+                "checks": {
+                    "A8": {"id": "A8", "status": "pass", "problems": [], "routing": None},
+                    "A10": {"id": "A10", "status": "pass", "classes": {"base_scale": _cls},
+                            "unidentified": ["base_scale"], "problems": []},
+                },
+            }
+            ap = os.path.join(run_dir, "engine_build", "admission.json")
+            os.makedirs(os.path.dirname(ap), exist_ok=True)
+            with open(ap, "w", encoding="utf-8") as _af:
+                json.dump(doc, _af)
+            return doc
+
+        BADM.admit = _stub_adm
+        try:
+            m_ap.step()
+        finally:
+            BADM.admit = orig_adm_ap
+        a10_res[label] = (m_ap.st.state, os.path.isfile(os.path.join(d_ap, SPEC_RETHINK_REQUEST)))
+    ok(a10_res["post"] == ("ENGINE_REVIEW", False) and a10_res["lik"] == ("SPEC", True),
+       f"BE_A10_PRIOR posterior prior_dominated proceeds to ENGINE_REVIEW while likelihood unidentified routes to SPEC ({a10_res})")
 
 
 def _self_test_acquire(ok, td: str) -> None:

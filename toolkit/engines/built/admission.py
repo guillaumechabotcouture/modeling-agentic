@@ -975,7 +975,7 @@ def check_a6_a7(cand: BCAND.CandidateEngine, build_decl: Mapping, spec_raw: Mapp
 
     # Build the complete A6/A7 evaluation plan across ALL inputs and run in a SINGLE worker batch
     all_cases: list[tuple[dict, UnitSpec, Package, Horizon, int]] = []
-    input_plan: list[tuple[str, dict, list, int, int, int]] = []
+    input_plan: list[tuple[str, str, dict, list, int, int, int]] = []
     for iname, out_signs in sorted(expected_effects.items()):
         if iname in inert:
             continue
@@ -1019,7 +1019,7 @@ def check_a6_a7(cand: BCAND.CandidateEngine, build_decl: Mapping, spec_raw: Mapp
                     u_use = UnitSpec(f"a6_{bi}", dict(bu.attributes, **{iname: pt})) if ikind == "attribute" else bu
                     for s in seeds:
                         all_cases.append((prm, u_use, Package(f"p_{bi}", pk_map), hor, s))
-        input_plan.append((iname, dict(out_signs), pts, len(base_pkgs), start_idx, len(all_cases)))
+        input_plan.append((iname, ikind, dict(out_signs), pts, len(base_pkgs), start_idx, len(all_cases)))
 
     chunk_sz = 256 if cand.kind == "closed_form" else 32
     all_outs: list[Outcomes] = []
@@ -1031,10 +1031,16 @@ def check_a6_a7(cand: BCAND.CandidateEngine, build_decl: Mapping, spec_raw: Mapp
         reads_outcomes_all.update(pr.get("read_outcomes") or [])
     n_seeds = len(seeds)
 
-    for iname, out_signs, pts, n_modes, start_idx, end_idx in input_plan:
+    for iname, ikind, out_signs, pts, n_modes, start_idx, end_idx in input_plan:
         in_outs = all_outs[start_idx:end_idx]
         n_pts = len(pts)
         stride_mode = len(base_units) * n_pts * n_seeds
+        ordered = all(isinstance(p, (int, float, bool)) for p in pts) and n_pts >= 2
+        cat_abs_idx: int | None = None
+        if ikind == "component" and not ordered and iname in comp_specs:
+            abs_v = comp_specs[iname].get("absent")
+            if abs_v in pts:
+                cat_abs_idx = pts.index(abs_v)
 
         for oname, sign in sorted(out_signs.items()):
             pair_total += 1
@@ -1050,6 +1056,43 @@ def check_a6_a7(cand: BCAND.CandidateEngine, build_decl: Mapping, spec_raw: Mapp
                     for pi in range(n_pts):
                         off = (bi * n_pts + pi) * n_seeds
                         ys_by_pt.append([_extract_output(o, oname) for o in mode_outs[off:off + n_seeds]])
+                    if cat_abs_idx is not None:
+                        # Unordered categorical component: compare every active value against `absent`
+                        # rather than arbitrary list endpoints or step monotonicity across list order.
+                        y_abs = ys_by_pt[cat_abs_idx]
+                        y0_mean = float(np.mean(y_abs))
+                        floor = max(abs_floor, rel_floor * abs(y0_mean))
+                        any_pos = False
+                        any_neg = False
+                        for pi in range(n_pts):
+                            if pi == cat_abs_idx:
+                                continue
+                            d_pi = [ys_by_pt[pi][s] - y_abs[s] for s in range(len(seeds))]
+                            m_pi = float(np.mean(d_pi))
+                            rel_ch = abs(m_pi) / max(abs(y0_mean), 1e-12)
+                            max_rel_change = max(max_rel_change, rel_ch)
+                            if stochastic and len(seeds) > 1:
+                                se_pi = float(np.std(d_pi, ddof=1)) / math.sqrt(len(seeds))
+                                lo_pi, hi_pi = m_pi - z_crit * se_pi, m_pi + z_crit * se_pi
+                                if lo_pi > floor:
+                                    any_pos = True
+                                if hi_pi < -floor:
+                                    any_neg = True
+                            else:
+                                if m_pi > floor:
+                                    any_pos = True
+                                if m_pi < -floor:
+                                    any_neg = True
+                        span = max(float(np.mean(ys)) for ys in ys_by_pt) - min(float(np.mean(ys)) for ys in ys_by_pt)
+                        moved = (span > floor) if sign == "nonzero" else (any_pos or any_neg)
+                        if moved:
+                            moved_bases += 1
+                            outputs_moved.add(oname)
+                            if sign == "+" and not (any_pos and not any_neg):
+                                mode_sign_ok = False
+                            elif sign == "-" and not (any_neg and not any_pos):
+                                mode_sign_ok = False
+                        continue
                     # Compare endpoints (pt[-1] vs pt[0]) and check monotonicity across ALL adjacent ordered steps
                     diffs = [ys_by_pt[-1][s] - ys_by_pt[0][s] for s in range(len(seeds))]
                     y0_mean = float(np.mean(ys_by_pt[0]))
@@ -1067,7 +1110,6 @@ def check_a6_a7(cand: BCAND.CandidateEngine, build_decl: Mapping, spec_raw: Mapp
                     if moved:
                         moved_bases += 1
                         outputs_moved.add(oname)
-                        ordered = all(isinstance(p, (int, float, bool)) for p in pts) and len(ys_by_pt) >= 2
                         if sign == "+":
                             if not (d_mean > 0):
                                 mode_sign_ok = False
@@ -2424,6 +2466,52 @@ def _self_test() -> int:
        and a6_d["status"] == "fail" and a7_d["status"] == "fail",
        f"BE_A6_COST_LOG log-space sampling for multi-decade attrs & active-mode A6 for cost_driver inputs "
        f"(log_mid={log_mid:.5f}, wired={a6_w['status']}/{a7_w['status']}, dead={a6_d['status']}/{a7_d['status']})")
+
+    # BE_A7_CAT: unordered categorical string components compare active modes against `absent` (order-independent);
+    # mixed-sign categorical violates A7; numeric ordered components still enforce step-by-step monotonicity.
+    b_cat = {
+        "id": "stub_cat", "kind": "closed_form",
+        "request": {
+            "components": {"mode": {"values": ["none", "mode_a", "mode_b"], "absent": "none"}},
+            "unit_attributes": {"x": {"type": "continuous", "range": [0.1, 1.0]}},
+            "outputs": {"per_capita": ["y_pos", "y_one"], "windows": {}, "cost_drivers": []},
+            "age_groups": ["g0"],
+            "parameters": [],
+            "expected_effects": {"mode": {"y_pos": "+", "y_one": "+"}, "x": {"y_pos": "+"}},
+            "stochastic": False,
+        },
+    }
+    class _CatStub:
+        kind = "closed_form"
+        def __init__(self, *, bad_sign: bool = False, comp_key: str = "mode"):
+            self._bad = bad_sign
+            self._key = comp_key
+        def run_many(self, cases):
+            out = []
+            for _prm, u, pk, _h, _s in cases:
+                x = float(u.attributes["x"])
+                mv = pk.components.get(self._key)
+                if mv in ("none", 0):
+                    yp, yo = 0.1 * x, 0.0
+                elif mv in ("mode_a", 1):
+                    yp, yo = 0.9 * x, 0.6 * x
+                else:
+                    yp = (0.02 * x) if self._bad else (0.5 * x)
+                    yo = 0.0
+                out.append(Outcomes({"y_pos": {"g0": yp}, "y_one": {"g0": yo}}, {}, {},
+                                    meta={"age_shares": {"g0": 1.0}, "param_reads": {"build": [], "read_outcomes": []}}))
+            return out
+    a6_cg, a7_cg = check_a6_a7(_CatStub(bad_sign=False), b_cat, {}, np.random.default_rng(3), n_bases=3, min_moving=2, th=th_cd)
+    a6_cb, a7_cb = check_a6_a7(_CatStub(bad_sign=True), b_cat, {}, np.random.default_rng(3), n_bases=3, min_moving=2, th=th_cd)
+    b_num = copy.deepcopy(b_cat)
+    b_num["request"]["components"] = {"level": {"values": [0, 1, 2], "absent": 0}}
+    b_num["request"]["expected_effects"] = {"level": {"y_pos": "+"}, "x": {"y_pos": "+"}}
+    b_num["request"]["outputs"]["per_capita"] = ["y_pos"]
+    a6_nm, a7_nm = check_a6_a7(_CatStub(bad_sign=False, comp_key="level"), b_num, {}, np.random.default_rng(3), n_bases=3, min_moving=2, th=th_cd)
+    ok(a6_cg["status"] == "pass" and a7_cg["status"] == "pass"
+       and a7_cb["status"] == "fail" and a7_nm["status"] == "fail",
+       f"BE_A7_CAT categorical string components compare active modes vs absent; mixed sign & non-monotone numeric fail A7 "
+       f"(cat_ok={a6_cg['status']}/{a7_cg['status']}, cat_bad={a7_cb['status']}, num_nonmono={a7_nm['status']})")
 
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
