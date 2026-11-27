@@ -129,8 +129,9 @@ every declared `age_groups` entry and how `horizon.window` length (`stop - start
 independent A11 reference implementation agrees on every `(output, age_group)` cell. For unordered
 multi-mode `request.components`, use string labels (e.g. `["none", "mode_a", "mode_b"]`, `absent: "none"`)
 rather than integer codes (`[0, 1, 2]`): numeric component lists are checked for step-by-step monotonicity in
-A7, whereas string components compare each active mode against `absent`. In `request.expected_effects`,
-declare `nonzero` rather than `+`/`-` whenever an output can be non-monotone across an input's declared domain. Quote ISO `decision_date` values (e.g. `"2026-01-01"`) or write an integer year. The harness has copied the question's input files into data/inputs/ (same
+A7, whereas string components compare each active mode against `absent`. In `request.expected_effects`, include every declared output (`per_capita`, `windows`, `cost_drivers`)
+under at least one non-inert input, and declare `nonzero` rather than `+`/`-` whenever an output can be
+non-monotone across an input's declared domain. Quote ISO `decision_date` values (e.g. `"2026-01-01"`) or write an integer year. The harness has copied the question's input files into data/inputs/ (same
 relative paths; their sha256 in data/inputs_provenance.json): read them. You write code, never
 tables. For each file the spec reads that is not a staged input (the units table, calibration
 targets, cost tables), write one script under data/derive/ and declare it in data/derivations.yaml

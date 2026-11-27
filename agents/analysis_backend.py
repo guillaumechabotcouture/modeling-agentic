@@ -1703,7 +1703,7 @@ def _self_test() -> int:
         }
         b_req["request"]["expected_effects"] = {
             "a": {"cases": "-"}, "eff_a": {"cases": "-"}, "sev_mult": {"cases": "+"},
-            "n_strains": {"cases": "+"}, "x": {"cases": "+"},
+            "n_strains": {"cases": "+"}, "x": {"cases": "+", "prev": "+"},
         }
         b_req["request"]["inert"] = {}
         b_req["request"]["compartments"]["transitions"] = [{"from": "S", "to": "I1", "counts": ["cases"]}]
@@ -1726,6 +1726,7 @@ def _self_test() -> int:
         # outcomes_reported mismatch: when spec also reports `severe` (which ToyEngine lacks), ToyEngine is ineligible
         b_sev = copy.deepcopy(b_bad)
         b_sev["request"]["outputs"]["per_capita"] = ["cases", "severe"]
+        b_sev["request"]["expected_effects"]["sev_mult"] = {"cases": "+", "severe": "+"}
         b_sev["request"]["compartments"]["transitions"] = [{"from": "S", "to": "I1", "counts": ["cases", "severe"]}]
         sp_sev = dict(sp_shortlist, engine={"build": b_sev}, outcomes_reported=["cases", "severe"])
         p_sev = build_request_problems(sp_sev, engines=toy_entry)

@@ -1019,6 +1019,7 @@ def _self_test() -> int:
         b_no["request"]["trials"][0]["estimand_mapping"]["value"] = "per_capita.cases.g1"
         b_yes = copy.deepcopy(b_no)
         b_yes["request"]["outputs"]["per_capita"] = ["cases", "severe", "immunity"]
+        b_yes["request"]["expected_effects"]["rate_in"]["immunity"] = "+"
         with open(os.path.join(d, "u_ot27.csv"), "w") as fh:
             fh.write("id,pop\nu1,10000\n")
         with open(os.path.join(d, "t_ot27.csv"), "w") as fh:

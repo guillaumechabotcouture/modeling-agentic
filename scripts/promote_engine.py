@@ -651,7 +651,7 @@ def _self_test() -> int:
             "attribute_binding": {"N": "required", "rate_in": "required", "age_pop": "required"},
             "decision_inputs": {"comp_a": [{"kind": "parameter", "name": "eff_a", "why": "effect"}]},
             "expected_effects": {"comp_a": {"cases": "-", "units_delivered": "+"}, "eff_a": {"cases": "-"},
-                                 "rate_in": {"cases": "+"}},
+                                 "rate_in": {"cases": "+", "prev": "+"}},
             "inert": {"N": {"reason": "invariant"}, "age_pop": {"reason": "weights only"}},
             "seed_test_setting": {"unit": {"N": 1000.0, "rate_in": 0.1, "age_pop": [90.0, 10.0]}},
             "reductions": [{"id": "R1", "oracle": "constant_hazard_survival", "oracle_args": {"hazard": 0.1, "dt": 1.0},
