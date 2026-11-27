@@ -95,97 +95,6 @@ def _import_sibling_module(name: str):
     return __import__(name)
 
 
-def _propagate_cloud(
-        run_dir: str, params_list: list, outcome_fn_spec: Optional[str],
-        pool_name: str, vm_size: str, max_nodes: int,
-        use_low_priority: bool, budget_usd_cap: float,
-        verbose: bool = False) -> list:
-    """Submit each params dict as a task to an Azure Batch pool.
-
-    Packages `{run_dir}/models/` as a tarball so workers can import the
-    user's outcome_fn module. Returns a list of outcome_fn outputs (or
-    {'_error': ...} for tasks that raised).
-
-    Assumes outcome_fn is importable at module scope in the models/ dir.
-    For default spec `models/outcome_fn.py::outcome_fn`, the qualified
-    name pickle records is `outcome_fn.outcome_fn`, which the worker
-    resolves after adding `./models/` to sys.path.
-    """
-    cloud = _import_sibling_module("cloud_batch")
-
-    models_dir = os.path.join(run_dir, "models")
-    if not os.path.isdir(models_dir):
-        raise FileNotFoundError(
-            f"No models/ directory at {models_dir}. Cloud UQ requires a "
-            f"models/ directory containing outcome_fn.py (the code the "
-            f"worker imports).")
-
-    # Resolve outcome_fn locally so we have a picklable handle. The module
-    # must be at the qualified name the worker will resolve (typically the
-    # basename of the outcome_fn file).
-    fn = load_outcome_fn(run_dir, outcome_fn_spec)
-
-    runner = cloud.BatchRunner()
-    try:
-        runner._require_config()
-    except RuntimeError as e:
-        raise RuntimeError(
-            f"Cloud propagation requires AZ_* env vars: {e}. Set them in "
-            f"the repo .env or export before running."
-        )
-
-    # Phase 21 δ: budget guard BEFORE any resource is created, priced for
-    # the node type actually requested (dedicated by default).
-    avg_task_seconds = 30.0
-    cloud.preflight_budget(len(params_list), avg_task_seconds, vm_size,
-                           max_nodes, use_low_priority, budget_usd_cap)
-
-    # Provision the pool if absent and guarantee teardown of a pool this
-    # invocation created — on success, exception, or timeout. Static
-    # dedicated pools bill until deleted, so this is not optional.
-    # Always use dedicated nodes unless the caller explicitly sets
-    # low-priority (Free Trial subs have 0 quota).
-    spec = cloud.PoolSpec(name=pool_name, vm_size=vm_size,
-                          max_nodes=max_nodes, auto_delete=True)
-    with runner.managed_pool(spec, use_low_priority=use_low_priority,
-                             auto_scale=False):
-        print(f"  cloud: submitting {len(params_list)} tasks to pool "
-              f"'{pool_name}' ({vm_size}, "
-              f"{'low-priority' if use_low_priority else 'dedicated'} × "
-              f"{max_nodes})", file=sys.stderr)
-        job_id = runner.submit_function_tasks(
-            pool_name=pool_name,
-            fn=fn,
-            args_list=params_list,
-            pip_deps=[],  # workers only need stdlib + whatever's in the
-                          # container image; outcome_fn's deps must be importable
-                          # from the tarballed models/ directory.
-            budget_usd_cap=budget_usd_cap,
-            avg_task_seconds=avg_task_seconds,
-            models_dir=models_dir,
-            low_priority=use_low_priority,
-        )
-        print(f"  cloud: job {job_id} submitted, waiting...", file=sys.stderr)
-        raw_results = runner.wait_and_collect(job_id, timeout_minutes=120)
-    print(f"  cloud: {len(raw_results)} results collected", file=sys.stderr)
-
-    # Unpack: each raw result is {'ok': bool, 'result'/'error': ...}
-    outs = []
-    for i, r in enumerate(raw_results):
-        if r is None:
-            outs.append({"_error": {"draw": i, "exception": "NoResult",
-                                    "message": "task produced no output blob"}})
-        elif r.get("ok"):
-            outs.append(r["result"])
-        else:
-            outs.append({"_error": {
-                "draw": i,
-                "exception": "WorkerError",
-                "message": r.get("error", "")[:200],
-            }})
-    return outs
-
-
 # ---------------------------------------------------------------------------
 # Outcome function loading
 # ---------------------------------------------------------------------------
@@ -551,15 +460,7 @@ def propagate(run_dir: str, n_draws: int = 200, seed: int = 42,
 
     compute_cloud = False
     if cloud:
-        cloud_results = _propagate_cloud(
-            run_dir, params_list, outcome_fn_spec,
-            pool_name=cloud_pool_name, vm_size=cloud_vm_size,
-            max_nodes=cloud_max_nodes,
-            use_low_priority=cloud_use_low_priority,
-            budget_usd_cap=cloud_budget_usd_cap,
-            verbose=verbose,
-        )
-        outs = cloud_results
+        raise RuntimeError("cloud_batch retired (use --parallel for Coiled compute)")
     elif parallel or os.environ.get("MA_COMPUTE_SCHEDULER"):
         # Phase 24 α: fan the draws out through scripts/compute.py (dask on
         # Coiled when the launcher provides a scheduler, else a local pool).
@@ -811,52 +712,6 @@ parameters:
            and "rare_event" not in rep4["scalar_outputs"]["b"]
            and "cuts" not in rep4["degenerate_outputs"],
            f"P45-3: propagate records rare-event fields; got {cu}")
-
-        # P21-5: cloud path against the in-memory Azure fake — budget is
-        # rejected before any pool is created; on success the created
-        # pool is deleted; on a mid-run failure it is deleted too.
-        cloud_mod = _import_sibling_module("cloud_batch")
-        os.environ["MA_ALLOW_AZURE_BATCH"] = "1"   # the fake Azure below; the real one is refused without it (AB1)
-        with open(os.path.join(run_dir, "models", "outcome_fn.py"), "w") as f:
-            f.write(outcome_fn_src)
-        orig_runner = cloud_mod.BatchRunner
-        try:
-            with cloud_mod._FakeAzure() as fa:
-                r1 = fa.runner()
-                cloud_mod.BatchRunner = lambda: r1
-                raised = False
-                try:
-                    propagate(run_dir, n_draws=50, seed=2, cloud=True,
-                              cloud_budget_usd_cap=1e-6)
-                except cloud_mod.BudgetExceededError:
-                    raised = True
-                ok(raised and fa.calls == [],
-                   f"P21-5: budget rejection precedes provisioning; calls {fa.calls}")
-            with cloud_mod._FakeAzure() as fa:
-                r2 = fa.runner()
-                cloud_mod.BatchRunner = lambda: r2
-                rep5 = propagate(run_dir, n_draws=20, seed=2, cloud=True,
-                                 cloud_budget_usd_cap=100.0)
-                ok(rep5["backend"] == "cloud" and rep5["n_successful"] == 20
-                   and ("pool.delete", "uq-pool") in fa.calls,
-                   f"P21-6: cloud success → results + pool deleted; calls {fa.calls}")
-            with cloud_mod._FakeAzure(task_mode="hang") as fa:
-                runner = fa.runner()
-                orig_wait = runner.wait_and_collect
-                runner.wait_and_collect = (lambda job_id, timeout_minutes=120:
-                                           orig_wait(job_id, timeout_minutes=0.0001,
-                                                     poll_seconds=0))
-                cloud_mod.BatchRunner = lambda: runner
-                timed_out = False
-                try:
-                    propagate(run_dir, n_draws=5, seed=2, cloud=True,
-                              cloud_budget_usd_cap=100.0)
-                except TimeoutError:
-                    timed_out = True
-                ok(timed_out and ("pool.delete", "uq-pool") in fa.calls,
-                   f"P21-7: cloud timeout → pool deleted; calls {fa.calls}")
-        finally:
-            cloud_mod.BatchRunner = orig_runner
 
     if failures:
         print(f"FAIL: {len(failures)} case(s)", file=sys.stderr)

@@ -613,20 +613,91 @@ def _self_test() -> int:
     with tempfile.TemporaryDirectory() as td:
         repo, bare = WMT._toy_repo(os.path.join(td, "toyrepo")), os.path.join(td, "noremote")
         subprocess.run(["git", "init", "-q", bare], check=True, capture_output=True)    # a repository, no remote
+        toolkit = AB.backend("toolkit")
+
+        class _FastToyBackend:
+            """Deterministic toy analyze step for `signoff='none'` world-model self-tests."""
+            settings_paths = getattr(toolkit, "settings_paths", AB.SETTINGS_PATHS)
+
+            def __getattr__(self, name):
+                return getattr(toolkit, name)
+
+            def pipeline_steps(self, spec_path, run_dir):
+                import shlex
+                deps = ["decision_spec.yaml", "units.csv"]
+                for rel in ("analysis_settings.yaml", "engine_choice.json"):
+                    if os.path.exists(os.path.join(run_dir, rel)):
+                        deps.append(rel)
+                code = (
+                    "import csv, json, os, yaml\n"
+                    "os.makedirs('analysis', exist_ok=True)\n"
+                    "spec = yaml.safe_load(open('decision_spec.yaml', encoding='utf-8')) or {}\n"
+                    "sett = (yaml.safe_load(open('analysis_settings.yaml', encoding='utf-8')) or {}) "
+                    "if os.path.exists('analysis_settings.yaml') else {}\n"
+                    "draws = int((sett.get('uncertainty') or {}).get('draws') "
+                    "or (spec.get('uncertainty') or {}).get('draws') or 24)\n"
+                    "outcome = (spec.get('objective') or {}).get('outcome') or 'dalys'\n"
+                    "ucsv = (spec.get('decision_units') or {}).get('csv') or 'units.csv'\n"
+                    "rows = list(csv.DictReader(open(ucsv, encoding='utf-8')))\n"
+                    "plan = {str(r['id']): ('a' if i % 2 == 0 else 'b') for i, r in enumerate(rows)}\n"
+                    "pt = {'schema': 'analysis.point/1', 'data': {\n"
+                    "    'plan': plan, 'averted': {outcome: 1000.0 + draws}, 'cost_allocated': 5000.0,\n"
+                    "    'mix': {'a': sum(v == 'a' for v in plan.values()), 'b': sum(v == 'b' for v in plan.values())},\n"
+                    "    'solver': {'status': 'optimal'}}}\n"
+                    "yaml.safe_dump(pt, open('analysis/point.yaml', 'w', encoding='utf-8'), sort_keys=False)\n"
+                    "uq = {'schema': 'analysis.uncertainty/1', 'data': {\n"
+                    "    'draws': draws, 'covers': ['engine_parameters'], 'excludes': [], 'label': '95% CI',\n"
+                    "    'fixed_plan': {outcome: {'ci_low': 800.0 + draws, 'median': 1000.0 + draws, 'ci_high': 1200.0 + draws}}}}\n"
+                    "yaml.safe_dump(uq, open('analysis/uncertainty.yaml', 'w', encoding='utf-8'), sort_keys=False)\n"
+                    "with open('analysis/allocation.csv', 'w', encoding='utf-8', newline='') as f:\n"
+                    "    w = csv.writer(f)\n"
+                    "    w.writerow(['id', 'package', f'{outcome}_averted'])\n"
+                    "    for u, pkg in plan.items():\n"
+                    "        w.writerow([u, pkg, 100.0 + draws])\n"
+                    "with open('allocation_optimized.csv', 'w', encoding='utf-8', newline='') as f:\n"
+                    "    w = csv.writer(f)\n"
+                    "    w.writerow(['unit', 'package', f'{outcome}_averted'])\n"
+                    "    for u, pkg in plan.items():\n"
+                    "        w.writerow([u, pkg, 100.0 + draws])\n"
+                    "open('results.md', 'w', encoding='utf-8').write(f'# Toy analysis\\n\\nDraws: {draws}\\n')\n"
+                    "man = {'status': 'complete', 'complete': True, "
+                    "'spec_signed': os.path.exists('decision_spec.signoff.json')}\n"
+                    "open('analysis/manifest.json', 'w', encoding='utf-8').write(json.dumps(man, sort_keys=True))\n"
+                )
+                return [{
+                    "id": "analyze",
+                    "run": f"{shlex.quote(sys.executable)} -c {shlex.quote(code)}",
+                    "inputs": deps,
+                    "outputs": ["analysis/manifest.json", "analysis/point.yaml", "analysis/uncertainty.yaml",
+                                "analysis/allocation.csv", "allocation_optimized.csv", "results.md"],
+                }]
+
+            def gate_findings(self, rd):
+                return [] if os.path.exists(os.path.join(rd, "analysis", "manifest.json")) else [
+                    {"kind": "analysis_contract_missing", "severity": "HIGH", "stage": "ANALYZE",
+                     "claim": "missing manifest", "key": "", "scope_declarable": False}]
+
+        fast_toy = _FastToyBackend()
 
         def run(name, seed=None, wm_on=True, repo_=repo, stop_after=None, then=None):
+            import yaml as _yaml_w
+            from toolkit.spec import schema as _schema_w
             d = os.path.join(td, name)
             os.makedirs(d)
-            AB.write_toy_units(os.path.join(d, "units.csv"), n=12)
-            spec = dict(AB.toy_spec("units.csv"))
-            spec.pop("engine")
+            spec_p = _schema_w.toy_spec(d, n=12)
+            with open(spec_p) as fh:
+                spec = _schema_w.direct_toy(_yaml_w.safe_load(fh))
+            os.unlink(spec_p)
+            spec["engine"] = "auto"
+            spec["uncertainty"].pop("draws", None)
+            spec["uncertainty"].pop("seed", None)
             st = SM.init_run(d, "toy question", 2, "none", "v2", None, derived_inputs=False, world_model=wm_on)
-            T = StubTasks({"spec": spec, "settings": AB.toy_settings(draws=24, points=16)})
+            T = StubTasks({"spec": spec, "settings": {"uncertainty": {"draws": 24, "seed": 1}}})
             if seed is not None:
                 T.world_model_seed = seed
 
             def machine(state):
-                m = SM.Machine(d, T, state, backend=AB.backend("spike"), log=lambda *a: None, cross_engine_check=False)
+                m = SM.Machine(d, T, state, backend=fast_toy, log=lambda *a: None, cross_engine_check=False)
                 m.wm_repo = repo_
                 return m
             m = machine(st)
@@ -705,7 +776,7 @@ def _self_test() -> int:
             WMS._seed_sha = real_sha
         ok(s9 == "completed" and abs(st9.spent_usd - 0.25) < 1e-9 and "interrupted_charged" not in st9.journal[JOURNAL_KEY],
            f"W8d a read failing after the charge records the charge once and the journal completed ({st9.spent_usd})")
-        m1 = SM.Machine(d1, StubTasks({}), None, backend=AB.backend("spike"), log=lambda *a: None)
+        m1 = SM.Machine(d1, StubTasks({}), None, backend=fast_toy, log=lambda *a: None)
         reg = j(d1, REGISTRATION)
         reg["topics"][-1]["key"] = "none"
         _put(d1, REGISTRATION, json.dumps(reg))

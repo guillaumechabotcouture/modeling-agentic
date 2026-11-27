@@ -34,7 +34,6 @@ AGENT_MODULES = (
     "agents/analysis_backend.py", "agents/v2_sdk_tasks.py", "agents/world_model_stage.py",
     "agents/acquire.py",
 )
-# agents/integrity.py imports the agents package, so main.py's self-test runs its cases (IN12).
 # Files (or directory prefixes ending in "/") in scope that have no --self-test, and why.
 EXEMPT = {
     "cloud/configs/": "launch configs (settings, no logic), read by cloud/run_cluster.py",

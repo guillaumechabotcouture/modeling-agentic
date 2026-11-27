@@ -4,8 +4,7 @@ imports nothing from this repo at module level).
 The agent VM runs one pipeline run (`run_to_disk`), stores it, and shuts the
 cluster down once every run of the launch is in storage. The keeper VM holds
 the compute pool's autoscaler (`keeper_task`). The small `*_side` functions
-are called with client.run by `run_cluster` (status, collect, brief, sign,
-report).
+are called with client.run by `run_cluster` (status, collect, sign).
 """
 from __future__ import annotations
 
@@ -912,11 +911,6 @@ def keeper_health():
     return {"status": keeper_status(), "log": keeper_log(), "now": time.time()}
 
 
-def ack_probe():
-    """A task that returns at once (run_cluster.py ack-probe: the acknowledgement of a fast task)."""
-    return "ok"
-
-
 class SchedulerInfoUnavailable(RuntimeError):
     """The scheduler's worker table could not be read within the retry bound."""
 
@@ -1423,22 +1417,6 @@ def _run_dir(label):
     return rds[-1] if rds else None
 
 
-def brief_side(label):
-    import os, subprocess, sys
-    rd = _run_dir(label)
-    if not rd:
-        return {"state": "no run directory yet"}
-    r = subprocess.run([sys.executable, "scripts/decision_brief.py", "status", rd], cwd=f"{WORK}/{label}",
-                       capture_output=True, text=True)
-    md = open(rd + "decision_brief.md").read() if os.path.exists(rd + "decision_brief.md") else None
-    # Phase 49 β: a pending scope sign-off is shown instead (scope_signoff.md, written by main.py).
-    sc = subprocess.run([sys.executable, "scripts/scope_signoff.py", "status", rd], cwd=f"{WORK}/{label}",
-                        capture_output=True, text=True).stdout.strip()
-    if sc == "awaiting" and os.path.exists(rd + "scope_signoff.md"):
-        return {"run_dir": rd, "status": "awaiting scope sign-off", "brief_md": open(rd + "scope_signoff.md").read()}
-    return {"run_dir": rd, "status": r.stdout.strip() or r.stderr.strip(), "brief_md": md}
-
-
 def sign_side(label, answers_yaml, note, run_name=None, expect_spec_sha256=None, _runner=None, action=None,
               expect_derivations_sha256=None, expect_sheet_sha256=None):
     """The owner's answer for the newest run on `label`. `run_name` (the run console passes it): the run dir the
@@ -1487,16 +1465,6 @@ def sign_side(label, answers_yaml, note, run_name=None, expect_spec_sha256=None,
     finally:
         os.remove(p)
     return {"rc": r.returncode, "out": (r.stdout + r.stderr).strip()}
-
-
-def report_side(label):
-    import subprocess, sys
-    rd = _run_dir(label)
-    if not rd:
-        return "no run directory yet"
-    r = subprocess.run([sys.executable, "scripts/convergence_report.py", rd], cwd=f"{WORK}/{label}",
-                       capture_output=True, text=True, timeout=300)
-    return r.stdout or r.stderr[-1500:]
 
 
 # ---- durable detached jobs on a VM (Phase 42 β, A7; driven by cloud/vm_job.py) ------------
