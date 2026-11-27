@@ -298,7 +298,7 @@ def job_sha(job: dict) -> str:
 def _engine(ref, *, run_dir: str | None = None):
     from toolkit.engines.built import BUILT_ADAPTER_REF
     from toolkit.spec.schema import load_engine
-    key = json.dumps({"ref": ref, "run_dir": run_dir}, sort_keys=True)
+    key = json.dumps(ref, sort_keys=True) if run_dir is None else json.dumps({"ref": ref, "run_dir": run_dir}, sort_keys=True)
     if key not in _E:
         is_built = (ref == BUILT_ADAPTER_REF) or (isinstance(ref, dict) and ref.get("ref") == BUILT_ADAPTER_REF)
         _E[key] = load_engine(ref, allow_built=is_built, run_dir=run_dir)
