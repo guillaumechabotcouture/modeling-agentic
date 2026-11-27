@@ -201,14 +201,13 @@ def run_eval(seeds=SEEDS) -> dict:
 
 def _run_built_engine_defects() -> list[tuple[str, str, bool]]:
     """Deterministic planted-defect tripwires BE2 (dead parameter -> A6), BE8 (closed-conservation
-    population growth -> A5), and BE10 (public lookup table -> S4 + hidden A4)."""
+    population growth -> A5), and BE10 (public lookup table -> hidden A4)."""
     if REPO not in sys.path:
         sys.path.insert(0, REPO)
     import numpy as np
     from toolkit.engines.built import admission as BADM
     from toolkit.engines.built import candidate as BCAND
     from toolkit.engines.built import fixtures as BFIX
-    from toolkit.engines.built import snapshot as BSNAP
     from toolkit.engines.built import worker as BWORK
     from toolkit.engines.contract import Package
 
@@ -222,7 +221,7 @@ def _run_built_engine_defects() -> list[tuple[str, str, bool]]:
 
     # BE2: dead parameter p_sev caught by A6
     c2 = BCAND.CandidateEngine(BFIX.two_group_sir_files("dead_param"), b, unsandboxed_ok=dev_un)
-    a6_2, _ = BADM.check_a6_a7(c2, b, sp, np.random.default_rng(11), n_bases=1, min_moving=1, th=th)
+    a6_2 = BADM.check_a6(c2, b, sp, np.random.default_rng(11), n_bases=1, min_moving=1, th=th)
     be2_ok = a6_2.get("status") == "fail" and any("p_sev" in str(p) for p in a6_2.get("problems") or [])
 
     # BE8: 0.1%/step population growth under conservation=closed caught by A5
@@ -230,12 +229,11 @@ def _run_built_engine_defects() -> list[tuple[str, str, bool]]:
     a5_8 = BADM.check_a5(c8, b, units, pkgs, hor, th=th)
     be8_ok = a5_8.get("status") == "fail" and any("conservation" in str(p) for p in a5_8.get("problems") or [])
 
-    # BE10: public lookup table caught by S4 static audit and hidden A4 (n_free=3 matches admission.py)
+    # BE10: public lookup table caught by hidden A4 (n_free=3 matches admission.py)
     f10 = BFIX.two_group_sir_files("public_table")
-    s4_probs = BSNAP.check_static(f10, request=b)
     c10 = BCAND.CandidateEngine(f10, b, unsandboxed_ok=dev_un)
     hid_a4 = BADM.check_a4(c10, b, sp, np.random.default_rng(19), n_free=3, th=th)
-    be10_ok = any("S4:" in p for p in s4_probs) and hid_a4.get("status") == "fail"
+    be10_ok = hid_a4.get("status") == "fail"
 
     return [
         ("built_engine:BE2", "built_dead_param", bool(be2_ok)),

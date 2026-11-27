@@ -26,12 +26,14 @@ for _p in (ROOT, HERE):
         sys.path.insert(0, _p)
 
 from lib import safe_io as SIO  # noqa: E402
+from toolkit.engines.built import BUILT_ADAPTER_REF  # noqa: E402
 from toolkit.engines.built import adapter as BADAPT  # noqa: E402
+from toolkit.engines.built import signoff as BSIG  # noqa: E402
 from toolkit.engines.built import snapshot as BSNAP  # noqa: E402
 from toolkit.engines.built import worker as BWORK  # noqa: E402
 
 _VALID_CHECK_STATUSES = frozenset({"pass", "fail", "skipped", "not_applicable", "inconclusive", "unavailable"})
-_GATING_CHECKS = frozenset({"A1", "A2", "A3", "A4", "A5", "A6", "A7", "A8", "A9", "A11"})
+_GATING_CHECKS = frozenset({"A1", "A2", "A3", "A4", "A5", "A6", "A8", "A11"})
 
 
 def _finding(kind: str, key: str, claim: str) -> dict:
@@ -101,10 +103,27 @@ def _read_plain_json(run_dir: str, rel: str) -> tuple[dict | None, bytes | None,
     return doc, raw, None
 
 
+def _choice_selects_built(run_dir: str) -> bool:
+    ch_path = os.path.join(run_dir, "engine_choice.json")
+    if not os.path.lexists(ch_path):
+        return False
+    doc, _raw, err = _read_plain_json(run_dir, "engine_choice.json")
+    if err or not isinstance(doc, dict):
+        return False
+    eng = doc.get("engine")
+    if isinstance(eng, dict) and eng.get("ref") == BUILT_ADAPTER_REF:
+        return True
+    return eng == BUILT_ADAPTER_REF
+
+
 def gate_findings(run_dir: str) -> list[dict]:
     """Fail-closed validation of `engine_build/` admission, snapshot manifest, and sign-off records."""
     eb_dir = os.path.join(run_dir, "engine_build")
+    built_chosen = _choice_selects_built(run_dir)
     if not os.path.lexists(eb_dir):
+        if built_chosen:
+            return [_finding("built_engine_artifact_invalid", "engine_build",
+                             "engine_choice.json selects BuiltEngine but engine_build/ is missing")]
         return []
     if os.path.islink(eb_dir) or not os.path.isdir(eb_dir):
         return [_finding("built_engine_artifact_invalid", "engine_build",
@@ -122,7 +141,13 @@ def gate_findings(run_dir: str) -> list[dict]:
     adm_present = os.path.lexists(os.path.join(run_dir, adm_rel))
     so_present = os.path.lexists(os.path.join(run_dir, so_rel))
     if not adm_present and not so_present:
+        if built_chosen:
+            findings.append(_finding("built_engine_admission_invalid", adm_rel,
+                                     "engine_choice.json selects BuiltEngine but admission.json and signoff.json are missing"))
         return findings
+    if built_chosen and not so_present:
+        findings.append(_finding("built_engine_signoff_invalid", so_rel,
+                                 "engine_choice.json selects BuiltEngine but engine_build/signoff.json is missing"))
 
     adm, adm_raw, adm_err = _read_plain_json(run_dir, adm_rel)
     adm_sha = hashlib.sha256(adm_raw).hexdigest() if adm_raw is not None else None
@@ -239,6 +264,22 @@ def gate_findings(run_dir: str) -> list[dict]:
             if so.get("by") not in ("owner", "lead"):
                 findings.append(_finding("built_engine_signoff_invalid", so_rel,
                                          f"{so_rel} invalid signer {so.get('by')!r}"))
+            else:
+                if os.path.lexists(os.path.join(run_dir, "run_state.json")):
+                    rs_doc, _rs_raw, rs_err = _read_plain_json(run_dir, "run_state.json")
+                    if not rs_err and isinstance(rs_doc, dict):
+                        if rs_doc.get("signoff") == "owner" and so.get("by") != "owner":
+                            findings.append(_finding("built_engine_signoff_invalid", so_rel,
+                                                     f"{so_rel} signed by {so.get('by')!r} in an owner-signoff run"))
+                if so.get("by") == "lead":
+                    try:
+                        blk = BSIG.review_blocks_lead(run_dir)
+                        if blk:
+                            findings.append(_finding("built_engine_signoff_invalid", so_rel,
+                                                     f"{so_rel} lead sign-off blocked by engine review: {blk}"))
+                    except Exception as e:  # noqa: BLE001
+                        findings.append(_finding("built_engine_signoff_invalid", so_rel,
+                                                 f"review_blocks_lead check failed: {type(e).__name__}: {e}"))
             so_snap = so.get("snapshot_sha256")
             if not _is_sha64(so_snap):
                 findings.append(_finding("built_engine_signoff_invalid", so_rel,

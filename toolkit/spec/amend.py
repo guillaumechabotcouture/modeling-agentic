@@ -55,7 +55,7 @@ FINAL_OR_PAUSED = "FINAL"
 NOT_COPIED = {STATE, "metadata.json", RECORD, REQUEST, "decision_spec.signoff.json", "decision_brief.signoff.json",
               "decision_brief.signed", "decision_spec.signoff_sheet.md", "scope_signoff.json",
               "scope_signoff_request.json", "report.md", "report_withheld.md", "manuscript.md", "final_gate.json",
-              "findings.jsonl", "declared_findings.yaml", "engine_choice.json", "figures", "trace.jsonl",
+              "findings.jsonl", "declared_findings.yaml", "engine_choice.json", "engine_build", "figures", "trace.jsonl",
               "budget_ledger.json", "progress.md", "copied_run.json", "_task_input.json", "done_when_registry.json",
               "scope_declaration.yaml", "impact_ledger.jsonl"}
 NOT_COPIED_PREFIX = ("critique_", "fix_plan_", "fix_impact", "fix_progress")
@@ -92,6 +92,7 @@ def _skip(rel: str, derived: set) -> bool:
     parts = rel.split("/")
     return (parts[0] in NOT_COPIED or (len(parts) == 1 and parts[0].startswith(NOT_COPIED_PREFIX))
             or parts[-1].endswith(".lock") or ".before_" in parts[-1] or rel in derived
+            or rel.startswith("models/ext/engine_")
             or any(rel == d or rel.startswith(d + "/") for d in NOT_COPIED_DIRS))
 
 
@@ -628,7 +629,7 @@ def amend(parent, patch=None, from_request=False, out=None, signoff=None, repo=R
     write_nofollow(child, "metadata.json", json.dumps(meta, indent=2).encode(), atomic=True)
     rounds = st.get("max_rounds") if type(st.get("max_rounds")) is int and st["max_rounds"] > 0 else 3
     keep = ("question", "gate_mode", "budget_usd", "task_cap_usd", "v2_rules", "derived_inputs",
-            "derive_unsandboxed", "world_model_stages", "acquire")
+            "derive_unsandboxed", "world_model_stages", "acquire", "engine_build_cap_usd", "engine_unsandboxed")
     acq_child = dict(st["acquired"]) if isinstance(st.get("acquired"), dict) and st.get("acquired") else None
     if acq_child is not None:
         acq_child["closed"] = True    # amended child reuses parent's acquired bytes and never re-fetches (§2.4)

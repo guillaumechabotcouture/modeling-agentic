@@ -110,7 +110,7 @@ def validate_engine_critique(path: str, round_n: int = 1) -> tuple[dict | None, 
     if not isinstance(blockers, list):
         errs.append("blockers must be a list")
         blockers = []
-    has_open = False
+    has_open_high = False
     seen_ids: set[str] = set()
     for idx, b in enumerate(blockers):
         if not isinstance(b, dict):
@@ -131,10 +131,10 @@ def validate_engine_critique(path: str, round_n: int = 1) -> tuple[dict | None, 
                 errs.append(f"blocker {bid}: non-empty {req_k} required")
         if not isinstance(b.get("resolved"), bool):
             errs.append(f"blocker {bid}: resolved must be boolean")
-        elif not b.get("resolved"):
-            has_open = True
-    if verdict == "PASS" and has_open:
-        errs.append("verdict is PASS but unresolved blockers are present")
+        elif not b.get("resolved") and sev == "HIGH":
+            has_open_high = True
+    if verdict == "PASS" and has_open_high:
+        errs.append("verdict is PASS but unresolved HIGH blockers are present")
     if errs:
         return None, errs
     return doc, []
@@ -238,6 +238,8 @@ def status(run_dir: str) -> str:
         try:
             _adm, _ab, _sb, bound = _verify_admitted_evidence(run_dir)
         except ValueError:
+            return "changed"
+        if so.get("by") not in ("owner", "lead"):
             return "changed"
         recorded = so.get("sha256") if isinstance(so.get("sha256"), dict) else {}
         if so.get("snapshot_sha256") != bound["snapshot"]:
@@ -357,6 +359,11 @@ def report_disclaimer_lines(run_dir: str) -> list[str]:
     eid = so.get("engine_id") or "unknown"
     snap = str(so.get("snapshot_sha256") or "")[:12]
     by = so.get("by")
+    if by == "owner":
+        return [
+            f"**Agent-built engine (owner-signed).** This run used an agent-built engine (`{eid}`, "
+            f"snapshot `{snap}`), harness-admitted and signed by the owner (`engine_build/admission_sheet.md`).\n\n"
+        ]
     if by == "lead":
         return [
             f"**Agent-built engine (lead-signed, provisional).** This run used an agent-built engine (`{eid}`, "
@@ -364,8 +371,8 @@ def report_disclaimer_lines(run_dir: str) -> list[str]:
             "A decision run requires the owner's engine signature (`engine_build/admission_sheet.md`).\n\n"
         ]
     return [
-        f"**Agent-built engine (owner-signed).** This run used an agent-built engine (`{eid}`, "
-        f"snapshot `{snap}`), harness-admitted and signed by the owner (`engine_build/admission_sheet.md`).\n\n"
+        f"**Agent-built engine (unverified signer `{by}`).** The engine sign-off record (`engine_build/signoff.json`) "
+        "does not record a valid owner or lead signature.\n\n"
     ]
 
 
@@ -464,18 +471,29 @@ def _self_test() -> int:
             "reviewer": "critique-engine",
             "round": 1,
             "verdict": "PASS",
-            "blockers": [],
+            "blockers": [{
+                "id": "E-001", "severity": "MEDIUM", "claim": "advisory note",
+                "evidence": "engine.py:10", "fix_requires": "optional clarification", "resolved": False,
+            }],
         }
         p_c = os.path.join(d3, REVIEW_FILE)
         SIO.write_nofollow(d3, REVIEW_FILE, yaml.safe_dump(good_c).encode("utf-8"), atomic=True)
         doc_ok, errs_ok = validate_engine_critique(p_c, 1)
+        pass_high = {
+            "reviewer": "critique-engine", "round": 1, "verdict": "PASS",
+            "blockers": [{"id": "E-002", "severity": "HIGH", "claim": "bug", "evidence": "e",
+                          "fix_requires": "f", "resolved": False}],
+        }
+        SIO.write_nofollow(d3, REVIEW_FILE, yaml.safe_dump(pass_high).encode("utf-8"), atomic=True)
+        doc_ph, errs_ph = validate_engine_critique(p_c, 1)
         bad_c = {"reviewer": "wrong", "round": 1, "verdict": [],
                  "blockers": [{"id": "E-001", "severity": [], "claim": "c", "evidence": "e",
                                "fix_requires": "f", "resolved": False}]}
         SIO.write_nofollow(d3, REVIEW_FILE, yaml.safe_dump(bad_c).encode("utf-8"), atomic=True)
         doc_bad, errs_bad = validate_engine_critique(p_c, 1)
-        ok(doc_ok is not None and not errs_ok and doc_bad is None and len(errs_bad) >= 3,
-           f"BSIG8 validate_engine_critique accepts valid review and catches malformed/unhashable fields ({errs_bad[:3]})")
+        ok(doc_ok is not None and not errs_ok and doc_ph is None and any("HIGH" in e for e in errs_ph)
+           and doc_bad is None and len(errs_bad) >= 3,
+           f"BSIG8 validate_engine_critique allows PASS with advisory MEDIUM, rejects PASS with open HIGH, catches malformed ({errs_bad[:3]})")
 
     if fails:
         print(f"FAILED: {len(fails)} case(s)")

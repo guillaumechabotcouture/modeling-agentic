@@ -47,14 +47,18 @@ def _f(kind, claim, key=""):
 
 
 def _names_engine(run_dir: str) -> bool:
-    """The signed spec names its engine (anything but auto), so the analysis ignores engine_choice.json, as
-    toolkit/spec/schema.py does, and records no choice hash. An unreadable spec or one without an engine is not
-    taken as naming one: the choice file is then compared (fail closed)."""
+    """The signed spec names a fixed registered engine (anything other than auto or engine.build),
+    so the analysis ignores engine_choice.json and records no choice hash. Both `auto` and `build`
+    resolve through `engine_choice.json`, so their choice hash IS compared."""
     try:
         eng = (yaml.safe_load(open(os.path.join(run_dir, SPEC))) or {}).get("engine")
     except (OSError, yaml.YAMLError, AttributeError):
         return False
-    return eng is not None and not (eng == "auto" or (isinstance(eng, dict) and eng.get("auto") is True))
+    if eng is None or eng == "auto":
+        return False
+    if isinstance(eng, dict) and (eng.get("auto") is True or isinstance(eng.get("build"), dict)):
+        return False
+    return True
 
 
 def _affordability(run_dir: str, unc: dict) -> list[dict]:
@@ -352,9 +356,15 @@ def departure_findings(run_dir: str) -> list[dict]:
                 names["the engine artifact's card"] = (((art.get("data") or {}).get("card")) or {}).get("name")
             except (OSError, yaml.YAMLError):
                 pass
+    eng_inst = None
     try:
         from toolkit.spec import schema
-        names["the spec's engine"] = schema.engine_class(ref)(**cfg).describe().name
+        from toolkit.engines.built import BUILT_ADAPTER_REF
+        if ref == BUILT_ADAPTER_REF:
+            eng_inst = schema.load_engine({"ref": ref, "config": cfg}, allow_built=True, run_dir=run_dir)
+        else:
+            eng_inst = schema.engine_class(ref)(**cfg)
+        names["the spec's engine"] = eng_inst.describe().name
     except Exception:  # noqa: BLE001 -- not resolvable here: the other sources decide
         pass
     known = {k: v for k, v in names.items() if isinstance(v, str) and v}
@@ -369,7 +379,10 @@ def departure_findings(run_dir: str) -> list[dict]:
         return []
     from toolkit.engines import benchmark_coverage as BC
     try:
-        cov = BC.load(BC.path_for(ref))[0]
+        if eng_inst is not None and callable(getattr(eng_inst, "read_verified_bench", None)):
+            cov = yaml.safe_load(eng_inst.read_verified_bench("bench/benchmark_coverage.yaml").decode("utf-8")) or {}
+        else:
+            cov = BC.load(BC.path_for(ref))[0]
     except Exception:  # noqa: BLE001
         cov = None
     if not cov or cov.get("engine") != name:
@@ -388,7 +401,7 @@ def departure_findings(run_dir: str) -> list[dict]:
     from toolkit.analysis import decision_tests as DT
     try:
         raw = dict(spec, engine={"ref": ref, "config": cfg})
-        targets = BC.departure_targets(raw, ref, run_dir)
+        targets = BC.departure_targets(raw, ref, run_dir, engine=eng_inst)
     except Exception as ex:  # noqa: BLE001
         return [f(f"the departed components cannot be resolved: {type(ex).__name__}: {ex}", "departures")]
     out = []

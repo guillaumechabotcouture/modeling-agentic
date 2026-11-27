@@ -60,7 +60,7 @@ KIND = "observations"
 FIELDS = ("csv", "unit", "groups", "source", "latent", "observed")
 STATE = ("immunity", "susceptible")
 LATENT_OF = {"immunity": "immunity", "susceptible": "immunity", "attack_rate": "attack_rate"}   # source latent quantity
-SUB_BATCH = 512
+SUB_BATCH = 4096
 
 
 def applies(spec) -> bool:
@@ -258,11 +258,11 @@ def _state_targets_informed(spec, rows, attr, params, pri_decl, pk, groups, nuis
     mid_vals = {p: float(pri_p[p].ppf(0.5)) for p in params}
     th_mid = PV.params(spec, mid_vals)
     z_mid = float(pri_a.ppf(0.5)) if pri_a is not None else None
-    probe_qs = (1e-6, 0.01, 0.1, 0.9, 0.99, 1.0 - 1e-6)
+    probe_qs = (0.1, 0.9, 0.01, 0.99, 1e-6, 1.0 - 1e-6)
     errs: list[str] = []
     sensitive = False
 
-    def row_shares(pair_rows, N, s):
+    def row_shares(pair_rows, N, s, age_shares=None):
         out = []
         for r in pair_rows:
             idx = [groups.index(g) for g in r["groups"]]
@@ -273,7 +273,13 @@ def _state_targets_informed(spec, rows, attr, params, pri_decl, pk, groups, nuis
                     v = float(s[idx[0]])
                     out.append(1.0 - v if r["latent"] == "immunity" else v)
                     continue
-                raise ValueError(f"observed groups {r['groups']} have zero population weight")
+                if isinstance(age_shares, dict):
+                    w_sh = np.asarray([float(age_shares.get(g, 0.0)) for g in r["groups"]], float)
+                    sh_sum = float(w_sh.sum())
+                    if sh_sum > 0.0 and np.all(np.isfinite(w_sh)) and np.all(w_sh >= 0.0):
+                        w, wsum = w_sh, sh_sum
+                if wsum <= 0.0:
+                    raise ValueError(f"observed groups {r['groups']} have zero population weight")
             val = float(np.dot(w, 1.0 - s[idx]) / wsum) if r["latent"] == "immunity" else float(np.dot(w, s[idx]) / wsum)
             out.append(val)
         return np.asarray(out, float)
@@ -293,6 +299,7 @@ def _state_targets_informed(spec, rows, attr, params, pri_decl, pk, groups, nuis
                 sh = {g: float(n) / float(Ne.sum()) for g, n in zip(groups, Ne)}
                 gsz = group_sizes({"meta": {"age_shares": sh}}, pops, u_rows[uid])
                 s = np.asarray(st["s_start"], float)
+                age_sh = sh
             else:
                 o = eng.run(th, us, epkg, horizon, seed)
                 s = _extract_s_start(o, groups)
@@ -300,8 +307,9 @@ def _state_targets_informed(spec, rows, attr, params, pri_decl, pk, groups, nuis
                     raise ValueError("engine output lacks meta['s_start'] and per_capita['immunity'|'susceptible'] "
                                      "for pre-epidemic state target")
                 gsz = group_sizes({"meta": o.meta}, pops, u_rows[uid])
+                age_sh = (o.meta or {}).get("age_shares") if isinstance(o.meta, dict) else None
             N = np.asarray([float(gsz.get(g, 0.0)) for g in groups])
-            return row_shares(pair_rows, N, s)
+            return row_shares(pair_rows, N, s, age_shares=age_sh)
 
         try:
             s0 = eval_shares(th_mid, z_mid)
@@ -470,12 +478,20 @@ class ObservedProblem:
                     if lat == "susceptible":
                         return float(s[idx[0]])
                     return float(o.per_capita["infections"][r["groups"][0]])
-                raise ValueError(f"observed groups {r['groups']} have zero population weight")
+                meta = getattr(o, "meta", None) if o is not None else None
+                sh_map = meta.get("age_shares") if isinstance(meta, dict) else None
+                if isinstance(sh_map, dict):
+                    w_sh = np.asarray([float(sh_map.get(g, 0.0)) for g in r["groups"]], float)
+                    sh_sum = float(w_sh.sum())
+                    if sh_sum > 0.0 and np.all(np.isfinite(w_sh)) and np.all(w_sh >= 0.0):
+                        w, wsum = w_sh, sh_sum
+                if wsum <= 0.0:
+                    raise ValueError(f"observed groups {r['groups']} have zero population weight")
             if lat == "immunity":
                 return float(np.dot(w, 1.0 - s[idx]) / wsum)
             if lat == "susceptible":
                 return float(np.dot(w, s[idx]) / wsum)
-            return float(sum(o.per_capita["infections"][g] * N[j] for g, j in zip(r["groups"], idx)) / wsum)
+            return float(sum(o.per_capita["infections"][g] * w[k] for k, g in enumerate(r["groups"])) / wsum)
         oc = lat[8:]
         return float(sum(o.per_capita[oc][g] * N[j] for g, j in zip(r["groups"], idx)))
 
@@ -582,19 +598,21 @@ def fit(spec, model, rows=None, fixed_z=None, fixed_params=None, seed=None, samp
         # refusals are counted and reported, as the scan's below. The optimisation and the Hessian are part of the
         # fit: a refusal there refuses it (Codex r1 P1-3).
         from toolkit.analysis import mode_start as MS
+        over = {} if E.state_only else {"max_importance_params": C.thresholds()["max_importance_params_run_batch"]}
         scanned = [0]
 
         def after_scan():
             scanned[0] += E.failed
             E.failed = 0
-        modes = MS.find_modes(P, after_scan=after_scan) if MS.uses_metropolis(P) else None
+        modes = MS.find_modes(P, after_scan=after_scan) if MS.uses_metropolis(P, **over) else None
         scan_failed = scanned[0]
         refuse_failures("while finding the posterior modes")
-        s = MS.sample(P, seed=int(sd), modes=modes, after_scan=after_scan)
+        s = MS.sample(P, seed=int(sd), modes=modes, after_scan=after_scan, **over)
         scan_failed = scanned[0]
         refuse_failures("in the posterior sample")
         c = C.classify(P, s)
         refuse_failures("in the identifiability classification")
+    from toolkit.analysis import mode_start as MS
     if P.names:
         if s:
             start = s["best"]
@@ -602,9 +620,9 @@ def fit(spec, model, rows=None, fixed_z=None, fixed_params=None, seed=None, samp
             # a start search over the prior (not part of any posterior): its refusals are counted and reported
             start = _scan_start(P)
             scan_failed, E.failed = E.failed, 0
-        xh, conv, msg = C._map_point(P, start)
+        xh, conv, msg = MS.map_point(P, start)
         if not conv:          # Codex r2 P1-2: one restart from the point reached; a mode that still fails is refused
-            xh, conv, msg = C._map_point(P, xh)
+            xh, conv, msg = MS.map_point(P, xh)
         refuse_failures("while finding the posterior mode")
         if not conv:
             raise C.CalibrationRefused("posterior_mode", f"the posterior mode search did not converge ({msg})")
@@ -619,7 +637,6 @@ def fit(spec, model, rows=None, fixed_z=None, fixed_params=None, seed=None, samp
     refuse_failures("at the posterior mode")
     if not np.isfinite(ll_hat):
         raise C.CalibrationRefused("posterior_mode", "the posterior mode has no finite likelihood")
-    from toolkit.analysis import mode_start as MS
     out = {"method": "posterior", "targets_kind": KIND, "x": x, "names": list(P.names), "params": E.params,
            "units_fitted": E.units, "fixed_z": fixed, "fixed_params": dict(E.fixed_params),
            "nuisance": [p for p in E.nuisance if p not in E.fixed_params],
@@ -875,16 +892,16 @@ def _self_test() -> int:
         e7 = schema.validate(schema.Spec(r7, d, os.path.join(d, "decision_spec.yaml")))
         ok(any("two different priors" in x for x in e7), f"OT21 (r1 P2-16) conflicting shared priors are refused: {e7[:2]}")
         # OT23 (r2 P1-2): a mode search that does not converge is refused
-        from toolkit.analysis import calibration as C
-        orig_map = C._map_point
-        C._map_point = lambda P, start=None: (orig_map(P, start)[0], False, "ABNORMAL (test)")
+        from toolkit.analysis import calibration as C, mode_start as MS
+        orig_map = MS.map_point
+        MS.map_point = lambda P, start=None: (orig_map(P, start)[0], False, "ABNORMAL (test)")
         try:
             fit(sp, m, fixed_params={k: v for k, v in fx.items() if k != "r0"}, sample_it=False)
             ok(False, "OT23 (r2 P1-2) an unconverged mode is refused")
         except C.CalibrationRefused as e:
             ok("did not converge" in str(e), f"OT23 (r2 P1-2) an unconverged mode is refused: {e}")
         finally:
-            C._map_point = orig_map
+            MS.map_point = orig_map
         # OT24 (r2 P2-6): a negative-binomial count row carries its own variance
         r8 = copy.deepcopy(sp.raw)
         r8["calibration"]["sources"][2]["noise"] = {"model": "negbin", "dispersion": 2.0}
@@ -1117,6 +1134,42 @@ def _self_test() -> int:
            f"OT27 RequestedEngine defers state probe if immunity/susceptible declared, and standard Engine without "
            f"initial_state() calibrates single unmapped group via per_capita['immunity'] (no={e_req_no}, yes={e_req_yes}, "
            f"ni={e_ni}, z={z_est:.4f})")
+        # OT27b: multi-group unmapped observation-only age band falls back to o.meta['age_shares']
+        r_mg = copy.deepcopy(r_yes)
+        r_mg["engine"]["build"]["request"]["age_groups"] = ["g1", "g2", "g3"]
+        with open(os.path.join(d, "t_ot27b.csv"), "w") as fh:
+            fh.write("unit,groups,source,latent,pos,n\nu1,g2;g3,sero,immunity,63,100\n")
+        r_mg["calibration"]["targets"]["csv"] = "t_ot27b.csv"
+
+        class _MultiObsEngine(_NoInitEngine):
+            def describe(self):
+                c = super().describe()
+                return EngineCard(
+                    name=c.name, version=c.version, mechanisms=c.mechanisms, components=c.components,
+                    unit_attributes=c.unit_attributes, outputs=c.outputs,
+                    age_groups=["g1", "g2", "g3"], valid_ranges=c.valid_ranges,
+                )
+
+            def run(self, params, unit, package, horizon, seed):
+                o = super().run(params, unit, package, horizon, seed)
+                r_in = float(unit.attributes["rate_in"])
+                imm2 = 1.0 - float(np.exp(-r_in * 10.0))
+                return Outcomes(
+                    per_capita={
+                        "cases": {**o.per_capita["cases"], "g3": o.per_capita["cases"]["g2"]},
+                        "severe": {**o.per_capita["severe"], "g3": o.per_capita["severe"]["g2"]},
+                        "immunity": {**o.per_capita["immunity"], "g3": imm2},
+                    },
+                    windows=o.windows, cost_drivers=o.cost_drivers,
+                    meta={"age_shares": {"g1": 0.4, "g2": 0.3, "g3": 0.3}},
+                )
+
+        eng_mg = _MultiObsEngine()
+        sp_mg = schema.with_engine(schema.Spec(r_mg, d, os.path.join(d, "spec_mg.yaml")), eng_mg)
+        e_mg = problems(sp_mg, eng_mg.describe(), {p.name: p for p in eng_mg.parameters()})
+        fit_mg = fit(sp_mg, DirectModel(sp_mg, log=lambda *a: None), seed=0, sample_it=False)
+        ok(e_mg == [] and abs(float(fit_mg["z"]["u1"]) - 0.0994) < 0.01,
+           f"OT27b multi-group observation-only age band falls back to meta['age_shares'] (e={e_mg}, z={fit_mg['z']['u1']:.4f})")
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1

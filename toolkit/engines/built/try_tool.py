@@ -31,6 +31,7 @@ for _p in (ROOT, os.path.join(ROOT, "scripts")):
         sys.path.insert(0, _p)
 
 from lib import safe_io as SIO  # noqa: E402
+from toolkit.engines import benchmark_coverage as BC  # noqa: E402
 from toolkit.engines.contract import Horizon, Package, UnitSpec  # noqa: E402
 from toolkit.engines.built import admission as BADM  # noqa: E402
 from toolkit.engines.built import candidate as BCAND  # noqa: E402
@@ -39,11 +40,7 @@ from toolkit.engines.built import snapshot as BSNAP  # noqa: E402
 
 LEDGER_REL = "engine_build/try/ledger.json"
 LEDGER_LOCK_REL = "engine_build/try/.ledger.lock"
-VALID_PUBLIC_CHECKS = ("A1", "A2", "A3", "A4", "A5", "A6", "A7", "A8")
-
-
-class TryCapExceeded(RuntimeError):
-    """Raised when a build try reaches the harness call limit (default 30 calls per try)."""
+VALID_PUBLIC_CHECKS = ("A1", "A2", "A3", "A4", "A5", "A6", "A8")
 
 
 def _load_ledger(run_dir: str) -> dict:
@@ -57,28 +54,23 @@ def _load_ledger(run_dir: str) -> dict:
     return {"count": 0, "calls": []}
 
 
-def _consume_call(run_dir: str, kind: str, max_calls: int) -> tuple[int, dict]:
-    """Atomically increment the persistent try-call ledger under an exclusive flock."""
+def _next_call_n(run_dir: str, kind: str) -> int:
+    """Atomically allocate the next monotonic trace number under flock (`engine_build/try/<n>.json`).
+    Turn and dollar budgets are enforced by `SdkTasks`; no separate fixed call cap is imposed."""
     with SIO.open_append_nofollow(run_dir, LEDGER_LOCK_REL) as lock_f:
         fcntl.flock(lock_f.fileno(), fcntl.LOCK_EX)
         try:
             ledger = _load_ledger(run_dir)
-            count = int(ledger.get("count", len(ledger.get("calls") or [])))
-            if count >= max_calls:
-                raise TryCapExceeded(f"try tool call cap reached ({count}/{max_calls} calls used)")
-            n = count + 1
+            calls = ledger.setdefault("calls", [])
+            n = int(ledger.get("count", len(calls))) + 1
             ledger["count"] = n
-            ledger.setdefault("calls", []).append({
-                "n": n,
-                "tool": kind,
-                "at": _dt.datetime.now(_dt.timezone.utc).isoformat(),
-            })
+            calls.append({"n": n, "tool": kind, "at": _dt.datetime.now(_dt.timezone.utc).isoformat()})
             SIO.write_nofollow(
                 run_dir, LEDGER_REL,
                 json.dumps(ledger, indent=1, sort_keys=True).encode("utf-8"),
                 atomic=True,
             )
-            return n, ledger
+            return n
         finally:
             fcntl.flock(lock_f.fileno(), fcntl.LOCK_UN)
 
@@ -189,14 +181,13 @@ def engine_try(
     config: Mapping | None = None,
     unsandboxed_ok: bool = False,
 ) -> dict:
-    """`mcp__engine__try`: snapshot working copy into `engine_build/try/snapshots/`, run S1-S4
-    and ONLY public cases of requested checks, write `engine_build/try/<n>.json`, return <= 8 KB summary."""
+    """`mcp__engine__try`: snapshot working copy into `engine_build/try/snapshots/`, run S1-S3
+    and public cases of requested checks, write `engine_build/try/<n>.json`, return <= 8 KB summary."""
     selected = _normalize_checks(checks)
     th = BADM.load_thresholds()
-    max_calls = int(th["try_max_calls"])
     max_bytes = int(th["try_summary_max_bytes"])
     spec_raw, build_decl = _load_spec_and_build(run_dir)
-    n, _ = _consume_call(run_dir, "try", max_calls)
+    n = _next_call_n(run_dir, "try")
     bid = str(build_decl["id"])
     wdir = work_dir or os.path.join(run_dir, "models", "ext", f"engine_{bid}")
     snaps_dir = os.path.join(run_dir, "engine_build", "try", "snapshots")
@@ -223,7 +214,10 @@ def engine_try(
         verified, build_decl, config=config, run_dir=run_dir,
         unsandboxed_ok=unsandboxed_ok, limits=limits, id_salt="public_try",
     )
-    pub = BADM.run_public_checks(cand, build_decl, spec_raw, checks=selected)
+    pub = BADM.run_public_checks(
+        cand, build_decl, spec_raw, checks=selected,
+        base_dir=run_dir, departures_status=BC.signature(run_dir),
+    )
     out = {
         "call_n": n,
         "ok": bool(pub["ok"]),
@@ -249,11 +243,9 @@ def engine_run_one(
     config: Mapping | None = None,
     unsandboxed_ok: bool = False,
 ) -> dict:
-    """`mcp__engine__run`: validate inputs against the signed request domains, consume one call from
-    the shared 30-call ledger, execute one sandboxed run, persist `engine_build/try/<n>.json`, and
-    return capped Outcomes + balance summary."""
+    """`mcp__engine__run`: validate inputs against the signed request domains, execute one
+    sandboxed run, persist `engine_build/try/<n>.json`, and return capped Outcomes + balance summary."""
     th = BADM.load_thresholds()
-    max_calls = int(th["try_max_calls"])
     max_bytes = int(th["try_summary_max_bytes"])
     _spec_raw, build_decl = _load_spec_and_build(run_dir)
     req = build_decl["request"]
@@ -282,7 +274,7 @@ def engine_run_one(
     if errs:
         raise ValueError("mcp__engine__run invalid inputs: " + "; ".join(errs[:6]))
 
-    n, _ = _consume_call(run_dir, "run", max_calls)
+    n = _next_call_n(run_dir, "run")
     rec_rel = f"engine_build/try/{n}.json"
     bid = str(build_decl["id"])
     wdir = work_dir or os.path.join(run_dir, "models", "ext", f"engine_{bid}")
@@ -382,16 +374,6 @@ def _self_test() -> int:
         ok(_json_len(big_try) <= 8192 and big_try.get("truncated") is True
            and _json_len(big_run) <= 8192 and big_run.get("full_record") == "engine_build/try/2.json",
            f"TRY1b _cap_summary strictly enforces <= 8192 bytes ({_json_len(big_try)}, {_json_len(big_run)})")
-
-        # Cap enforcement: simulate 30 calls already used -> 31st refused
-        led["count"] = 30
-        SIO.write_nofollow(d, LEDGER_REL, json.dumps(led).encode("utf-8"), atomic=True)
-        try:
-            engine_try(d, checks=["A1"], unsandboxed_ok=dev_un)
-            capped = False
-        except TryCapExceeded:
-            capped = True
-        ok(capped, "TRY2 shared 30-call ledger refuses the 31st call")
 
     if fails:
         print(f"FAILED: {len(fails)} case(s)")

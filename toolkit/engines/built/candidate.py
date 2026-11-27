@@ -46,6 +46,7 @@ class CandidateEngine:
         results_path: str | None = None,
         pack_path: str | None = None,
         coverage_path: str | None = None,
+        use_session: bool = False,
     ):
         self._files = {str(k): bytes(v) for k, v in verified_files.items()}
         self._build = dict(build_decl)
@@ -62,6 +63,7 @@ class CandidateEngine:
         self._hash_seed = str(hash_seed)
         self._id_salt = str(id_salt)
         self._force_sandbox: str | None = "auto"
+        self._use_session = bool(use_session)
         self.used_unsandboxed = False
         self.fitted_path = fitted_path
         self.results_path = results_path
@@ -95,7 +97,7 @@ class CandidateEngine:
         return self._req_engine.validate_unit_values(units, engine_attributes)
 
     def _call(self, action: str, payload: Mapping | None = None, *, hash_seed: str | None = None,
-              id_salt: str | None = None) -> dict:
+              id_salt: str | None = None, use_session: bool | None = None) -> dict:
         res = BWORK.run_in_worker(
             self._files,
             kind=self.kind,
@@ -107,6 +109,7 @@ class CandidateEngine:
             hash_seed=self._hash_seed if hash_seed is None else str(hash_seed),
             id_salt=self._id_salt if id_salt is None else str(id_salt),
             _force_sandbox=self._force_sandbox,
+            use_session=self._use_session if use_session is None else bool(use_session),
         )
         if res.get("unsandboxed"):
             self.used_unsandboxed = True
@@ -189,7 +192,7 @@ class CandidateEngine:
         units = list(unit_or_units)
         if len(units) != n:
             raise ValueError(f"run_batch length mismatch: params={n}, units={len(units)}, packages={len(pkgs)}")
-        chunk_sz = 256 if self.kind == "closed_form" else 32
+        chunk_sz = 2048 if self.kind == "closed_form" else 32
         out: list[Outcomes] = []
         for a in range(0, n, chunk_sz):
             cases = [

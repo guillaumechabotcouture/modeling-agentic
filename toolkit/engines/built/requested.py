@@ -466,52 +466,32 @@ def validate_build(build: Mapping) -> list[str]:
             elif not isinstance(role, str) or role not in PARAM_ROLES:
                 bad.append(f"engine.build.request.parameter_roles.{pn}: role {role!r} not in {list(PARAM_ROLES)}")
 
-    # Expected effects
+    # Optional expected_effects (not required: A6 verifies dead-parameter reads & output liveness directly)
     ee_raw = req.get("expected_effects")
-    valid_effect_outs = (set(per_cap) | set(cost_drivers)
-                         | {m for ms in windows_map.values() for m in ms}
-                         | {f"windows.{w}.{m}" for w, ms in windows_map.items() for m in ms})
-    if not isinstance(ee_raw, Mapping):
-        bad.append("engine.build.request.expected_effects: must be a mapping")
-    else:
-        for iname in sorted(all_inputs):
-            if iname not in ee_raw and iname not in inert_raw:
-                bad.append(f"engine.build.request.expected_effects: missing input {iname!r} (declare effects or inert)")
-        for iname, outs in ee_raw.items():
-            if not _is_str(iname) or iname not in all_inputs:
-                bad.append(f"engine.build.request.expected_effects.{iname}: unknown input")
-            if not isinstance(outs, Mapping) or not outs:
-                bad.append(f"engine.build.request.expected_effects.{iname}: non-empty {{output: sign}} mapping required")
-                continue
-            for oname, sign in outs.items():
-                if not _is_str(oname) or oname not in valid_effect_outs:
-                    bad.append(f"engine.build.request.expected_effects.{iname}.{oname}: undeclared output")
-                if not isinstance(sign, str) or sign not in EFFECT_SIGNS:
-                    bad.append(f"engine.build.request.expected_effects.{iname}.{oname}: sign {sign!r} not in {list(EFFECT_SIGNS)}")
-        covered_outs: set[str] = set()
-        for iname, outs in ee_raw.items():
-            if iname not in inert_raw and isinstance(outs, Mapping):
-                covered_outs.update(str(k) for k in outs if _is_str(k))
-        for pc in per_cap:
-            if not (pc in covered_outs or f"per_capita_all.{pc}" in covered_outs
-                    or any(o.startswith(f"per_capita.{pc}.") for o in covered_outs)):
-                bad.append(
-                    f"engine.build.request.expected_effects: declared per_capita output {pc!r} is not named "
-                    "for any non-inert input (A6 requires every declared output to be moved by at least one input)"
-                )
-        for drv in cost_drivers:
-            if not (drv in covered_outs or f"cost.{drv}" in covered_outs):
-                bad.append(
-                    f"engine.build.request.expected_effects: declared cost_driver {drv!r} is not named "
-                    "for any non-inert input (A6 requires every declared output to be moved by at least one input)"
-                )
-        for wname, metrics in windows_map.items():
-            for m in sorted(metrics):
-                if not (m in covered_outs or f"windows.{wname}.{m}" in covered_outs):
-                    bad.append(
-                        f"engine.build.request.expected_effects: declared window output 'windows.{wname}.{m}' is not "
-                        "named for any non-inert input (A6 requires every declared output to be moved by at least one input)"
-                    )
+    if ee_raw is not None:
+        valid_effect_outs = (
+            set(per_cap)
+            | {f"per_capita_all.{pc}" for pc in per_cap}
+            | {f"per_capita.{pc}.{g}" for pc in per_cap for g in age_group_set}
+            | set(cost_drivers)
+            | {f"cost.{drv}" for drv in cost_drivers}
+            | {m for ms in windows_map.values() for m in ms}
+            | {f"windows.{w}.{m}" for w, ms in windows_map.items() for m in ms}
+        )
+        if not isinstance(ee_raw, Mapping):
+            bad.append("engine.build.request.expected_effects: must be a mapping")
+        else:
+            for iname, outs in ee_raw.items():
+                if not _is_str(iname) or iname not in all_inputs:
+                    bad.append(f"engine.build.request.expected_effects.{iname}: unknown input")
+                if not isinstance(outs, Mapping) or not outs:
+                    bad.append(f"engine.build.request.expected_effects.{iname}: non-empty {{output: sign}} mapping required")
+                    continue
+                for oname, sign in outs.items():
+                    if not _is_str(oname) or oname not in valid_effect_outs:
+                        bad.append(f"engine.build.request.expected_effects.{iname}.{oname}: undeclared output")
+                    if not isinstance(sign, str) or sign not in EFFECT_SIGNS:
+                        bad.append(f"engine.build.request.expected_effects.{iname}.{oname}: sign {sign!r} not in {list(EFFECT_SIGNS)}")
 
     # Compartments (required for starsim_module)
     cmps = req.get("compartments")
@@ -685,15 +665,14 @@ def validate_build(build: Mapping) -> list[str]:
                           and "unit" not in attr_specs and "params" not in attr_specs)
                 if nested:
                     tu = tset.get("unit")
-                    if tu is not None:
-                        if not isinstance(tu, Mapping):
-                            bad.append(f"engine.build.request.trials.{tid}.setting.unit: must be a mapping")
-                        else:
-                            for k, v in tu.items():
-                                if not _is_str(k) or k not in attr_specs:
-                                    bad.append(f"engine.build.request.trials.{tid}.setting.unit.{k}: unknown unit attribute")
-                                else:
-                                    bad += _check_attr_val(v, attr_specs[k], f"engine.build.request.trials.{tid}.setting.unit.{k}")
+                    if "unit" not in tset or not isinstance(tu, Mapping):
+                        bad.append(f"engine.build.request.trials.{tid}.setting.unit: mapping required when setting uses params/unit")
+                    else:
+                        for k, v in tu.items():
+                            if not _is_str(k) or k not in attr_specs:
+                                bad.append(f"engine.build.request.trials.{tid}.setting.unit.{k}: unknown unit attribute")
+                            else:
+                                bad += _check_attr_val(v, attr_specs[k], f"engine.build.request.trials.{tid}.setting.unit.{k}")
                     tp = tset.get("params")
                     if tp is not None:
                         if not isinstance(tp, Mapping):
@@ -747,10 +726,14 @@ def validate_build(build: Mapping) -> list[str]:
                             if not (_is_num(vitem.get("weight")) and float(vitem["weight"]) > 0):
                                 bad.append(f"engine.build.request.trials.{tid}.estimand_mapping.values[{vi}].weight: positive number required")
                 if et in ("ratio", "odds_ratio"):
-                    if "value" not in em and "values" not in em:
+                    if "value" in em and "values" in em:
+                        bad.append(f"engine.build.request.trials.{tid}.estimand_mapping: cannot declare both value and values")
+                    elif "value" not in em and "values" not in em:
                         bad.append(f"engine.build.request.trials.{tid}.estimand_mapping: {et} requires value or values")
                     for ak in ("num", "den"):
-                        if ak in em:
+                        if ak not in em:
+                            bad.append(f"engine.build.request.trials.{tid}.estimand_mapping.{ak}: required for {et}")
+                        else:
                             _check_arm_ref(em[ak], f"engine.build.request.trials.{tid}.estimand_mapping.{ak}")
                 elif et == "interaction_or":
                     if "value" not in em:
@@ -762,9 +745,27 @@ def validate_build(build: Mapping) -> list[str]:
                         bad.append(f"engine.build.request.trials.{tid}.estimand_mapping: cost_per_outcome requires value")
                     for ak in ("num", "den"):
                         _check_arm_ref(em.get(ak), f"engine.build.request.trials.{tid}.estimand_mapping.{ak}")
+                    has_costs = False
+                    for ckey in ("costs", "costs_num"):
+                        if ckey in em and em[ckey] is not None:
+                            if not isinstance(em[ckey], Mapping) or not em[ckey]:
+                                bad.append(f"engine.build.request.trials.{tid}.estimand_mapping.{ckey}: non-empty mapping required")
+                            else:
+                                has_costs = True
+                                for drv, uc in em[ckey].items():
+                                    if not _is_str(drv) or drv not in driver_set:
+                                        bad.append(f"engine.build.request.trials.{tid}.estimand_mapping.{ckey}.{drv}: undeclared cost_driver")
+                                    if not (_is_num(uc) and float(uc) >= 0.0):
+                                        bad.append(f"engine.build.request.trials.{tid}.estimand_mapping.{ckey}.{drv}: non-negative unit cost required")
+                    if not has_costs:
+                        bad.append(f"engine.build.request.trials.{tid}.estimand_mapping: cost_per_outcome requires costs or costs_num")
                 elif et == "curve_rules":
                     _check_vpath(em.get("x"), f"engine.build.request.trials.{tid}.estimand_mapping.x")
                     _check_vpath(em.get("y"), f"engine.build.request.trials.{tid}.estimand_mapping.y")
+                    if not (isinstance(em.get("arms"), list) and em["arms"]):
+                        bad.append(f"engine.build.request.trials.{tid}.estimand_mapping.arms: non-empty list required")
+                    else:
+                        _check_arm_ref(em["arms"], f"engine.build.request.trials.{tid}.estimand_mapping.arms")
                     if not (isinstance(em.get("rules"), list) and em["rules"]):
                         bad.append(f"engine.build.request.trials.{tid}.estimand_mapping.rules: non-empty list required")
             pub = tr.get("published")
@@ -789,7 +790,7 @@ def validate_build(build: Mapping) -> list[str]:
                 if not isinstance(cmap, Mapping):
                     bad.append(f"engine.build.request.configs.{cname}: must be a mapping")
                 else:
-                    res_hits = sorted(k for k in RESERVED_CONFIG_KEYS if k in cmap)
+                    res_hits = sorted(str(k) for k in cmap if k in RESERVED_CONFIG_KEYS or str(k).startswith("_"))
                     if res_hits:
                         bad.append(f"engine.build.request.configs.{cname}: reserved harness keywords refused: {res_hits}")
     return bad
@@ -940,6 +941,12 @@ class RequestedEngine:
                         val = cell
                     _check_one(val, f"unit {uid}")
                 elif "columns" in m:
+                    if at == "vector" and isinstance(m["columns"], Mapping):
+                        bad.append(
+                            f"decision_units.engine_attributes.{aname} (unit {uid}): vector attribute requires a "
+                            "list of column names for columns, not a mapping"
+                        )
+                        continue
                     cols = list(m["columns"].values()) if isinstance(m["columns"], Mapping) else list(m["columns"] or [])
                     _check_one([u.get(c) for c in cols], f"unit {uid}")
                 if len(bad) >= 20:
@@ -966,7 +973,7 @@ class RequestedEngine:
             "A2_determinism": 9,
             "A4_reductions": len(reds) * 3,
             "A5_mass_balance": 6 if self.kind == "starsim_module" else 0,
-            "A6_A7_wiring": n_inputs * 12,
+            "A6_liveness": len(r.get("parameters") or []) + len(r.get("components") or {}),
             "A8_trials": len(trials),
             "A11_reference": 1,
         }
@@ -1150,14 +1157,33 @@ def _self_test() -> int:
     ok(bool(validate_build(b_empty_di)) and validate_build(b_none_di) == []
        and bool(validate_build(b_unhash)) and "validation errors" in "\n".join(sheet_lines(b_unhash)),
        "BE24c7 empty decision_inputs refused without none_reason; unhashable name returns error instead of TypeError")
-    b_uncov_drv = copy.deepcopy(b0)
-    b_uncov_drv["request"]["expected_effects"]["comp_a"] = {"cases": "-"}
-    b_uncov_win = copy.deepcopy(b0)
-    b_uncov_win["request"]["expected_effects"]["rate_in"] = {"cases": "+"}
-    e_ud, e_uw = validate_build(b_uncov_drv), validate_build(b_uncov_win)
-    ok(any("cost_driver 'units_delivered'" in x for x in e_ud)
-       and any("windows.w0.prev" in x for x in e_uw),
-       f"BE24c8 declared outputs missing from expected_effects refused before sign-off (drv={e_ud[:1]}, win={e_uw[:1]})")
+    b_no_ee = copy.deepcopy(b0)
+    b_no_ee["request"].pop("expected_effects", None)
+    b_no_ee["request"].pop("inert", None)
+    ok(validate_build(b_no_ee) == [],
+       f"BE24c8 expected_effects and inert are optional ({validate_build(b_no_ee)})")
+    # BE24c9: qualified expected_effects paths (when supplied), trial shape checks, leading-_ configs, vector dict columns
+    b_qual = copy.deepcopy(b0)
+    b_qual["request"]["expected_effects"]["comp_a"] = {"per_capita_all.cases": "-", "cost.units_delivered": "+"}
+    b_qual["request"]["expected_effects"]["sev_mult"] = {"per_capita.severe.all": "+"}
+    b_bad_t = copy.deepcopy(b0)
+    b_bad_t["request"]["trials"][0]["setting"] = {"params": {"n_strains": 4}}
+    b_bad_t["request"]["trials"][0]["estimand_mapping"] = {"value": "per_capita.cases.all", "values": [{"path": "per_capita.cases.all", "weight": 1.0}]}
+    b_bad_t["request"]["configs"] = {"default": {"_priv": 1}}
+    e_qual, e_bad_t = validate_build(b_qual), validate_build(b_bad_t)
+    b_vec = copy.deepcopy(b0)
+    b_vec["request"]["unit_attributes"]["v2"] = {"type": "vector", "length": 2}
+    b_vec["request"]["attribute_binding"]["v2"] = "required"
+    e_vec_dict = RequestedEngine(b_vec).validate_unit_values(
+        [{"id": "u1", "c0": 1.0, "c1": 2.0}],
+        {"v2": {"columns": {"a": "c0", "b": "c1"}}},
+    )
+    ok(e_qual == [] and any("setting.unit" in x for x in e_bad_t)
+       and any("both value and values" in x for x in e_bad_t)
+       and any(".num:" in x for x in e_bad_t) and any("_priv" in x for x in e_bad_t)
+       and any("not a mapping" in x for x in e_vec_dict),
+       f"BE24c9 qualified expected_effects paths accepted; bad trial setting/estimand/configs/vector-dict-columns refused "
+       f"(qual={e_qual}, bad_t={e_bad_t[:5]}, vec={e_vec_dict[:1]})")
 
     # BE24: build spec validates through RequestedEngine; missing component, bad trial, bad reduction, bad unit type refused
     with tempfile.TemporaryDirectory() as d:

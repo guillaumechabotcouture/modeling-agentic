@@ -828,7 +828,8 @@ def _built_engine_bundle_extras(run_dir: str) -> list[str]:
     (`run_state.json`, `decision_spec.yaml`, and spec sign-off record). Shipped in `make_bundle`
     when `engine_build/` production files exist; never hashed into `_run_files_digest` so RS1 holds."""
     out: list[str] = []
-    for name in ("run_state.json", "decision_spec.yaml", "decision_brief.signoff.json", "decision_spec.signoff.json"):
+    for name in ("run_state.json", "decision_spec.yaml", "engine_choice.json",
+                 "decision_brief.signoff.json", "decision_spec.signoff.json"):
         p = os.path.join(run_dir, name)
         if os.path.isfile(p) and not os.path.islink(p):
             out.append(p)

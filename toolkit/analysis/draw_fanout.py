@@ -123,9 +123,11 @@ def config(A) -> dict | None:
     if not (os.environ.get("MA_COMPUTE_SCHEDULER") or kw.get("draw_fanout") is True):
         return None
     off = None
+    from toolkit.engines.built import BUILT_ADAPTER_REF
     if getattr(A.eng, "batch_equals_run", False) is not True:
         off = "the engine does not declare batch_equals_run, so its results may depend on the worker process"
-    elif isinstance(A.spec.raw.get("engine"), dict) and "build" in A.spec.raw["engine"]:
+    elif (getattr(A.spec, "engine_build", None) is not None
+          or getattr(type(A.eng), "ENGINE_REF", None) == BUILT_ADAPTER_REF):
         off = "agent-built engines execute locally inside the run's verified bubblewrap sandbox"
     else:
         out = [f for f in _engine_files(A) if not _shipped(f, kw["run_dir"])]

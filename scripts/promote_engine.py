@@ -237,8 +237,15 @@ def _self_test_case_from_request(build_decl: Mapping) -> dict:
         for aname, aspec in (req.get("unit_attributes") or {}).items():
             if not isinstance(aspec, Mapping):
                 continue
+            at = aspec.get("type")
             rng = aspec.get("range") if "range" in aspec else aspec.get("test_range")
-            if isinstance(rng, (list, tuple)) and len(rng) == 2:
+            if at == "vector":
+                ln = int(aspec.get("length", 1))
+                mid = 0.5 * (float(rng[0]) + float(rng[1])) if isinstance(rng, (list, tuple)) and len(rng) == 2 else 1000.0
+                unit_attrs[str(aname)] = [mid] * ln
+            elif at == "integer" and isinstance(rng, (list, tuple)) and len(rng) == 2:
+                unit_attrs[str(aname)] = int(round(0.5 * (float(rng[0]) + float(rng[1]))))
+            elif isinstance(rng, (list, tuple)) and len(rng) == 2:
                 unit_attrs[str(aname)] = 0.5 * (float(rng[0]) + float(rng[1]))
             elif aspec.get("values"):
                 unit_attrs[str(aname)] = aspec["values"][0]

@@ -311,6 +311,7 @@ class BuiltEngine:
             payload=payload,
             unsandboxed_ok=self._unsandboxed_ok,
             _force_sandbox=self._force_sandbox,
+            use_session=True,
         )
         if res.get("unsandboxed"):
             self.used_unsandboxed = True
@@ -359,13 +360,29 @@ class BuiltEngine:
         pkgs = [packages] * n if isinstance(packages, Package) else list(packages)
         if len(units) != n or len(pkgs) != n:
             raise ValueError(f"run_batch length mismatch: params={n}, units={len(units)}, packages={len(pkgs)}")
-        chunk_sz = 256 if self.kind == "closed_form" else 32
+        chunk_sz = 2048 if self.kind == "closed_form" else 32
         out: list[Outcomes] = []
         for a in range(0, n, chunk_sz):
             items = [
                 self._item_payload(p, u, pk, horizon, seed)
                 for p, u, pk in zip(param_sets[a:a + chunk_sz], units[a:a + chunk_sz], pkgs[a:a + chunk_sz])
             ]
+            res_list = self._call_worker("run_many", payload={"items": items})["result"]
+            out.extend(
+                Outcomes(per_capita=r["per_capita"], windows=r["windows"],
+                         cost_drivers=r["cost_drivers"], meta=r["meta"])
+                for r in res_list
+            )
+        return out
+
+    def run_many(self, cases: list[tuple[dict, UnitSpec, Package, Horizon, int]]) -> list[Outcomes]:
+        """Run heterogeneous `(params, unit, package, horizon, seed)` tuples in chunked sandboxed worker calls."""
+        if not cases:
+            return []
+        chunk_sz = 2048 if self.kind == "closed_form" else 32
+        out: list[Outcomes] = []
+        for a in range(0, len(cases), chunk_sz):
+            items = [self._item_payload(prm, u, pkg, hor, s) for prm, u, pkg, hor, s in cases[a:a + chunk_sz]]
             res_list = self._call_worker("run_many", payload={"items": items})["result"]
             out.extend(
                 Outcomes(per_capita=r["per_capita"], windows=r["windows"],
