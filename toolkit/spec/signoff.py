@@ -1112,7 +1112,7 @@ def _self_test() -> int:
             write_sheet(d)                  # the stage machine signer, too, binds what the sheet showed
             rec = SM.sign(d, "owner", "n")
             ok((rec.get("evidence") or {}).get("dossier") == "evidence_dossier.yaml"
-               and (rec.get("evidence_sha256") or {}).get("evidence_dossier.yaml"),
+               and (rec.get("evidence_sha256") or rec.get("sha256") or {}).get("evidence_dossier.yaml"),
                f"ED11b the stage machine's sign-off binds the dossier: {rec}")
         with tempfile.TemporaryDirectory() as d:
             p = ED.toy_dossier_spec(d, dossier=False)

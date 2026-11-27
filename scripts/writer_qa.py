@@ -795,8 +795,8 @@ def _run_self_test() -> int:
            "T-accept-stale: an ACCEPT older than the report grants no exemption")
         try:
             sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-            from agents import enforcement as _EN
-            why = _EN.protected_reason(os.path.join(d, "run_state.json"), d, None)
+            from agents import v2_sdk_tasks as _VT
+            why = _VT._allowed(os.path.join(d, "run_state.json"), d, ())
         except Exception as e:  # noqa: BLE001
             why = None
         ok(bool(why), "T-accept-protect: agents may not write run_state.json")

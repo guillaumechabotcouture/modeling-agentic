@@ -1,21 +1,9 @@
 #!/usr/bin/env python3
-"""v2 C: the stage machine's interface to the engines and the analysis engine (workstream B).
+"""v2 C: the stage machine's interface to the engines and the analysis engine (`toolkit/analysis/api.py`).
 
-    python3 agents/analysis_backend.py configure <decision_spec.yaml> <out_dir>   # pipeline step
-    python3 agents/analysis_backend.py analyze   <decision_spec.yaml> <out_dir>   # pipeline step
     python3 agents/analysis_backend.py --self-test
 
-This is the only file that changes when workstream B (`v2b-analysis`) lands. Until then
-it drives `spike/analysis` (origin/v2), which runs on any engine behind
-`toolkit/engines/contract.py`, the toy engine included. The machine calls:
-
-  eligible_engines(spec)        harness filter: each registered EngineCard against the spec's needs
-  cross_check(spec, refs, ...)  optional: the analysis on a subset with each eligible engine, plans compared
-  validate(spec, base)          fail closed, before any simulation
-  pipeline_steps(spec_path, run_dir)  the S1 steps (models/pipeline.yaml) the harness runs: configure, analyze
-  headline(run_dir)             the numbers each impact-ledger row records before and after a fix
-  gate_findings(run_dir)        contract checks on the analysis output, in the common finding shape
-
+The machine calls `backend("toolkit")` (`_ToolkitApi`) and `eligible_engines(spec)`.
 Nothing here names a disease; the engines and the spec carry the specifics. This file
 does not import the `agents` package (that pulls in the SDK): pipeline steps run it as a
 script.
@@ -106,9 +94,6 @@ ENGINES = [
 ]
 # Checks on a configuration the signed spec gives (engine: {ref, config}), made before the engine is built.
 SIGNED_CONFIG_CHECKS = {EMPIRICAL: _empirical_limit}
-# Contract thresholds on the analysis output (B owns these once it lands).
-EMULATOR_R2_MIN = 0.8
-EMULATOR_MAE_MAX = 0.05
 
 
 # ------------------------------------------------------------------ engine choice
@@ -329,40 +314,6 @@ def eligible_engines(spec: dict, engines=None, departures: str = "signed") -> li
     return rows
 
 
-def cross_check(spec: dict, refs: list[str], work_dir: str, n_units: int = 8, *, run_dir: str) -> dict:
-    """Run the analysis on the first `n_units` units with each engine and compare the plans. `work_dir` lies in the
-    trusted `run_dir` (required), and every file this writes there is anchored at `run_dir` with no link followed."""
-    import csv
-    import io
-    from toolkit.analysis.artifacts import _safe_io
-    plans = {}
-    for ref in refs:
-        s = copy.deepcopy(spec)
-        s["engine"] = ref
-        d = os.path.join(work_dir, ref.replace(":", "_").replace(".", "_"))
-        src = s["decision_units"]["csv"]
-        rows = list(csv.DictReader(open(src)))[:n_units]
-        sub = os.path.join(d, "units.csv")
-        buf = io.StringIO(newline="")
-        w = csv.DictWriter(buf, fieldnames=list(rows[0]))
-        w.writeheader()
-        w.writerows(rows)
-        _safe_io().publish(sub, buf.getvalue(), run_dir)     # creates d below run_dir with no link followed
-        s["decision_units"]["csv"] = sub
-        if isinstance(s.get("options", {}).get("units"), dict):
-            s["options"]["units"]["csv"] = sub
-        s.setdefault("uncertainty", {})["draws"] = min(int(s["uncertainty"].get("draws", 4)), 4)
-        _configure(s, d, run_dir)
-        A = _analyze(s, d)
-        plans[ref] = {u: p for u, p in _plan_of(d).items()}
-        plans[ref + "#headline"] = A["point"]["averted"]
-    a, b = refs[0], refs[1]
-    same = [u for u in plans[a] if plans[b].get(u) == plans[a][u]]
-    return {"engines": refs, "units": len(plans[a]), "same_package": len(same),
-            "agreement": len(same) / max(1, len(plans[a])),
-            "headlines": {r: plans[r + "#headline"] for r in refs}}
-
-
 # ------------------------------------------------------------------ spec and steps
 def _abs_spec(spec: dict, base: str) -> dict:
     s = copy.deepcopy(spec)
@@ -497,20 +448,6 @@ def engine_choice_ref(run_dir: str) -> str | None:
     return e if isinstance(e, str) else None
 
 
-def pre_sign_problems(run_dir: str, derived: bool | None = None) -> list[str]:
-    """Before the engine is chosen: every section the spike needs, and a valid settings file. (`derived`: the
-    derived-input checks are workstream B's schema's; the spike's spec has none.)"""
-    import yaml
-    from spike.analysis.spec import REQUIRED
-    try:
-        spec = yaml.safe_load(open(os.path.join(run_dir, SPEC_FILE))) or {}
-    except Exception as e:  # noqa: BLE001
-        return [f"{SPEC_FILE} unreadable: {type(e).__name__}"]
-    from toolkit.spec import schema
-    return [f"missing section {k}" for k in REQUIRED if k != "engine" and k not in spec] + settings_problems(run_dir, spec) \
-        + schema.engine_ref_problems(spec)     # the declaration as signed: candidates and a named engine (#367)
-
-
 def choice_spec(run_dir: str) -> dict:
     """The spec the engine filter reads (merged with its settings). A spec signed `engine: auto` stays `auto` here
     after a choice, so a back-edge to the engine choice considers every engine, not only the one chosen before."""
@@ -520,149 +457,6 @@ def choice_spec(run_dir: str) -> dict:
     if named_engine({"engine": signed})[0] is None:
         spec["engine"] = "auto" if signed is None else signed
     return spec
-
-
-# Sign-off: the spike adapter has none of its own; the machine's whole-file hash is used (sign = None).
-sign = None
-
-
-def validate(spec, base: str | None = None) -> list[str]:
-    """`spec` is the spec file's path (merged with its settings and the engine choice) or a mapping."""
-    from spike.analysis import spec as S
-    try:
-        if isinstance(spec, str):
-            base = os.path.dirname(os.path.abspath(spec))
-            spec = merged_spec(base)
-        return S.validate(_abs_spec(spec, base), base)
-    except Exception as e:  # noqa: BLE001 -- fail closed
-        return [f"spec validation failed: {type(e).__name__}: {e}"]
-
-
-def pipeline_steps(spec_path: str, run_dir: str) -> list[dict]:
-    """The S1 pipeline the harness writes for a v2 run. The spec and its data are inputs, so
-    an edit to either reruns exactly what depends on it."""
-    import yaml
-    py = sys.executable
-    me = os.path.abspath(__file__)
-    data = []
-    try:
-        spec = yaml.safe_load(open(os.path.join(run_dir, SPEC_FILE))) or {}
-        for p in {(spec.get("decision_units") or {}).get("csv"), ((spec.get("options") or {}).get("units") or {}).get("csv")}:
-            if isinstance(p, str) and not os.path.isabs(p):
-                data.append(p)
-    except OSError:
-        pass
-    data += [f for f in (SETTINGS_FILE, ENGINE_CHOICE) if os.path.exists(os.path.join(run_dir, f))]
-    return [
-        {"id": "configure", "run": f"{py} {me} configure {SPEC_FILE} {OUT_DIR}",
-         "inputs": [SPEC_FILE] + sorted(data),
-         "outputs": [f"{OUT_DIR}/design.json", f"{OUT_DIR}/jobs.jsonl", f"{OUT_DIR}/results.jsonl",
-                     f"{OUT_DIR}/batch_summary.json"],
-         "purpose": "engine batch over the emulator design"},
-        {"id": "analyze", "run": f"{py} {me} analyze {SPEC_FILE} {OUT_DIR}",
-         "inputs": [SPEC_FILE, f"{OUT_DIR}/design.json", f"{OUT_DIR}/results.jsonl"] + sorted(data),
-         "outputs": [ANALYSIS_JSON, ALLOCATION_CSV],
-         "purpose": "calibrate, emulate, optimise, uncertainty, leave-one-out, decision tests"},
-    ]
-
-
-def _configure(spec: dict, out: str, root: str) -> dict:
-    from spike.analysis import batch as B
-    from toolkit.analysis.artifacts import _safe_io
-    for f in ("results.jsonl", "results_prev.jsonl"):
-        _safe_io().remove_path(os.path.join(out, f), root)      # a changed spec invalidates every engine run
-    d = B.design(spec, out)
-    s = B.run(out, max(1, min(2, os.cpu_count() or 1)))   # at most 2 local workers
-    return {"design": d, "batch": s}
-
-
-def _analyze(spec: dict, out: str) -> dict:
-    from spike.analysis.run import Analysis
-    return Analysis(spec, out, log=lambda *a: None).run()
-
-
-def _plan_of(out: str) -> dict:
-    import csv
-    with open(os.path.join(out, "allocation.csv")) as f:
-        rows = list(csv.reader(f))
-    return {r[0]: r[2] for r in rows[1:]}
-
-
-# ------------------------------------------------------------------ facts for the machine
-def _analysis(run_dir: str) -> dict | None:
-    try:
-        with open(os.path.join(run_dir, ANALYSIS_JSON)) as f:
-            return json.load(f)
-    except (OSError, ValueError):
-        return None
-
-
-def headline(run_dir: str) -> dict:
-    A = _analysis(run_dir)
-    if not A:
-        return {}
-    out = {f"averted.{k}": v for k, v in (A.get("point") or {}).get("averted", {}).items()}
-    out["cost_allocated"] = (A.get("point") or {}).get("cost_allocated")
-    for k, q in ((A.get("uncertainty") or {}).get("fixed_plan") or {}).items():
-        out[f"fixed_plan.{k}.lo95"], out[f"fixed_plan.{k}.hi95"] = q.get("lo95"), q.get("hi95")
-    return {k: (round(v, 6) if isinstance(v, float) else v) for k, v in out.items()}
-
-
-def _f(kind, sev, stage, claim, key="", declarable=True):
-    return {"kind": kind, "severity": sev, "stage": stage, "target_stage": stage, "claim": claim, "key": key,
-            "scope_declarable": declarable}
-
-
-def gate_findings(run_dir: str) -> list[dict]:
-    """Contract checks on the harness's own analysis output. Fail closed: no output, or
-    output without a required section, is a non-declarable HIGH."""
-    A = _analysis(run_dir)
-    if A is None:
-        return [_f("analysis_missing", "HIGH", "ANALYZE", f"{ANALYSIS_JSON} is missing or unreadable: the "
-                   "pipeline's analyze step has not produced it.", "analysis", False)]
-    out = []
-    for sect in ("point", "uncertainty", "emulator_accuracy", "calibration", "loo"):
-        if not isinstance(A.get(sect), dict):
-            out.append(_f("analysis_section_missing", "HIGH", "ANALYZE", f"{ANALYSIS_JSON} has no `{sect}`.", sect, False))
-    if out:
-        return out
-    acc = A["emulator_accuracy"]
-    r2, mae = acc.get("reduction_r2_median"), acc.get("reduction_mae_median")
-    if not ((isinstance(r2, (int, float)) and r2 >= EMULATOR_R2_MIN)
-            or (isinstance(mae, (int, float)) and mae <= EMULATOR_MAE_MAX)):
-        out.append(_f("emulator_inaccurate", "HIGH", "CONFIGURE",
-                      f"Emulator held-out accuracy below the contract: R2 median {r2}, MAE median {mae} "
-                      f"(needs R2 >= {EMULATOR_R2_MIN} or MAE <= {EMULATOR_MAE_MAX}). Add design points.", "emulator"))
-    cal = A["calibration"]
-    if cal.get("clamped_units"):
-        out.append(_f("calibration_clamped", "MEDIUM", "CONFIGURE",
-                      f"{cal['clamped_units']} of {cal.get('units')} units could not be calibrated inside the "
-                      "calibration range (clamped).", "calibration"))
-    if (A["point"].get("solver") or {}).get("status") != "optimal":
-        out.append(_f("optimizer_not_optimal", "HIGH", "ANALYZE", "The allocation is not a proven optimum.",
-                      "solver", False))
-    for k, q in (A["uncertainty"].get("fixed_plan") or {}).items():
-        if not (isinstance(q, dict) and isinstance(q.get("lo95"), (int, float)) and q.get("hi95", 0) > q["lo95"]):
-            out.append(_f("ci_degenerate", "HIGH", "ANALYZE", f"The fixed-plan interval for {k} is degenerate: {q}.", k))
-    draws = A["uncertainty"].get("draws")
-    if isinstance(draws, int) and draws < 20:
-        out.append(_f("uncertainty_draws_low", "MEDIUM", "ANALYZE",
-                      f"Uncertainty from {draws} draws; intervals at the 2.5/97.5 percentiles need more.", "draws"))
-    v = A["loo"].get("verdict")
-    if v == "UNSTABLE":
-        out.append(_f("allocation_unstable", "HIGH", "ANALYZE", "Leave-one-group-out allocation is UNSTABLE.", "loo"))
-    elif v == "FRAGILE":
-        out.append(_f("allocation_fragile", "MEDIUM", "ANALYZE", "Leave-one-group-out allocation is FRAGILE.", "loo"))
-    elif v != "ROBUST":
-        out.append(_f("allocation_robustness_unknown", "HIGH", "ANALYZE", f"Unknown LOO verdict {v!r}.", "loo", False))
-    for dt in A.get("decision_tests") or []:
-        if dt.get("plan_changes"):
-            # Decision-bearing: the stage machine sends it through the owner rule (Phase 49 β)
-            # before it can be declared; without that rule it is not declarable (fail closed).
-            out.append(dict(_f("decision_test_changes_plan", "HIGH", "ANALYZE",
-                               f"Decision test {dt.get('id')} changes the plan: {dt.get('text', '')}",
-                               str(dt.get("id"))), decision_bearing=True))
-    return out
 
 
 # ------------------------------------------------------------------ workstream B (PR #89)
@@ -813,53 +607,19 @@ class _ToolkitApi:
 
 
 def backend(prefer: str = "auto"):
-    """The analysis backend the machine uses: workstream B's API when it is on this branch
-    (`toolkit/analysis/api.py`), else this module's spike adapter."""
-    if prefer in ("auto", "toolkit"):
-        try:
-            from toolkit.analysis import api
-            from toolkit.spec import schema
-        except ImportError:
-            if prefer == "toolkit":
-                raise
-        else:
-            # The machine chooses the engine after SIGN, so the signed spec says `engine: auto`
-            # and the engine comes from engine_choice.json (agreed with B; B's schema marks it
-            # ENGINE_AUTO). Without it every v2 run would fail at CONFIGURE: keep the spike adapter.
-            if getattr(api, "ENGINE_AUTO", False) or getattr(schema, "ENGINE_AUTO", False) or prefer == "toolkit":
-                return _ToolkitApi(api)
-    return sys.modules[__name__]
+    """The analysis backend the machine uses: workstream B's API (`toolkit/analysis/api.py`)."""
+    if prefer == "spike":
+        raise ValueError("spike backend has been retired; use 'toolkit' or 'auto'")
+    if prefer not in ("auto", "toolkit"):
+        raise ValueError(f"unknown analysis backend {prefer!r}")
+    from toolkit.analysis import api
+    return _ToolkitApi(api)
 
 
-# ------------------------------------------------------------------ CLI (pipeline steps)
 def main(argv=None) -> int:
     argv = sys.argv[1:] if argv is None else argv
     if argv[:1] == ["--self-test"]:
         return _self_test()
-    if len(argv) == 3 and argv[0] in ("configure", "analyze"):
-        # the trusted run dir is the one the pipeline runs this step in (scripts/pipeline.py sets it per step); never
-        # taken from the spec's path, the output dir or the cwd
-        run_dir = os.environ.get("MA_PIPELINE_RUN_DIR")
-        if not run_dir:
-            print("ERROR: MA_PIPELINE_RUN_DIR is not set: run this step through scripts/pipeline.py", file=sys.stderr)
-            return 2
-        spec = merged_spec(os.path.dirname(os.path.abspath(argv[1])))   # the spec's directory is the run directory
-        out = os.path.abspath(argv[2])
-        from toolkit.analysis.artifacts import _safe_io
-        sio = _safe_io()
-        fd, rel = sio.anchored(os.path.join(out, ".keep"), run_dir)     # out lies in the run dir; made no-follow
-        try:
-            parts = rel.split("/")[:-1]
-            if parts:
-                os.close(sio.dir_fd_nofollow(fd, parts, create=True))
-        finally:
-            os.close(fd)
-        if argv[0] == "configure":
-            print(json.dumps(_configure(spec, out, run_dir)))
-        else:
-            A = _analyze(spec, out)
-            print(json.dumps({"point": A["point"]["averted"], "wall_s": A.get("wall_s")}, default=float))
-        return 0
     print(__doc__)
     return 2
 
@@ -1529,70 +1289,6 @@ def _self_test() -> int:
     why = card_fits(card, {"components": {"net": ["pbo"]}, "outputs": ["deaths"], "unit_attributes": ["m0"],
                            "ranges": {"x": [-5, 1]}})
     ok(len(why) == 4, f"B2 missing component, outcome, attribute and an out-of-range value are each named: {why}")
-    with tempfile.TemporaryDirectory() as d:
-        p = os.path.join(d, "units.csv")
-        write_toy_units(p)
-        spec = toy_spec("units.csv")
-        import yaml
-        yaml.safe_dump(toy_settings(), open(os.path.join(d, SETTINGS_FILE), "w"))
-        rows = eligible_engines(_abs_spec(spec, d), ENGINES)
-        toy = next(r for r in rows if r["ref"].endswith("ToyEngine"))
-        mal = next(r for r in rows if "malaria" in r["ref"])
-        ok(toy["eligible"] and not mal["eligible"] and mal["why_not"],
-           f"B3 the filter picks the toy engine for a toy spec and says why the other is not eligible ({mal['why_not'][:2]})")
-        ok(validate(spec, d) == [], f"B4 the toy spec validates from run-relative paths {validate(spec, d)}")
-        bad = copy.deepcopy(spec)
-        bad["options"]["engine_map"]["a"] = {"a": 7}
-        ok(any("engine component value" in e for e in validate(bad, d)), "B5 a component the engine lacks fails validation")
-        ok(gate_findings(d)[0]["kind"] == "analysis_missing" and not gate_findings(d)[0]["scope_declarable"],
-           "B6 no analysis output is a non-declarable HIGH")
-        yaml.safe_dump(spec, open(os.path.join(d, SPEC_FILE), "w"))
-        ok(validate(os.path.join(d, SPEC_FILE)) == [] and merged_spec(d)["uncertainty"]["draws"] == 6,
-           "B4b the spec path validates merged with its settings file")
-        steps = pipeline_steps(os.path.join(d, SPEC_FILE), d)
-        ok([s["id"] for s in steps] == ["configure", "analyze"] and "units.csv" in steps[0]["inputs"]
-           and SETTINGS_FILE in steps[1]["inputs"],
-           "B7 the pipeline has configure and analyze, with the spec and its data as inputs")
-        sys.path.insert(0, os.path.join(REPO, "scripts"))
-        import pipeline as P
-        yaml.safe_dump({"steps": steps}, open(os.path.join(d, "models_pipeline.yaml"), "w"))
-        os.makedirs(os.path.join(d, "models"), exist_ok=True)
-        os.replace(os.path.join(d, "models_pipeline.yaml"), os.path.join(d, "models", "pipeline.yaml"))
-        rep = P.run(d)
-        ok(rep["ok"] and [s["id"] for s in rep["steps"]] == ["configure", "analyze"], f"B8 the S1 runner runs both steps {rep.get('errors')}")
-        h = headline(d)
-        ok(h.get("averted.dalys", 0) > 0 and h["fixed_plan.dalys.hi95"] >= h["fixed_plan.dalys.lo95"],
-           f"B9 the headline is read from the harness output {h}")
-        kinds = {f["kind"] for f in gate_findings(d)}
-        ok("uncertainty_draws_low" in kinds and "analysis_missing" not in kinds, f"B10 contract checks on real output {kinds}")
-        rep2 = P.run(d)
-        ok(rep2["ok"] and rep2["steps"] == [], "B11 nothing reruns when nothing changed")
-        yaml.safe_dump(toy_settings(draws=24), open(os.path.join(d, SETTINGS_FILE), "w"))
-        rep3 = P.run(d)
-        ok([s["id"] for s in rep3["steps"]] == ["configure", "analyze"]
-           and "uncertainty_draws_low" not in {f["kind"] for f in gate_findings(d)},
-           "B12 a settings edit reruns its dependants and the finding clears")
-        yaml.safe_dump({"uncertainty": {"draws": 9}, "constraints": {"envelope_usd": 1}},
-                       open(os.path.join(d, SETTINGS_FILE), "w"))
-        probs = settings_problems(d)
-        ok(any("constraints.envelope_usd is not a computational setting" in x for x in probs)
-           and any("validation failed" in x for x in validate(os.path.join(d, SPEC_FILE))),
-           f"B15 a decision leaf in the settings file is refused and validation fails closed {probs}")
-        yaml.safe_dump({"calibration": {"attribute": "y"}}, open(os.path.join(d, SETTINGS_FILE), "w"))
-        ok(settings_problems(d), "B16 a settings leaf the signed spec also sets is refused")
-        os.remove(os.path.join(d, SETTINGS_FILE))
-        os.symlink(os.path.join(d, SPEC_FILE), os.path.join(d, SETTINGS_FILE))
-        ok(any("symlink" in x for x in settings_problems(d)), "B17 a symlinked settings file is refused")
-        os.remove(os.path.join(d, SETTINGS_FILE))
-        yaml.safe_dump(toy_settings(draws=24), open(os.path.join(d, SETTINGS_FILE), "w"))
-        A = json.load(open(os.path.join(d, ANALYSIS_JSON)))
-        A["decision_tests"] = [{"id": "DT1", "plan_changes": True, "text": "t"}]
-        json.dump(A, open(os.path.join(d, ANALYSIS_JSON), "w"))
-        dtf = [f for f in gate_findings(d) if f["kind"] == "decision_test_changes_plan"]
-        ok(dtf and dtf[0].get("decision_bearing") and dtf[0]["severity"] == "HIGH",
-           "B18 a measured decision test that changes the plan is a decision-bearing HIGH")
-        cc = cross_check(merged_spec(d), ["toolkit.engines.contract:ToyEngine"] * 2, os.path.join(d, "xc"), 8, run_dir=d)
-        ok(cc["agreement"] == 1.0 and cc["units"] == 8, f"B13 the cross-engine check compares plans (same engine twice agrees) {cc['agreement']}")
     from types import SimpleNamespace as NS
     fake = NS(validate=lambda s, b=None: [], headline=lambda d: {}, gate_findings=lambda d: [],
               pipeline_steps=lambda sp, d: [{"id": "analyze", "cmd": "python3 x.py", "inputs": [], "outputs": [],
@@ -1617,26 +1313,6 @@ def _self_test() -> int:
     fake.validate = boom
     v = _ToolkitApi(fake).validate("x/decision_spec.yaml")
     ok(len(v) == 1 and "not a computational setting" in v[0], f"B21 B's raising validate becomes a problem list {v}")
-    import types
-    saved = {k: sys.modules.get(k) for k in ("toolkit.analysis", "toolkit.analysis.api", "toolkit.spec", "toolkit.spec.schema")}
-    try:
-        for k in saved:
-            sys.modules[k] = types.ModuleType(k)
-        sys.modules["toolkit.analysis"].api = fake
-        sys.modules["toolkit.analysis.api"] = fake
-        sys.modules["toolkit.spec"].schema = sys.modules["toolkit.spec.schema"]
-        sys.modules["toolkit.spec.schema"].SETTINGS_PATHS = frozenset({("uncertainty", "draws")})
-        no_auto = backend()
-        fake.ENGINE_AUTO = True
-        with_auto = backend()
-    finally:
-        for k, mod in saved.items():
-            if mod is None:
-                sys.modules.pop(k, None)
-            else:
-                sys.modules[k] = mod
-    ok(no_auto is sys.modules[__name__] and isinstance(with_auto, _ToolkitApi),
-       "B22 B's API is used only once its schema takes `engine: auto` from engine_choice.json")
     # B25: the compartmental engine is registered with the configuration its signed spec gives
     cfg = {"groups": ["a", "b"], "structure": "age_groups_contact_matrix", "outcomes": ["hosp"],
            "components": {"da": {"kind": "doses", "group": "a", "block_size": 10, "max_blocks": 2}}}

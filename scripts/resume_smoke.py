@@ -145,11 +145,16 @@ def judge(name: str, before: list, after: list, summary: dict, *, expect_kept=No
         if sorted(r.get("i") for r in rows) != list(range(N)) or bad:
             problems.append(f"the final rows do not carry their own inputs' results ({len(rows)} rows; wrong: {bad})")
     if stage:
+        by = sig1.get("signed_by") or sig1.get("by") if isinstance(sig1, dict) else None
+        sha_map = sig1.get("sha256") if isinstance(sig1, dict) else None
+        bound = (sig1.get("spec_sha256")
+                 or (sha_map.get("decision_spec.yaml") if isinstance(sha_map, dict) else None)) \
+            if isinstance(sig1, dict) else None
         if not sig0 or not sig1 or sig0 != sig1:
             problems.append("the sign-off record is missing or changed across the resume")
-        elif sig1.get("by") != "lead":
-            problems.append(f"the sign-off is by {sig1.get('by')!r}, not the lead")
-        elif sig1.get("spec_sha256") != spec_sha:
+        elif by != "lead":
+            problems.append(f"the sign-off is by {by!r}, not the lead")
+        elif bound != spec_sha:
             problems.append("the sign-off record no longer binds the spec")
         if not reopened:
             problems.append("the resume did not reopen the run at ANALYZE (FINAL -> ANALYZE, resumed_from run_failed)")
@@ -206,21 +211,21 @@ def scenarios(work: str) -> list:
     import compute
     import stage_machine as SM
     from v2_tasks import StubTasks
-    spike = AB.backend("spike")
+    tk = AB.backend("toolkit")
     quiet = lambda *a: None  # noqa: E731
     drv = os.path.join(work, "resume_smoke_driver.py")
     open(drv, "w").write(DRIVER.format(scripts=os.path.join(ROOT, "scripts"), n=N, killed=KILLED))
 
     class Batch:
-        """The spike backend with the toy engine batch as a pipeline step before its analysis."""
+        """The toolkit backend with the toy engine batch as a pipeline step before its analysis."""
         def __init__(self, tmo):
             self.tmo = tmo
 
         def __getattr__(self, k):
-            return getattr(spike, k)
+            return getattr(tk, k)
 
         def pipeline_steps(self, spec_path, run_dir):
-            steps = [dict(s) for s in spike.pipeline_steps(spec_path, run_dir)]
+            steps = [dict(s) for s in tk.pipeline_steps(spec_path, run_dir)]
             for s in steps:
                 if s["id"] == "analyze":
                     s["inputs"] = s["inputs"] + ["analysis/toy_rows.json"]
@@ -229,16 +234,20 @@ def scenarios(work: str) -> list:
                      "outputs": ["analysis/toy_rows.json"], "timeout_s": self.tmo}] + steps
 
     def toy_run(name):
+        import yaml as _yaml
+        from toolkit.spec import schema as _schema
         d = os.path.join(work, name)
         os.makedirs(os.path.join(d, "models"))
-        AB.write_toy_units(os.path.join(d, "units.csv"), n=12)
-        spec = AB.toy_spec("units.csv")
-        spec.pop("engine")
-        spec["deliverable_file"] = {"path": "allocation_optimized.csv",
-                                    "columns": {"unit": "id", "package": "package", "dalys_averted": "dalys_averted"}}
+        spec_p = _schema.toy_spec(d, n=12)
+        with open(spec_p) as fh:
+            spec = _schema.direct_toy(_yaml.safe_load(fh))
+        os.unlink(spec_p)
+        spec["engine"] = "auto"
+        spec["uncertainty"].pop("draws", None)
+        spec["uncertainty"].pop("seed", None)
         SM.init_run(d, "toy question", 3, "lead", "v2", None, derived_inputs=False)
         open(os.path.join(d, "models", "toy_fn.py"), "w").write(TOY_FN)
-        return d, StubTasks({"spec": spec, "settings": AB.toy_settings(draws=24, points=16)})
+        return d, StubTasks({"spec": spec, "settings": {"uncertainty": {"draws": 24, "seed": 1}}})
 
     def sig(d):
         try:

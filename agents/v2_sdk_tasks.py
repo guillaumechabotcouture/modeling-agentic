@@ -1334,7 +1334,7 @@ class SdkTasks:
     run's remaining budget less the write-up reserve, at most the task cap). Spend is charged
     through agents/run_budget.py like the lead's sessions: a reported cost exactly (also one
     reported before an exception); after a crash the conversation's cost is read back
-    (crashed_session_cost); when it cannot be, the whole allowance. Never $0 for a call that ran.
+    (RECONCILE_PROMPT); when it cannot be, the whole allowance. Never $0 for a call that ran.
     Every charge is also written to budget_ledger.json."""
 
     def __init__(self, run_dir: str, allow_cloud: bool = False, task_cap_usd: float = 3.0, max_turns: int | None = None,
@@ -1800,18 +1800,9 @@ def _self_test() -> int:
                 raise RuntimeError("no read-back")
             yield init
             raise RuntimeError("crash before any cost")
-        import agents.run_budget as RB
-        orig = RB.crashed_session_cost
-
-        async def no_cost(options, sid, **k):
-            return None, "result"
-        RB.crashed_session_cost = no_cost
-        try:
-            t = SdkTasks(d, query_fn=failing_readback)
-            t.set_allowance(1.25)          # no read-back budget: none is made
-            r = t._session("pick_engine", "x", "y", ())
-        finally:
-            RB.crashed_session_cost = orig
+        t = SdkTasks(d, query_fn=failing_readback)
+        t.set_allowance(1.25)          # no read-back budget: none is made
+        r = t._session("pick_engine", "x", "y", ())
         ok(not r.ok and abs(r.usd - 1.25) < 1e-9, f"S3 a crash with no readable cost is charged the whole allowance ({r.usd})")
         t = SdkTasks(d, query_fn=stream(init, res))
         t.set_allowance(0.0)

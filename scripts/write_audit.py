@@ -275,7 +275,6 @@ _FIX = "self-test fixture code in a helper the skip rule does not name"
 REVIEWED: dict = {
     "agents/analysis_backend.py": {"open-write": (1, "write_toy_units (a fixture)")},
     "scripts/assemble_changes.py": {"open-write": (3, _REPO), "os-remove": (1, _REPO)},
-    "scripts/cloud_batch.py": {"open-write": (2, "the operator's local batch files")},
     "scripts/codex_review.py": {"open-write": (2, "a dev tool the operator runs on the repository, never in a run: "
                                                   "codex's log next to the review's output, and PR.diff in the "
                                                   "export (" + _TMP_REASON + ")")},
@@ -290,27 +289,17 @@ REVIEWED: dict = {
                               "os-rename": (1, "its own .partial child to the new child name it checked")},
     "scripts/eval_suite.py": {"open-write": (9, _EVAL), "os-symlink": (1, _EVAL), "os-remove": (1, _EVAL),
                               "shell-command": (1, _EVAL + " (--execute runs the cloud launch commands it printed)")},
-    "scripts/fixtures.py": {"shutil": (5, _EVAL), "open-write": (7, _EVAL), "os-remove": (1, _EVAL)},
     "scripts/gate_fuzz.py": {"shutil": (6, _EVAL), "open-write": (7, _EVAL), "os-remove": (2, _EVAL), "os-symlink": (1, _EVAL)},
-    "scripts/gate_replay.py": {"shutil": (3, _EVAL), "open-write": (1, _EVAL)},
-    "scripts/golden_traces.py": {"shutil": (6, _EVAL), "os-remove": (2, _EVAL), "tempfile-dir": (2, _EVAL),
-                                 "open-write": (1, _EVAL)},
     "scripts/harness_metrics.py": {"safeio-derived-root": (1, "--json: the operator's report file, named on the CLI")},
     "scripts/pipeline.py": {
         "shell-command": (1, "_run_cmd runs a step's declared `run` command (shell=True for a non-compute step): the "
                              "agent's own command, run in the run dir with the agent's reach; the harness writes "
                              "nothing through the shell, and the step's outputs are hashed after it exits"),
-        "shutil": (10, "the step's pyc cache and derivation work dirs (" + _TMP_REASON + "); the aside dir the harness "
-                       "made (mkdtemp) and a planted .pipeline_aside_* dir, removed with rmtree, which removes links, "
-                       "never their targets; the scratch copy (copytree with symlinks=True, a sibling temp dir the "
-                       "harness made, then rmtree)"),
-        "tempfile-dir": (2, "the aside dir (mkdtemp inside the run dir, a random name the harness owns) and the "
-                            "scratch copy (mkdtemp beside the run dir)"),
-        "os-remove": (3, "inside the scratch copy the harness made: links re-pointed into the copy, and its own "
-                         "manifest replaced"),
-        "os-symlink": (1, "inside the scratch copy: a link re-pointed into the copy, never at the real run dir"),
-        "open-write": (3, "the scratch copy's manifest (its own file after the link is removed); the derivation's "
-                          "column-stripped input and mount points in its temporary work dirs")},
+        "shutil": (6, "the step's pyc cache and derivation work dirs (" + _TMP_REASON + "); the aside dir the harness "
+                      "made (mkdtemp) and a planted .pipeline_aside_* dir, removed with rmtree, which removes links, "
+                      "never their targets"),
+        "tempfile-dir": (1, "the aside dir (mkdtemp inside the run dir, a random name the harness owns)"),
+        "open-write": (2, "the derivation's column-stripped input and mount points in its temporary work dirs")},
     "scripts/plant_defects.py": {"open-write": (3, _EVAL), "shutil": (4, _EVAL)},
     "scripts/regression_eval.py": {"open-write": (4, _EVAL), "shutil": (1, _EVAL), "os-remove": (1, _EVAL)},
     "scripts/results_store.py": {"safeio-derived-root": (1, "download() streams to the path its caller names (the "
@@ -353,10 +342,8 @@ _V1 = ("v1 pipeline (main.py without --v2, its hooks and gates): writes in its r
 # OPEN_ITEMS: attacker-reachable write sites not yet on lib.safe_io. Counted exactly, so none is added; each migration
 # lowers a count. These are known gaps, not exemptions.
 OPEN_ITEMS: dict = {
-    "agents/integrity.py": {"open-write": (1, _V1)},
     "agents/run_finish.py": {"open-write": (1, "store_run_results (shared with v2): metadata.json's stored/store_error "
                                               "fields, a plain open in the run dir")},
-    "scripts/ask.py": {"open-write": (1, _V1)},
     "scripts/benchmark_match.py": {"open-write": (1, _V1)},
     "scripts/coherence_audit.py": {"open-write": (1, _V1)},
     "scripts/compare_models.py": {"open-write": (1, _V1)},
@@ -364,12 +351,9 @@ OPEN_ITEMS: dict = {
     "scripts/effort_floors.py": {"open-write": (1, _V1)},
     "scripts/eligibility_probe.py": {"open-write": (1, _V1)},
     "scripts/identifiability.py": {"open-write": (1, _V1)},
-    "scripts/lessons.py": {"open-write": (3, _V1)},
-    "scripts/model_card.py": {"open-write": (3, _V1), "os-rename": (1, _V1)},
     "scripts/open_problems.py": {"open-write": (2, _V1), "os-rename": (2, _V1)},
     "scripts/presentation_pass.py": {"open-write": (2, _V1), "os-rename": (1, _V1)},
     "scripts/propagate_uncertainty.py": {"open-write": (1, _V1)},
-    "scripts/run_autopsy.py": {"open-write": (2, _V1)},
     "scripts/writer_qa.py": {"open-write": (1, _V1)},
 }
 
@@ -504,7 +488,7 @@ def _self_test_writers(ok) -> None:
 
 
 def _self_test_v2_open_items(ok) -> None:
-    """WA10-WA12: the v2 open items (pipeline aside, derived_rebuild sidecars, v2_tasks stubs), each against a planted
+    """WA10, WA12: the v2 open items (pipeline aside, v2_tasks stubs), each against a planted
     link, run for real."""
     import tempfile
     for p in (REPO, os.path.join(REPO, "scripts"), os.path.join(REPO, "agents")):
@@ -523,19 +507,6 @@ def _self_test_v2_open_items(ok) -> None:
         dst = os.path.join(d, "data", "x.csv")
         ok(not os.path.islink(dst) and os.path.exists(secret),
            "WA10 a planted aside entry that is a link is not moved into the run dir (pipeline._recover_aside)")
-    with tempfile.TemporaryDirectory() as d, tempfile.TemporaryDirectory() as out:
-        import derived_rebuild as DR
-        os.symlink(out, os.path.join(d, "figures"))
-        real = DR.inside_dir
-        DR.inside_dir = lambda *a, **k: True          # the check saw no link (a race)
-        try:
-            DR._write_sidecar(d, os.path.join(d, "figures", "f.png.provenance.json"), {"x": 1})
-        except (ValueError, OSError):
-            pass
-        finally:
-            DR.inside_dir = real
-        ok(os.listdir(out) == [], f"WA11 a derivation sidecar is not written through a linked figures/ "
-                                  f"({os.listdir(out)})")
     with tempfile.TemporaryDirectory() as d, tempfile.TemporaryDirectory() as out:
         from agents import v2_tasks as V
         vs = []
@@ -805,13 +776,13 @@ def k(p, run_dir):
 
 
 def _self_test_round8(ok) -> None:
-    """WA24-WA25: the focused check of #134 at 32a30f2: a caller passing its output dir as the trusted root
-    (analysis_backend.cross_check -> _configure), and an audit rule for roots derived from the path or the cwd."""
+    """WA24-WA25: the focused check of #134 at 32a30f2: safe_io.remove_path refuses to follow a symlinked
+    output dir, and an audit rule for roots derived from the path or the cwd."""
     import tempfile
     for p in (REPO, os.path.join(REPO, "scripts"), os.path.join(REPO, "agents")):
         if p not in sys.path:
             sys.path.insert(0, p)
-    from agents import analysis_backend as AB
+    from toolkit.analysis.artifacts import _safe_io
     with tempfile.TemporaryDirectory() as d, tempfile.TemporaryDirectory() as out:
         ref = "toolkit.engines.contract:ToyEngine"
         sub = ref.replace(":", "_").replace(".", "_")
@@ -819,20 +790,15 @@ def _self_test_round8(ok) -> None:
         for f in ("results.jsonl", "results_prev.jsonl"):
             open(os.path.join(out, "cross_check", sub, f), "w").write("external\n")
         os.symlink(out, os.path.join(d, "analysis"))           # the run's marker removed, analysis/ linked outside
-        units = os.path.join(d, "units.csv")
-        open(units, "w").write("unit,pop\na,1\n")
-        spec = {"decision_units": {"csv": units}, "uncertainty": {"draws": 2}}
-        try:
+        for f in ("results.jsonl", "results_prev.jsonl"):
             try:
-                AB.cross_check(spec, [ref, ref], os.path.join(d, "analysis", "cross_check"), 8, run_dir=d)
-            except TypeError:
-                AB.cross_check(spec, [ref, ref], os.path.join(d, "analysis", "cross_check"), 8)
-        except Exception:  # noqa: BLE001 -- the outcome is what the outside dir holds, not the exception
-            pass
+                _safe_io().remove_path(os.path.join(d, "analysis", "cross_check", sub, f), d)
+            except Exception:  # noqa: BLE001 -- the outcome is what the outside dir holds, not the exception
+                pass
         left = sorted(os.listdir(os.path.join(out, "cross_check", sub)))
         ok(left == ["results.jsonl", "results_prev.jsonl"],
-           f"WA24 the cross-engine check anchors at the run dir, not its own output dir: a linked analysis/ loses no "
-           f"external results and receives no units subset ({left})")
+           f"WA24 safe_io.remove_path anchors at the run dir, not its own output dir: a linked analysis/ loses no "
+           f"external results ({left})")
     s = scan_text(_BYPASS4)
     lines = _BYPASS4.splitlines()
     at = (lambda frag: next(i + 1 for i, ln in enumerate(lines) if frag in ln))

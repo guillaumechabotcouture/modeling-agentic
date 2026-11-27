@@ -7,21 +7,12 @@
                                                               # then shut down, unless --no-shutdown. A run whose
                                                               # large files exist only on its VM stays pending
                                                               # until --accept-partial
-    python cloud/run_cluster.py <config.py> brief|report      # decision brief / convergence measures of a live run
-    python cloud/run_cluster.py <config.py> health [--loop] [--interval S] [--log PATH] [--thresholds YAML]
-                                                              # anomalies of a live run (cloud/run_health.py)
     python cloud/run_cluster.py <config.py> sign <answers.yaml> [--label L] [--run RUN] [--action spec|scope]
                          [--expect-spec-sha256 SHA] [--expect-derivations-sha256 SHA|none] [--expect-sheet-sha256 SHA] [note]
                                                               # pending scope declarations, a v2 spec, or the brief
     python cloud/run_cluster.py <config.py> relaunch <label>
     python cloud/run_cluster.py <config.py> keeper            # reconcile, then start missing helpers for the run
                                                               # cluster clusters.json records (after exit 3 or 5)
-    python cloud/run_cluster.py <config.py> ack-probe         # a fast task through the acknowledgement (smoke);
-                                                              # exit 6: the run cluster stopped while it connected
-    python cloud/run_cluster.py <config.py> smoke-run [--minutes 20] [--interrupt-on TEXT]
-                                                              # a smoke: `launch` as a child under a wall-clock bound;
-                                                              # waits for it and every cluster it tagged; at the limit
-                                                              # terminates and reaps it, then stops them by id
     python cloud/run_cluster.py <config.py> reuse-check <run_dir> [--expect-all]
                                                               # how many stored engine rows the code this launch
                                                               # would ship reuses (local, no cloud call)
@@ -105,7 +96,7 @@ each construction's start and outcome).
     `invocation` is this invocation's token and whose status is "failed"; then stop the ids it names. Any other
     record (none, another token, another status) belongs to an earlier launch: stop nothing.
   3 submitted, connection lost: the scheduler listed every run, then this process lost its connection
-    (status "submitted_connection_lost"). Do not shut down; watch with `status` / `health --loop`, and start
+    (status "submitted_connection_lost"). Do not shut down; watch with `status`, and start
     a missing keeper with `keeper`.
   4 submitted, not confirmed: a run was sent, but the scheduler's acceptance of it was not seen (its future
     finished or erred, the scheduler lists it as processing, or holds it queued or waiting); connection lost
@@ -801,8 +792,7 @@ def _construct(cfg, name, inv, ctor, lister=None):
     attaches to a live cluster of that name instead of creating one (another launcher, on another machine, may have
     created it). Ours only if all three hold, any doubt meaning not ours: no live cluster of the name is listed just
     before the constructor; Coiled logged that it created it (_coiled_events); and its `created` time is no earlier
-    than this construction's start less OWN_SKEW_S. The journal records the start and the outcome, so `smoke-run`
-    owns what this invocation created, and a construction that never finished."""
+    than this construction's start less OWN_SKEW_S. The journal records the start and the outcome."""
     import secrets
     if lister is None:
         import coiled
@@ -832,28 +822,6 @@ def _construct(cfg, name, inv, ctor, lister=None):
     return cl
 
 
-def owned_clusters(cfg, inv, items, journal) -> dict:
-    """{id: name} of the listed live clusters of this config's names that are this invocation's: the ids its
-    journal says it created, and, for a construction it began and never finished (interrupted), a cluster of that
-    name created after it began (less OWN_SKEW_S). An id it attached to is never ours."""
-    names = {cfg.name, cfg.keeper_name, cfg.overflow_name}
-    mine = [e for e in journal if e.get("inv") == inv]
-    done = {e.get("seq"): e for e in mine if e.get("status") in ("created", "attached", "unknown")}
-    ids = {e.get("id") for e in done.values() if e["status"] == "created"}
-    never = {e.get("id") for e in done.values() if e["status"] != "created"}
-    pending = [e for e in mine if e.get("status") == "constructing" and e.get("seq") not in done]
-    out = {}
-    for c in items:
-        cid, name = c.get("id"), c.get("name")
-        if name not in names or ws.state_of(c) not in _ATTACH or cid in never:
-            continue
-        ts = _ts(c.get("created"))
-        if cid in ids or (ts is not None and any(p.get("name") == name and ts >= float(p.get("t", 0)) - OWN_SKEW_S
-                                                  for p in pending)):
-            out[cid] = name
-    return out
-
-
 def _task_key(label) -> str:
     return f"run-{label}-{int(time.time())}"
 
@@ -875,7 +843,6 @@ def _submit(cfg, client, label, worker, code, question, keys, launch_id, key=Non
 
 
 EXIT_LAUNCHED, EXIT_FAILED, EXIT_SUBMITTED_LOST, EXIT_UNCONFIRMED, EXIT_INCOMPLETE = 0, 1, 3, 4, 5   # module doc
-EXIT_PROBE_LOST = 6        # ack-probe: the run cluster went away while it connected (no evidence either way)
 ACK_ATTEMPTS, ACK_DELAY_S = 36, 5.0      # about 3 minutes for the scheduler to list a run (F5 resume: 43 s)
 # a lost connection to the scheduler: distributed's CommClosedError and connect timeouts are OSErrors
 CONNECTION_ERRORS = (OSError, TimeoutError, ws.SchedulerInfoUnavailable)
@@ -1028,7 +995,7 @@ def _handover(cfg, clusters: dict, e: BaseException, sent: list, acked: list) ->
         me = "python cloud/run_cluster.py <config> "
         print(f"\n{cfg.name}: {status} (exit {code}) after {type(e).__name__}: {str(e)[:200]}\n"
               f"  submitted {sent or '-'}; listed by the scheduler {acked or '-'}.\n  The run keeps going without "
-              f"this process: do not shut down. Attach later with `{me}status` or `{me}health --loop`.", flush=True)
+              f"this process: do not shut down. Attach later with `{me}status`.", flush=True)
         if clusters["not_submitted"]:
             print(f"  Not submitted: {clusters['not_submitted']}; `{me}relaunch <label>` once `status` shows the "
                   "cluster (their assignments are recorded).", flush=True)
@@ -1186,45 +1153,6 @@ def _reconcile(cfg, clusters: dict, role: str, name: str):
     return None
 
 
-def ack_probe(cfg, lister=None, security_fn=None, client_cls=None) -> int:
-    """`ack-probe`: the acknowledgement on a genuinely fast task. Submits worker_side.ack_probe (it returns at
-    once) to the run cluster, lets it finish, then runs wait_listed and prints what acknowledged it. It connects
-    only to the run cluster id clusters.json records, only while the listing shows that id ready or running, with a
-    plain distributed.Client on its scheduler address: never the name-based constructor, which on a stopping
-    cluster creates a new empty one (smoke case A, 2026-11-09: cluster 2351659)."""
-    from distributed import fire_and_forget
-    cid = (json.load(open(cfg.clusters_file)).get("run") or {}).get("id")
-    if lister is None:
-        import coiled
-        lister = lambda: coiled.list_clusters(workspace=WORKSPACE)  # noqa: E731
-    state = next((ws.state_of(c) for c in _items(lister()) if c.get("id") == cid and c.get("name") == cfg.name), None)
-    if cid is None or state not in ("ready", "running"):
-        raise SystemExit(f"{cfg.name}: the recorded run cluster {cid} is {state or 'not listed'}; ack-probe needs it "
-                         "ready or running (it never attaches by name): refusing")
-    if security_fn is None:
-        def security_fn(cluster_id):
-            from coiled.v2.core import CloudV2
-            with CloudV2() as cloud:
-                return cloud.security(cluster_id, workspace=WORKSPACE)
-    sec, info = security_fn(cid)
-    if client_cls is None:
-        from distributed import Client as client_cls
-    key, why = f"ack-probe-{int(time.time())}", []
-    try:   # a run that ends now stops its cluster under the probe (smoke case A rerun): no evidence, no traceback
-        client = client_cls(info["address_to_use"], security=sec, timeout="60s")
-        fut = client.submit(ws.ack_probe, pure=False, key=key)
-        fire_and_forget(fut)
-        print(f"submitted {key}", flush=True)
-        time.sleep(10)                    # long past the task's run time: nothing is left to list as processing
-        got = wait_listed(client, key, fut, attempts=3, why=why)
-    except CONNECTION_ERRORS as e:
-        print(f"ack-probe {key}: the run cluster stopped while ack-probe was connecting: no acknowledgement evidence "
-              f"({type(e).__name__}: {str(e)[:120]})", flush=True)
-        return EXIT_PROBE_LOST
-    print(f"ack-probe {key}: {'acknowledged by ' + why[0] if got else 'NOT acknowledged'} (future {fut.status})")
-    return 0 if got else 1
-
-
 def _bounded(fn, *a, timeout_s: float = 60.0):
     """fn(*a) in a daemon thread; TimeoutError when it has not returned within `timeout_s`."""
     import threading
@@ -1243,91 +1171,6 @@ def _bounded(fn, *a, timeout_s: float = 60.0):
     if "e" in box:
         raise box["e"]
     return box.get("v")
-
-
-def smoke_watch(cfg, inv, launcher_alive, minutes: float = 20.0, lister=None, stopper=None, clock=None, sleep=None,
-                every_s: float = 30.0, call_timeout_s: float = 60.0, terminate=None, journal=None) -> dict:
-    """A smoke's laptop-side bound. The clusters it owns are this invocation's by its construction journal
-    (owned_clusters: what it created, and what a construction it began and never finished created).
-    Until the wall-clock limit it waits for the launcher to exit and for every owned cluster to stop. At the limit
-    it terminates the launcher first (`terminate`, which reaps it), then stops every owned cluster by id. Every API
-    call is bounded (`call_timeout_s`)."""
-    clock, sleep = clock or time.monotonic, sleep or time.sleep
-    if lister is None:
-        import coiled
-        lister = lambda: coiled.list_clusters(workspace=WORKSPACE)  # noqa: E731
-    stopper = stopper or _stop_id
-
-    def live():
-        items = _items(_bounded(lister, timeout_s=call_timeout_s))
-        return owned_clusters(cfg, inv, items, journal if journal is not None else read_journal(cfg))
-    deadline = clock() + minutes * 60
-    while clock() < deadline:
-        try:
-            lv = live()
-        except Exception as e:  # noqa: BLE001 — unknown this round; the limit still holds
-            print(f"smoke-watch: listing failed ({type(e).__name__}); retrying", flush=True)
-            lv = None
-        if lv == {} and not launcher_alive():
-            print("smoke-watch: the launcher has exited and no cluster of this invocation is live", flush=True)
-            return {"clean": True, "stopped": []}
-        sleep(every_s)
-    print(f"smoke-watch: limit of {minutes} min reached; terminating the launcher, then stopping by id", flush=True)
-    if terminate is not None:
-        try:
-            terminate()                 # no new cluster can appear after this
-        except Exception as e:  # noqa: BLE001
-            print(f"smoke-watch: terminating the launcher failed: {type(e).__name__}", flush=True)
-    stopped, end = [], clock() + min(300.0, minutes * 60 / 4)
-    while clock() < end:
-        try:
-            lv = live()
-        except Exception:  # noqa: BLE001
-            lv = None
-        if lv == {}:
-            break
-        for cid, name in (lv or {}).items():
-            if cid not in stopped:
-                try:
-                    _bounded(stopper, name, cid, timeout_s=call_timeout_s)
-                    stopped.append(cid)
-                except Exception as e:  # noqa: BLE001 — tried again next round
-                    print(f"smoke-watch: stop {name} ({cid}) failed: {type(e).__name__}", flush=True)
-        sleep(every_s)
-    return {"clean": False, "stopped": stopped}
-
-
-def smoke_run(cfg, inv, cmd, minutes: float = 20.0, interrupt_on: str | None = None, **watch) -> dict:
-    """`smoke-run`: run the launcher `cmd` as this process's child under MA_LAUNCH_INVOCATION=`inv`, echo its
-    output, send it SIGINT once on the first line containing `interrupt_on` (the smoke's lost-connection case), and
-    watch it with smoke_watch; at the limit the child is terminated (then killed) and reaped before the sweep."""
-    import signal
-    import threading
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
-                            env={**os.environ, "MA_LAUNCH_INVOCATION": inv})
-    sent = []
-
-    def pump():
-        for line in proc.stdout:
-            print(line, end="", flush=True)
-            if interrupt_on and not sent and interrupt_on in line:
-                sent.append(line.strip())
-                proc.send_signal(signal.SIGINT)
-    reader = threading.Thread(target=pump, daemon=True)
-    reader.start()
-
-    def terminate():
-        if proc.poll() is None:
-            proc.terminate()
-            try:
-                proc.wait(30)
-            except subprocess.TimeoutExpired:
-                proc.kill()
-        proc.wait()
-    r = smoke_watch(cfg, inv, lambda: proc.poll() is None, minutes, terminate=terminate, **watch)
-    terminate()
-    reader.join(5)
-    return {**r, "launcher_rc": proc.returncode, "interrupted": bool(sent)}
 
 
 def keeper_later(cfg) -> int:
@@ -2321,38 +2164,6 @@ def _side(cfg, fn, *args, label=None):
     return _on_worker(existing_client(cfg.name), fn, label, *args, worker=assign[label]["worker"])
 
 
-def health_snapshots(cfg, client, assign: dict, now: float | None = None) -> dict:
-    """Phase 51 γ: {label: snapshot} for run_health.Monitor, read from a live
-    cluster (attach-only; the caller passes the client). The scheduler view
-    runs on the scheduler and the file view on each run's agent VM; both are
-    sent by value, so runs launched before this code have them too. What
-    cannot be read becomes a `monitor_error` entry, never a quiet snapshot."""
-    import run_health as rh
-    try:
-        import cloudpickle
-        cloudpickle.register_pickle_by_value(rh)
-    except ImportError:
-        pass
-    now = time.time() if now is None else now
-    res = (cfg.compute_env or {}).get("MA_COMPUTE_RESOURCE", rh.RESOURCE)
-    errors = []
-    try:
-        sched = client.run_on_scheduler(rh.scheduler_view, res)
-    except Exception as e:  # noqa: BLE001 — reported as a monitor error
-        sched, errors = None, [f"scheduler view: {type(e).__name__}: {rh.clip(e, 160)}"]
-    out = {}
-    for label in cfg.labels:
-        errs = list(errors)
-        try:
-            files = _on_worker(client, rh.run_files_view, label, worker=assign[label]["worker"])
-        except Exception as e:  # noqa: BLE001
-            files = {}
-            errs.append(f"run files: {type(e).__name__}: {rh.clip(e, 160)}")
-        errs += list(files.get("errors") or [])
-        out[label] = {**files, "at": now, "scheduler": sched, "input_errors": errs}
-    return out
-
-
 def connect_existing(name: str, lister=None, security_fn=None, client_cls=None):
     """A Client on the live cluster `name`, or None. Built from the cluster's
     scheduler address and TLS security as the Coiled API reports them, then a
@@ -2375,81 +2186,6 @@ def connect_existing(name: str, lister=None, security_fn=None, client_cls=None):
     if client_cls is None:
         from distributed import Client as client_cls
     return client_cls(info["address_to_use"], security=sec, timeout="60s")
-
-
-def health(cfg, args, connect_fn=None, sleep=time.sleep) -> int:
-    """`health`: check a live run once, or every `--interval` s with `--loop`,
-    appending new alerts to the log (default <out_dir>/health.log) and stdout.
-    It connects with connect_existing, which cannot create a cluster; a
-    cluster that is not running is reported and that poll skipped. A poll
-    that cannot read something (assignments.json, a run file, the scheduler)
-    logs a monitor_error and the next poll tries again: the loop never ends
-    on a transient read. Every line goes through run_health.redact."""
-    import argparse
-    import run_health as rh
-    ap = argparse.ArgumentParser(prog="run_cluster.py <config> health")
-    ap.add_argument("--loop", action="store_true")
-    ap.add_argument("--interval", type=float, default=300.0)
-    ap.add_argument("--log", default=os.path.join(cfg.out_dir, "health.log"))
-    ap.add_argument("--thresholds", default=rh.THRESHOLDS)
-    ap.add_argument("--max-polls", type=int, default=0, help=argparse.SUPPRESS)
-    a = ap.parse_args(args)
-    connect_fn = connect_fn or connect_existing
-    thresholds = rh.load_thresholds(a.thresholds)
-    monitors = {label: rh.Monitor(thresholds) for label in cfg.labels}
-    seen_poll_errors: set = set()
-    polls = 0
-
-    def poll_error(what: str, e: Exception) -> None:
-        now = time.time()
-        key = f"poll:{what}:{type(e).__name__}"
-        alert = {"rule": "monitor_error", "key": key, "at": now, "at_iso": rh._iso(now),
-                 "message": f"could not read {what}: {type(e).__name__}: {rh.clip(e, 200)} (retrying next poll)"}
-        if key not in seen_poll_errors:
-            seen_poll_errors.add(key)
-            rh.log_alerts([alert], a.log)
-        else:
-            print(rh.format_alert(alert))
-
-    while True:
-        client = None
-        try:
-            client = connect_fn(cfg.name)
-            if client is None:
-                print(rh.redact(f"cluster {cfg.name}: not running; poll skipped"))
-            else:
-                try:
-                    with open(cfg.state_file, encoding="utf-8") as f:
-                        assign = json.load(f)
-                    if not isinstance(assign, dict):
-                        raise ValueError("not a mapping")
-                except (OSError, ValueError) as e:
-                    poll_error(os.path.basename(cfg.state_file), e)
-                    assign = None
-                for label, snap in (health_snapshots(cfg, client, assign).items() if assign is not None else ()):
-                    alerts = monitors[label].check(snap)
-                    for err in snap.get("input_errors") or []:
-                        key = f"input:{err}"
-                        if key not in monitors[label].seen:
-                            monitors[label].seen.add(key)
-                            alerts.append({"rule": "monitor_error", "key": key, "at": snap["at"],
-                                           "at_iso": rh._iso(snap["at"]), "message": f"could not read {err}"})
-                    rh.log_alerts(alerts, a.log, label)
-                    if not alerts and not a.loop:
-                        print(f"{label}: no anomalies ({len(snap.get('trace') or [])} trace events read)")
-        except Exception as e:  # noqa: BLE001 — one failed poll must not end the watch
-            poll_error("the cluster", e)
-        finally:
-            close = getattr(client, "close", None)
-            if callable(close):
-                try:
-                    close()
-                except Exception:  # noqa: BLE001
-                    pass
-        polls += 1
-        if not a.loop or (a.max_polls and polls >= a.max_polls):
-            return 0
-        sleep(a.interval)
 
 
 # ---- self-test --------------------------------------------------------------------------
@@ -2898,156 +2634,6 @@ def _self_test_52(ok) -> None:
     ok(r4 == {"status": "down", "workers": ["idle"]},
        f"RC52s a worker that joined and took a chunk after the refresh is kept: the retirement check is one "
        f"scheduler-side call on the scheduler's own state: {r4}")
-
-
-def _self_test_51c(ok) -> None:
-    """Phase 51 γ: the `health` command on a fake cluster (no Coiled, no network)."""
-    import contextlib
-    import io
-    import tempfile
-    import types
-    import run_health as rh
-
-    class FakeWS:
-        def __init__(self, tagged, processing):
-            self.resources = {"compute": 1} if tagged else {}
-            self.processing = set(range(processing))
-            self.status = types.SimpleNamespace(name="running")
-
-    sched = types.SimpleNamespace(
-        workers={"agent": FakeWS(False, 1), "c0": FakeWS(True, 24), "c1": FakeWS(True, 0)},
-        unrunnable=[types.SimpleNamespace(resource_restrictions={"compute": 1}),
-                    types.SimpleNamespace(resource_restrictions={"compute": 1, rh.DEMAND_RESOURCE: 1})])
-    with tempfile.TemporaryDirectory() as d:
-        rd = os.path.join(d, "work", "R1", "runs", "2026-10-28_x")
-        os.makedirs(os.path.join(rd, "models"))
-        old = "2026-10-29T06:00:00"
-        with open(os.path.join(rd, "trace.jsonl"), "w") as f:
-            f.write(json.dumps({"ts": old, "type": "tool_use"}) + "\n" + "{torn line\n"
-                    + json.dumps({"ts": "2026-10-29T07:00:25", "type": "session_error", "session": 2,
-                                  "error": "exit code 143"}) + "\n")
-        with open(os.path.join(rd, "status.json"), "w") as f:
-            json.dump({"heartbeat": old + "+00:00", "gate": {"round": 2}}, f)
-        work = os.path.join(d, "work")
-
-        class FakeClient:
-            calls = []
-
-            def run_on_scheduler(self, fn, *a):
-                self.calls.append("scheduler")
-                return fn(*a, dask_scheduler=sched)
-
-            def run(self, fn, *a, workers, **kw):
-                self.calls.append(("run", workers))
-                return {workers[0]: fn(*a, work=work)}
-
-        client = FakeClient()
-        cfg = RunConfig(name="h", question_file="q", out_dir=os.path.join(d, "out"))
-        os.makedirs(cfg.out_dir)
-        with open(cfg.state_file, "w") as f:
-            json.dump({"R1": {"worker": "agent"}}, f)
-        snaps = health_snapshots(cfg, client, json.load(open(cfg.state_file)), now=rh._epoch("2026-10-29T08:00:00"))
-        s = snaps["R1"]
-        ok(s["scheduler"]["unrunnable_compute"] == 1 and s["scheduler"]["workers"]["c0"]["processing"] == 24
-           and not s["scheduler"]["workers"]["agent"]["compute"],
-           "RC51c-1 the scheduler view counts compute tasks unrunnable (not demand markers) and tags")
-        ok(len(s["trace"]) == 2 and any("unparseable" in e for e in s["input_errors"]),
-           "RC51c-2 the run-file view reads the trace and reports a torn line instead of dropping it")
-        alerts = rh.Monitor(rh.load_thresholds()).check(s)
-        ok(sorted({a["rule"] for a in alerts}) == ["session_error", "stall"],
-           f"RC51c-3 a live snapshot raises session_error and stall ({sorted(a['rule'] for a in alerts)})")
-        connected = []
-        buf = io.StringIO()
-        with contextlib.redirect_stdout(buf):
-            rc = health(cfg, ["--loop", "--interval", "0", "--max-polls", "2"],
-                        connect_fn=lambda n: connected.append(n) or client, sleep=lambda s: None)
-        log = open(os.path.join(cfg.out_dir, "health.log")).read()
-        ok(rc == 0 and connected == ["h", "h"] and log.count("HEALTH session_error") == 1
-           and "HEALTH monitor_error: could not read trace.jsonl: unparseable line" in log,
-           "RC51c-4 health --loop logs each alert once across polls, input errors included")
-        buf = io.StringIO()
-        with contextlib.redirect_stdout(buf):
-            rc = health(cfg, ["--loop", "--interval", "0", "--max-polls", "3"], connect_fn=lambda n: None,
-                        sleep=lambda s: None)
-        ok(rc == 0 and buf.getvalue().count("not running; poll skipped") == 3,
-           "RC51c-5 a cluster that is not running is reported and the poll skipped, every poll")
-
-        # Codex round 1, P1-1: health connects through a path that cannot create a
-        # cluster (Coiled API security + a plain distributed Client), even in a stop race.
-        class NoCreate(types.ModuleType):
-            def __getattr__(self, k):
-                raise AssertionError(f"health touched coiled.{k}")
-        saved = sys.modules.get("coiled")
-        sys.modules["coiled"] = NoCreate("coiled")
-        made = []
-
-        def boom(*a, **k):
-            raise AssertionError("must not be called")
-        try:
-            got = connect_existing("h", lister=lambda: [{"name": "h", "id": 7, "current_state": {"state": "running"}}],
-                                   security_fn=lambda cid: ("SEC", {"address_to_use": f"tls://10.0.0.{cid}:8786"}),
-                                   client_cls=lambda addr, **kw: made.append((addr, kw.get("security"))) or "CLIENT")
-            ok(got == "CLIENT" and made == [("tls://10.0.0.7:8786", "SEC")],
-               "RC51c-7 connect_existing opens a plain Client on the live cluster's scheduler with its security")
-
-            def stopping(cid):
-                raise RuntimeError("Cannot get security info for cluster 7, scheduler state is stopping")
-            gone = connect_existing("h", lister=lambda: [{"name": "h", "id": 7, "current_state": {"state": "stopping"}}],
-                                    security_fn=boom, client_cls=boom)
-            race = connect_existing("h", lister=lambda: [{"name": "h", "id": 7, "current_state": {"state": "running"}}],
-                                    security_fn=stopping, client_cls=boom)
-            ok(gone is None and race is None,
-               "RC51c-8 a stopped cluster, or one stopping between list and connect, gives None, never a new one")
-        finally:
-            if saved is None:
-                sys.modules.pop("coiled", None)
-            else:
-                sys.modules["coiled"] = saved
-        import inspect as _inspect
-        src = _inspect.getsource(health) + _inspect.getsource(health_snapshots) + _inspect.getsource(connect_existing)
-        ok("coiled.Cluster(" not in src and "attach(" not in src, "RC51c-9 health never calls coiled.Cluster or attach")
-
-        # Codex round 1, P1-2: transient read errors are logged and retried, never fatal.
-        os.remove(cfg.state_file)
-        polls = []
-
-        def flaky(n):
-            polls.append(n)
-            if len(polls) == 2:
-                with open(cfg.state_file, "w") as f:
-                    f.write("{torn")
-            if len(polls) == 3:
-                with open(cfg.state_file, "w") as f:
-                    json.dump({"R1": {"worker": "agent"}}, f)
-            return client
-        open(os.path.join(cfg.out_dir, "health.log"), "w").close()
-        buf = io.StringIO()
-        with contextlib.redirect_stdout(buf):
-            rc = health(cfg, ["--loop", "--interval", "0", "--max-polls", "3"], connect_fn=flaky,
-                        sleep=lambda s: None)
-        log = open(os.path.join(cfg.out_dir, "health.log")).read()
-        ok(rc == 0 and len(polls) == 3 and "FileNotFoundError" in log and "JSONDecodeError" in log
-           and "HEALTH session_error" in log,
-           "RC51c-10 a missing then torn assignments.json is a monitor error; the loop retries and recovers")
-        os.remove(os.path.join(rd, "status.json"))
-        with open(os.path.join(rd, "trace.jsonl"), "wb") as f:
-            f.write(b"\xff\xfe not text\n")
-        s3 = health_snapshots(cfg, client, {"R1": {"worker": "agent"}})["R1"]
-        ok(s3["status"] is None and s3["input_errors"], "RC51c-11 an unreadable or vanished run file is an input error")
-
-        class Broken(FakeClient):
-            def run_on_scheduler(self, fn, *a):
-                raise OSError("scheduler gone")
-        s2 = health_snapshots(cfg, Broken(), {"R1": {"worker": "agent"}})["R1"]
-        ok(s2["scheduler"] is None and any("scheduler gone" in e for e in s2["input_errors"]),
-           "RC51c-6 an unreadable scheduler is an input error, not a quiet snapshot")
-
-        class Leaky(FakeClient):
-            def run_on_scheduler(self, fn, *a):
-                raise OSError("x" * 140 + "token=" + "sk-ant-api03-LEAKLEAKLEAKLEAK" + " tail")
-        s4 = health_snapshots(cfg, Leaky(), {"R1": {"worker": "agent"}})["R1"]
-        ok(not any("sk-ant" in e or "LEAK" in e for e in s4["input_errors"]),
-           f"RC51c-12 a scheduler error is redacted before it is truncated ({s4['input_errors'][0][-40:]})")
 
 
 def _self_test_attach(ok) -> None:
@@ -3699,123 +3285,8 @@ def _self_test_s18_r3(ok) -> None:
         except RuntimeError:
             refused = True
     ok(refused, "G1b a real coiled call from a run_cluster self-test is refused")
-    # the smoke watch: ownership is this invocation's construction journal (ids it created; a construction it began
-    # and never finished: clusters of that name created after it began); at the limit the launcher goes first
-    import datetime as _dt
-    sw = g.get("smoke_watch")
-    cfg = RunConfig(name="lt", question_file="q", pipeline="v2")
-    T0 = 1_800_000_000.0                                    # the invocation's constructions began here (epoch)
-
-    def iso(t):
-        return _dt.datetime.fromtimestamp(t, _dt.timezone.utc).isoformat()
-
-    def cl_(name, cid, created=T0 + 30):
-        return {"name": name, "id": cid, "created": iso(created), "current_state": {"state": "running"}}
-    journal = [{"inv": "INV", "name": "lt", "t": T0, "status": "constructing", "seq": 1},
-               {"inv": "INV", "name": "lt", "id": 77, "status": "created", "seq": 1},
-               {"inv": "INV", "name": "lt-keeper", "t": T0 + 60, "status": "constructing", "seq": 2},
-               {"inv": "INV", "name": "lt-keeper", "id": 79, "status": "created", "seq": 2}]
-
-    class World:
-        def __init__(self, script, launcher_alive_until):
-            self.t, self.script, self.until, self.stopped, self.events = 0.0, script, launcher_alive_until, [], []
-
-        def clock(self):
-            return self.t
-
-        def sleep(self, s):
-            self.t += s
-
-        def lister(self):
-            self.t += 7.0                       # each listing takes time: the bound is the clock, not a count
-            return [c for t0, c in self.script if t0 <= self.t and c["id"] not in self.stopped]
-
-        def stop(self, name, cid):
-            self.events.append(("stop", cid))
-            self.stopped.append(cid)
-
-        def alive(self):
-            return self.t < self.until
-
-        def terminate(self):
-            self.events.append(("terminate", None))
-            self.until = -1
-    run, keeper = cl_("lt", 77), cl_("lt-keeper", 79, T0 + 70)
-    theirs = cl_("lt", 66, created=T0 + 40)          # same name, created by another invocation (another machine)
-    if sw:
-        class W1(World):
-            def lister(self):
-                self.t += 7.0
-                out = [theirs]
-                if self.t < 200:
-                    out.append(run)
-                if 150 <= self.t < 400:
-                    out.append(keeper)
-                return out
-        w = W1([], 100)
-        r = sw(cfg, "INV", w.alive, minutes=20, lister=w.lister, stopper=w.stop, clock=w.clock, sleep=w.sleep,
-               every_s=30, terminate=w.terminate, journal=journal)
-        ok(r.get("clean") and not w.stopped and w.t >= 400,
-           f"W1 the watch waits for a late keeper to stop by itself, then ends clean: t={w.t} {r}")
-        w = World([(0, run), (0, keeper), (0, theirs)], 10 ** 9)
-        r = sw(cfg, "INV", w.alive, minutes=20, lister=w.lister, stopper=w.stop, clock=w.clock, sleep=w.sleep,
-               every_s=30, terminate=w.terminate, journal=journal)
-        ok(not r.get("clean") and sorted(w.stopped) == [77, 79] and 1200 <= w.t <= 1200 + 300,
-           f"W2 at the wall-clock limit it stops by id every cluster this invocation created, nothing else: "
-           f"t={w.t} stopped={w.stopped} {r}")
-        ok(w.events[:1] == [("terminate", None)], f"W4 at the limit the launcher is terminated before the sweep: "
-                                                  f"{w.events}")
-        w = World([(0, theirs)], 10 ** 9)
-        r = sw(cfg, "INV", w.alive, minutes=20, lister=w.lister, stopper=w.stop, clock=w.clock, sleep=w.sleep,
-               every_s=30, terminate=w.terminate, journal=journal)
-        ok(not w.stopped and ("terminate", None) in w.events,
-           f"W4b another invocation's cluster of the same name is never stopped: {w.events}")
-        # a construction interrupted before its outcome was journaled: clusters of that name created after it began
-        pend = journal + [{"inv": "INV", "name": "lt-overflow", "t": T0 + 100, "status": "constructing", "seq": 3}]
-        late, old = cl_("lt-overflow", 80, created=T0 + 110), cl_("lt-overflow", 81, created=T0 - 600)
-        w = World([(0, late), (0, old)], 10 ** 9)
-        r = sw(cfg, "INV", w.alive, minutes=20, lister=w.lister, stopper=w.stop, clock=w.clock, sleep=w.sleep,
-               every_s=30, terminate=w.terminate, journal=pend)
-        ok(w.stopped == [80], f"W7 an unfinished construction owns only a cluster of its name created after it began: "
-                              f"{w.stopped}")
-        att = journal + [{"inv": "INV", "name": "lt-overflow", "t": T0 + 100, "status": "constructing", "seq": 3},
-                         {"inv": "INV", "name": "lt-overflow", "id": 80, "status": "attached", "seq": 3}]
-        w = World([(0, late)], 10 ** 9)
-        sw(cfg, "INV", w.alive, minutes=20, lister=w.lister, stopper=w.stop, clock=w.clock, sleep=w.sleep, every_s=30,
-           terminate=w.terminate, journal=att)
-        ok(not w.stopped, f"W7b a cluster this invocation attached to (not created) is never stopped: {w.stopped}")
-
-        def hang():
-            import time as _t
-            _t.sleep(5)
-            return []
-        import time as _time
-        t0 = _time.monotonic()
-        r = sw(cfg, "INV", lambda: False, minutes=0.01, lister=hang, stopper=lambda n, c: None, every_s=0.1,
-               call_timeout_s=0.5, terminate=lambda: None, journal=[])
-        ok(_time.monotonic() - t0 < 4, f"W3 a hung API call is bounded by its timeout: {_time.monotonic() - t0:.1f}s {r}")
-    else:
-        ok(False, "W1 smoke_watch exists")
-    # smoke-run owns the launcher process: it can interrupt it on a line, and terminates and reaps it at the limit
-    srun = g.get("smoke_run")
-    if srun:
-        import io
-        import contextlib
-        script = "import time, sys; print('listed S1 (run-S1-1) by the scheduler', flush=True); time.sleep(60)"
-        t0 = _time.monotonic()
-        with contextlib.redirect_stdout(io.StringIO()):
-            r = srun(cfg, "INV", [sys.executable, "-c", script], minutes=0.05, interrupt_on="listed S1",
-                     lister=lambda: [], stopper=lambda n, c: None, every_s=0.1, journal=[])
-        ok(r.get("launcher_rc") is not None and r.get("interrupted") and _time.monotonic() - t0 < 20,
-           f"W5 smoke-run interrupts the launcher on its line and reaps it: {r}")
-        with contextlib.redirect_stdout(io.StringIO()):
-            r = srun(cfg, "INV", [sys.executable, "-c", "import time; time.sleep(60)"], minutes=0.02,
-                     lister=lambda: [], stopper=lambda n, c: None, every_s=0.1, journal=[])
-        ok(r.get("launcher_rc") is not None and not r.get("clean") and _time.monotonic() - t0 < 40,
-           f"W6 (round 4) a launcher still running at the limit is terminated and reaped: {r}")
-    else:
-        ok(False, "W5 smoke_run exists")
     # the job's cloud-side lifetime: the run's wall time and the hold for collection come from the config
+    import time as _time
     sub = []
     fc = types.SimpleNamespace(submit=lambda *a, **kw: sub.append((a, kw)) or "fut")
     from unittest import mock
@@ -3967,81 +3438,10 @@ def _self_test_s18_r4(ok) -> None:
 
 
 def _self_test_s18_smoke_a(ok) -> None:
-    """From smoke case A (2026-11-09, 9f7a787). (1) The run finished in under a minute; `ack-probe` then attached by
-    name to the stopping run cluster, and Coiled created a new empty s18-smoke-gcc (2351659), which it shut down:
-    ack-probe now connects only to the recorded run cluster id, only while the listing shows it ready or running,
-    and never through the name-based constructor. (2) The launcher retried the keeper's worker table for about
-    6 minutes after the run cluster had stopped: confirm_keeper stops at once when the run is no longer alive."""
+    """From smoke case A (2026-11-09, 9f7a787): confirm_keeper stops at once when the run is no longer alive."""
     import contextlib
     import io
-    import tempfile
     import types
-    from unittest import mock
-    M, P, g = sys.modules[__name__], mock.patch.object, globals()
-    built, sec_calls = [], []
-
-    def no_ctor(**kw):
-        built.append(kw)
-        raise AssertionError("the name-based constructor was called")
-    fake = types.ModuleType("coiled")
-    fake.Cluster = no_ctor
-
-    class FakeClient:
-        def __init__(self, address, security=None, timeout=None):
-            self.address = address
-
-        def submit(self, fn, pure=False, key=None):
-            return types.SimpleNamespace(status="finished", key=key)
-
-        def processing(self):
-            return {}
-
-        def run_on_scheduler(self, fn, *a):
-            return None
-
-    def go(state, cid_listed=77, recorded=77, cc=None):
-        with tempfile.TemporaryDirectory() as d:
-            cfg = RunConfig(name="lt", question_file="q", out_dir=d, pipeline="v2")
-            json.dump({"run": {"name": "lt", "id": recorded}, "invocation": "I", "status": "launched"},
-                      open(cfg.clusters_file, "w"))
-            listing = [{"name": "lt", "id": cid_listed, "current_state": {"state": state}}]
-            out = io.StringIO()
-            with mock.patch.dict(sys.modules, {"coiled": fake,
-                                               "distributed": types.SimpleNamespace(fire_and_forget=lambda f: None)}), \
-                    P(time, "sleep", lambda s: None), contextlib.redirect_stdout(out):
-                try:
-                    rc = ack_probe(cfg, lister=lambda: listing,
-                                   security_fn=lambda cid: sec_calls.append(cid) or ("sec", {"address_to_use": "tls://s:1"}),
-                                   client_cls=cc or FakeClient)
-                except SystemExit as e:
-                    rc = ("exit", str(e.code))
-                except TypeError as e:
-                    rc = ("typeerror", str(e))
-            return rc, out.getvalue()
-    for st in ("stopping", "stopped", "pending"):
-        rc, out = go(st)
-        ok(isinstance(rc, tuple) and rc[0] == "exit" and "77" in rc[1] and not built and not sec_calls,
-           f"A1 ack-probe refuses a run cluster that is {st}, without the name-based constructor: {rc} {built} {sec_calls}")
-    rc, out = go("running", cid_listed=99)
-    ok(isinstance(rc, tuple) and rc[0] == "exit" and not built and not sec_calls,
-       f"A1b a live cluster of the name with another id is not the recorded one: refused: {rc}")
-    for st in ("ready", "running"):
-        sec_calls.clear()
-        rc, out = go(st)
-        ok(rc == 0 and sec_calls == [77] and not built and "acknowledged by future finished" in out,
-           f"A2 ack-probe connects by the recorded id ({st}) and reports the fast task's acknowledgement: {rc} {out[-160:]!r}")
-    # the rerun of case A: the probe saw the id running, then the cluster stopped while it connected
-    class Lost(FakeClient):
-        def submit(self, fn, pure=False, key=None):
-            raise OSError("ConnectionPool closing")              # distributed's CommClosedError is an OSError
-
-    def timeout_client(*a, **k):
-        raise TimeoutError("Timed out trying to connect to tls://s:1 after 60 s")
-    for cc, what in ((timeout_client, "a connect timeout"), (Lost, "a closed connection pool")):
-        rc, out = go("running", cc=cc)
-        ok(rc == g.get("EXIT_PROBE_LOST", "unset") and rc not in (0, 1) and
-           "the run cluster stopped while ack-probe was connecting: no acknowledgement evidence" in out
-           and "Traceback" not in out, f"A4 {what} while ack-probe connects fails cleanly with its own code: {rc} {out[-200:]!r}")
     # confirm_keeper: a run cluster that has stopped ends the wait at once
     sleeps, reads = [], []
 
@@ -6080,7 +5480,6 @@ def _self_test() -> int:
         ok(False, f"RK: {type(e).__name__}: {e}")
     globals()["budget_guard"] = lambda cfg, reserve=True, inv=None: None   # the launch cases below predate the budget (BU1-BU4 test it)
     _self_test_42b(ok, RunConfig)
-    _self_test_51c(ok)
     _self_test_52(ok)
     _self_test_sheet(ok)
     _self_test_attach(ok)
@@ -6182,16 +5581,6 @@ def main(argv) -> int:
         return launch(cfg)
     elif cmd == "keeper":
         return keeper_later(cfg)
-    elif cmd == "ack-probe":
-        return ack_probe(cfg)
-    elif cmd == "smoke-run":
-        mins = float(rest[rest.index("--minutes") + 1]) if "--minutes" in rest else 20.0
-        stop_on = rest[rest.index("--interrupt-on") + 1] if "--interrupt-on" in rest else None
-        inv = _invocation()
-        print(f"smoke-run invocation {inv}", flush=True)
-        r = smoke_run(cfg, inv, [sys.executable, os.path.abspath(__file__), argv[1], "launch"], mins, stop_on)
-        print(f"smoke-run: {json.dumps(r)}", flush=True)
-        return 0 if r["clean"] else 1
     elif cmd == "reuse-check":
         if not rest or rest[0].startswith("-"):
             sys.exit(__doc__)
@@ -6221,14 +5610,6 @@ def main(argv) -> int:
         c = existing_client(cfg.keeper_name)
         w = sorted(ws.scheduler_workers(lambda: c, attempts=3, min_workers=1))[0]
         print(c.run(ws.keeper_log, workers=[w])[w])
-    elif cmd == "brief":
-        r = _side(cfg, ws.brief_side)
-        print(f"run dir: {r.get('run_dir')}\nstatus: {r.get('status') or r.get('state')}\n")
-        print(r.get("brief_md") or "(no decision_brief.md yet)")
-    elif cmd == "report":
-        print(_side(cfg, ws.report_side))
-    elif cmd == "health":
-        return health(cfg, rest)
     elif cmd == "sign":
         a = parse_sign_args(rest, cfg.labels)
         try:   # sent by value: a worker uploaded before --run existed still runs this sign_side
