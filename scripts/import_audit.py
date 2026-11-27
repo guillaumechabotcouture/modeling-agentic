@@ -42,10 +42,6 @@ REVIEWED = {
                                                          "the batch runner and the checkpoint-restore self-test)")},
     "scripts/eval_suite.py": {"spec_from_file_location": (2, "the eval suite's own generators and hidden tests")},
     "scripts/gate_fuzz.py": {"import_module": (5, "gate module names from its own table of gates")},
-    "scripts/identifiability.py": {"spec_from_file_location": (1, _RUN_CODE)},
-    "scripts/propagate_uncertainty.py": {"__import__": (1, "_sibling(name): sibling script names written in the code"),
-                                         "spec_from_file_location": (1, _RUN_CODE)},
-    "scripts/render_claims.py": {"spec_from_file_location": (1, _REPO_FILE)},
     "toolkit/engines/built/worker.py": {
         "exec_compile": (1, "verified-bytes compile of an agent-built engine snapshot inside the minimal-mount "
                             "sandbox, only after sha256 verification (docs/design/agent-built-engines.md §5.1)")},

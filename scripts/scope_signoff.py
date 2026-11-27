@@ -32,15 +32,10 @@ How it runs
 * `--signoff owner` (main.py): the writer is held, the lead ends its turn with
   AWAITING_SIGNOFF, and the harness waits for the owner (`scope_signoff.md`;
   `sign` from the owner's shell, or `cloud/run_cluster.py <config> sign`), then
-  resumes the lead with the answers, like the decision-brief sign-off. A wait
-  that times out ends the run `awaiting_scope_signoff` (resumable, exit 2).
-* `--signoff lead` (smokes): the lead reviews and writes its answers to
-  `scope_signoff_answers.yaml`; the harness signs them `by: lead`.
 * Only the harness records an answer (`harness_record`, from main.py, after the
   owner signed outside the agent session): the ledger holds the answer's hash
   under a nonce the harness also writes to trace.jsonl. An answer without that
-  record does not count, so a signature an agent wrote is not an approval; no
-  script an agent runs is credited with writing it (agents/integrity.py).
+  record does not count, so a signature an agent wrote is not an approval.
 * v2 `--signoff lead` (owner default D2, autonomy 1F): the run never waits for the owner. The
   harness answers each pending item `accept` as the lead, marked `provisional`
   (`provisional_answers`), records it like any answer, and the report lists it (heading the report
@@ -79,14 +74,12 @@ if HERE not in sys.path:
 from lib import scope_declarations as sd  # noqa: E402
 from lib.safe_io import sha256_file  # noqa: E402
 
-REQUEST, SIGNOFF, MD = "scope_signoff_request.json", "scope_signoff.json", "scope_signoff.md"
+REQUEST, SIGNOFF = "scope_signoff_request.json", "scope_signoff.json"
 # Codex review (#85): the harness's record of each answer it received from outside the agent
-# session (the owner's CLI or `cloud/run_cluster.py sign`), and the lead's answers file under
-# --signoff lead. Agents never write the signature or the ledger: no script run by an agent is
-# credited with them (agents/integrity.py), and an answer counts only when the ledger records
-# its hash under a nonce the harness also wrote to trace.jsonl.
-LEDGER, LEAD_ANSWERS, TRACE = "scope_signoff_ledger.json", "scope_signoff_answers.yaml", "trace.jsonl"
-MAX_SIGNOFF_WAITS = 20
+# session (the owner's CLI or `cloud/run_cluster.py sign`). Agents never write the signature
+# or the ledger: an answer counts only when the ledger records its hash under a nonce the
+# harness also wrote to trace.jsonl.
+LEDGER, TRACE = "scope_signoff_ledger.json", "trace.jsonl"
 DECLINED, INVALID = "scope_declaration_declined", "scope_signoff_invalid"
 POLICY = os.path.join(os.path.dirname(HERE), ".claude", "orchestration", "scope_declaration_policy.yaml")
 CONDITIONS = ("allocation", "benchmark_intervention", "always", "artifact")
@@ -441,15 +434,6 @@ def harness_record(run_dir: str) -> str:
         f.write(json.dumps({"ts": now, "type": "scope_signoff_recorded", "nonce": nonce}) + "\n")
     write_nofollow(run_dir, LEDGER, json.dumps({"entries": led, "producer": "main.py"}, indent=1).encode(), atomic=True)
     return nonce
-
-
-def lead_answers(run_dir: str) -> Optional[dict]:
-    """--signoff lead: the lead's answers file (finding -> accept|decline), or None."""
-    try:
-        doc = _read_yaml(run_dir, LEAD_ANSWERS)
-    except (OSError, UnicodeDecodeError, ValueError, yaml.YAMLError):
-        return None
-    return doc if isinstance(doc, dict) and doc else None
 
 
 def gate_findings(run_dir: str, round_n: Optional[int] = None, current: Optional[list] = None,
@@ -813,25 +797,6 @@ def review(run_dir: str, finding: str, decision: str, note: str = "") -> dict:
         return rev
 
 
-def answer_text(run_dir: str) -> str:
-    """What the lead is told after the sign-off."""
-    req = _load_request(run_dir) or {}
-    answers, _ = verified_answers(run_dir)
-    lines = []
-    for it in req.get("items") or []:
-        a = answers.get(it.get("fingerprint")) or {}
-        lines.append(f"- {it.get('finding')}: {a.get('decision', 'no answer')} by {a.get('by', '?')}"
-                     + (f" ({a['note']})" if a.get("note") else ""))
-    acc = all((answers.get(it.get("fingerprint")) or {}).get("decision") == "accept" for it in req.get("items") or [])
-    lines.append("Re-run the STAGE 7 gate now. "
-                 + ("Every declaration was accepted: continue to the write-up the gate gives, and state each "
-                    "accepted declaration, its decision test (or that it had none) and the owner's acceptance "
-                    "in report.md Limitations." if acc else
-                    "A declined declaration is HIGH `scope_declaration_declined`: fix those findings in the "
-                    "remaining rounds; the accepted ones stand."))
-    return "\n".join(lines)
-
-
 # --------------------------------------------------------------------------- self-test
 
 def _self_test() -> int:
@@ -999,7 +964,6 @@ def _self_test() -> int:
             f = gate_findings(d, 7, c)
             ok([x["kind"] for x in f] == [DECLINED] and c[1].get("owner_signed") and not c[1].get("owner_signoff")
                and not c[0].get("owner_signoff"), f"SO14 declined -> HIGH, accepted -> declarable: {f}")
-            ok("decline by owner" in answer_text(d) and "Re-run" in answer_text(d), "SO15 the lead's resume text")
             # SO24 (Codex P1): changed evidence (the finding's result) is asked again.
             c = cur()
             c[1]["claim"] = "B15 drift: observed 0.57"
@@ -1319,9 +1283,7 @@ def main(argv=None) -> int:
         return 0
     if os.environ.get("MA_SIGNOFF_MODE"):
         # Set only in the agents' environment (main.py): the owner signs from a shell of their own.
-        # Under --signoff lead the lead writes scope_signoff_answers.yaml and the harness signs.
-        print("Agents cannot sign scope declarations. Owner: sign from your own shell. Lead (--signoff lead): "
-              f"write {LEAD_ANSWERS} and end your turn with AWAITING_SIGNOFF.", file=sys.stderr)
+        print("Agents cannot sign scope declarations. Owner: sign from your own shell.", file=sys.stderr)
         return 1
     if a.cmd == "review":
         if not a.finding or a.confirm == a.overturn:

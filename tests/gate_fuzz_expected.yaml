@@ -16,22 +16,6 @@ expected_failures:
       truncated: [fails_open]
       undecodable: [fails_open]
       wrong_type: [fails_open]
-  decision_brief:
-    acceptance_lock.json:
-      corrupt: [fails_open]
-      empty: [fails_open]
-      symlink_escape: [fails_open]
-      truncated: [fails_open]
-      undecodable: [fails_open]
-      wrong_type: [raises]
-    decision_brief.signoff.json:
-      symlink_escape: [fails_open]
-    decision_brief.yaml:
-      symlink_escape: [fails_open]
-    models/benchmark_targets.yaml:
-      symlink_escape: [fails_open]
-    success_criteria.yaml:
-      symlink_escape: [fails_open]
   pipeline:
     models/pipeline.yaml:
       bad_date: [raises]

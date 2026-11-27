@@ -849,14 +849,31 @@ def after_write_item(b: dict) -> bool:
             or str(b.get("category") or "").upper() == "PRESENTATION")
 
 
+_SCOPED_CRITICS = ("critique-domain", "critique-presentation", "critique-redteam", "critique-methods")
+
+
+def _brief_scope_filter(critiques: dict, run_dir: str) -> set[str]:
+    try:
+        with open(os.path.join(run_dir, "decision_brief.signoff.json"), encoding="utf-8") as f:
+            if not isinstance(json.load(f), dict):
+                return set()
+    except (OSError, ValueError):
+        return set()
+    out: set[str] = set()
+    for reviewer, doc in (critiques or {}).items():
+        if reviewer in _SCOPED_CRITICS:
+            for b in (doc or {}).get("blockers") or []:
+                if (isinstance(b, dict) and b.get("severity") in ("HIGH", "MEDIUM")
+                        and b.get("resolved") is not True
+                        and str(b.get("brief_item") or "").strip().upper() == "NONE"):
+                    out.add(str(b.get("id")))
+    return out
+
+
 def _apply_brief_scope(decision: dict, critiques: dict, run_dir: str,
                        max_rounds: int, current_round: int) -> dict:
-    """Phase 33 α: once the brief is signed, a critic finding the critic tied
-    to NONE (`brief_item: NONE`) neither blocks nor escalates; it is listed as
-    `outside_brief`, a note for the next run. Missing or unknown ties still
-    block (decision_brief.tie_findings)."""
-    import decision_brief
-    outside = decision_brief.scope_filter(critiques, run_dir)
+    """Once the brief is signed, a critic finding tied to NONE neither blocks nor escalates."""
+    outside = _brief_scope_filter(critiques, run_dir)
     if not outside:
         return decision
     decision["unresolved_high"] = [
@@ -1487,12 +1504,9 @@ def _run_self_test() -> int:
        f"got {dec_f3.get('blocker_attempts')}")
 
 
-    # BS2: once the decision brief is signed, untied HIGH leaves unresolved_high
+    # BS2: once the brief signoff exists, untied HIGH leaves unresolved_high
     with tempfile.TemporaryDirectory() as d:
-        import decision_brief as _db
-        yaml.safe_dump({"hard_blockers": [{"id": "HB-001"}]}, open(os.path.join(d, "success_criteria.yaml"), "w"))
-        yaml.safe_dump(_db.example_brief(), open(os.path.join(d, "decision_brief.yaml"), "w"))
-        _db.sign(d, "owner")
+        json.dump({"signed_by": "owner"}, open(os.path.join(d, "decision_brief.signoff.json"), "w"))
         crit = {"critique-redteam": {"blockers": [
             {"id": "R-003", "severity": "HIGH", "target_stage": "MODEL", "category": "METHODS",
              "first_seen_round": 5, "claim": "untied", "resolved": False, "brief_item": "NONE"},

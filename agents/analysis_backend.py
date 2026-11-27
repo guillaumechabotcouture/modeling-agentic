@@ -931,15 +931,12 @@ def _self_test_benchmark_gate(ok) -> None:
             run3 = os.path.join(d, "run3")
             os.makedirs(run3)
             schema.toy_spec(run3, bench=rp)
-            from toolkit.spec import geometry as GEO
-            yaml.safe_dump({"hard_blockers": [{"id": "HB-001"}]}, open(os.path.join(run3, signoff.DB.CRITERIA), "w"))
-            yaml.safe_dump(signoff.DB.example_brief(), open(os.path.join(run3, signoff.DB.BRIEF), "w"))
-            GEO.toy_write_sheet(run3)
+            signoff.write_sheet(run3)
             try:
-                signoff.DB.sign(run3, "owner", accept_proposed=True)
-                ok(False, "G22 the brief's signing path refuses an engine that fails the benchmark precondition")
+                signoff.sign(run3, "owner")
+                ok(False, "G22 the signing path refuses an engine that fails the benchmark precondition")
             except ValueError as ex:
-                ok("T1" in str(ex), f"G22 the brief's signing path refuses an engine that fails the benchmark "
+                ok("T1" in str(ex), f"G22 the signing path refuses an engine that fails the benchmark "
                                     f"precondition ({str(ex)[:90]})")
             # review round 3: effective packages, departure shape on every signing path, engine auto candidates
             from toolkit.spec import preconditions as PC

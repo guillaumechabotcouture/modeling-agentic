@@ -658,9 +658,7 @@ def _settle_one(modname: str, run: str, round_n: int) -> dict:
 
 
 def _settle(base: str, modules: list, work: str, round_n: int) -> tuple[str, list]:
-    """Codex round 2: some checks create state the first time they see a run
-    (decision_brief writes acceptance_lock.json with the benchmark targets'
-    hash). A mutation seen first would be locked as it is and never reported.
+    """Codex round 2: some checks create state the first time they see a run.
     So every check runs on a copy of the base, in turn, until no file changes
     (at most 3 passes); that settled copy is the base every case starts from.
     The given base is not modified. Returns (settled dir, files created or
@@ -684,17 +682,13 @@ def _supplement(run_dir: str, round_n: int) -> None:
     (Codex round 1: a file-backed check with no mutation case is not tested).
     Each is the smallest valid input its producer would write:
       compute         a results file and its summary (two ok rows), as map_fn writes;
-      decision_brief  decision_brief.yaml (decision_brief.example_brief) signed with
-                      decision_brief.sign, so the sign-off, frozen copies and lock exist;
       pipeline        models/pipeline.yaml with one shell step;
-      stall_rule      validator_history.jsonl with the earlier rounds' gate records;
-      declaration_tests  scope_declaration.yaml with one declaration."""
+      scope_signoff   scope_declaration.yaml with one declaration."""
     w0 = os.path.join(run_dir, "scope_declaration.yaml")
     if not os.path.exists(w0):
         with open(w0, "w") as f:
             yaml.safe_dump({"declarations": [{"id": "SD-001", "blocker_id": "benchmark_drift",
                                               "why_unresolved": "gate_fuzz fixture"}]}, f)
-    import decision_brief as db
     w = lambda rel, txt: (os.makedirs(os.path.dirname(os.path.join(run_dir, rel)) or run_dir,  # noqa: E731
                                       exist_ok=True), open(os.path.join(run_dir, rel), "w").write(txt))
     rows = [{"key": f"k{i}", "ok": True, "params": {"i": i}, "value": float(i)} for i in range(2)]
@@ -702,10 +696,6 @@ def _supplement(run_dir: str, round_n: int) -> None:
     w("models/fuzz_results.jsonl.summary.json", json.dumps(
         {"fn": "models/model.py::outcome_fn", "n": 2, "n_ok": 2, "n_failed": 0, "task_core_s": 1.0,
          "wall_s": 1.0, "backend": "local", "workers": 1}))
-    if not os.path.exists(os.path.join(run_dir, db.BRIEF)):
-        w(db.BRIEF, yaml.safe_dump(db.example_brief(), sort_keys=False))
-    if not db.is_signed(run_dir):
-        db.sign(run_dir, "gate_fuzz", accept_proposed=True)
     w("models/pipeline.yaml", yaml.safe_dump({"steps": [
         {"id": "allocate", "run": "python3 models/model.py", "inputs": ["models/model.py"],
          "outputs": ["models/fuzz_pipeline_out.txt"]}]}, sort_keys=False))
@@ -1073,8 +1063,8 @@ def gate_findings(run_dir):
         return [{"kind": "a_invalid", "severity": "HIGH"}]
     return []
 ''',
-    # locks a.yaml's hash the first time it sees it (as decision_brief locks the
-    # benchmark targets): a corrupt file seen first would be locked as it is
+    # locks a.yaml's hash the first time it sees it: a corrupt file seen first
+    # would be locked as it is
     "gf_lock": '''
 import hashlib, json, os
 def gate_findings(run_dir):

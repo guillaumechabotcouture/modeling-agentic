@@ -1438,11 +1438,10 @@ def sign_side(label, answers_yaml, note, run_name=None, expect_spec_sha256=None,
     if action is None and expect_spec_sha256:
         action = "spec"
     elif action is None:
-        # Phase 49 β: a pending scope sign-off (AWAIT_OWNER) is answered first; else the spec or the brief.
+        # Phase 49 β: a pending scope sign-off (AWAIT_OWNER) is answered first; else the spec.
         st = run([sys.executable, "scripts/scope_signoff.py", "status", rd], cwd=f"{WORK}/{label}",
                  env=env, capture_output=True, text=True).stdout.strip()
-        action = ("scope" if st == "awaiting" else "spec" if os.path.exists(os.path.join(rd, "run_state.json"))
-                  else "brief")
+        action = "scope" if st == "awaiting" else "spec"
     if action == "spec":
         if not expect_spec_sha256:
             return {"rc": 1, "out": "not signed: a spec is signed with the sha256 of the spec the owner read "
@@ -1459,8 +1458,7 @@ def sign_side(label, answers_yaml, note, run_name=None, expect_spec_sha256=None,
     os.write(fd, answers_yaml.encode())
     os.close(fd)
     try:
-        script = "scripts/scope_signoff.py" if action == "scope" else "scripts/decision_brief.py"
-        r = run([sys.executable, script, "sign", rd, "--by", "owner", "--answers", p, "--note", note],
+        r = run([sys.executable, "scripts/scope_signoff.py", "sign", rd, "--by", "owner", "--answers", p, "--note", note],
                 cwd=f"{WORK}/{label}", env=env, capture_output=True, text=True)
     finally:
         os.remove(p)

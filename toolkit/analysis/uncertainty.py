@@ -40,9 +40,12 @@ re-run took as long as the draws). Long per-draw loops log a progress line with 
 """
 from __future__ import annotations
 
+import math
 import os
 import sys
 import time
+from collections import Counter
+from statistics import mean, pstdev
 
 import numpy as np
 import yaml
@@ -252,10 +255,142 @@ def posterior_range_record(ne: dict) -> dict:
                 **({"exception": ne["exception"]} if ne.get("exception") else {}))
 
 
-def _pu():
-    sys.path.insert(0, os.path.join(ROOT, "scripts"))
-    import propagate_uncertainty
-    return propagate_uncertainty
+def parameter_summary(per_param_samples: dict) -> dict:
+    """The report's `parameter_samples:` block (mean, std, 2.5% / 97.5% order statistics)."""
+    out = {}
+    for name, samples in per_param_samples.items():
+        samples_sorted = sorted(samples)
+        n = len(samples_sorted)
+        if not n:
+            continue
+        out[name] = {
+            "mean": float(mean(samples)),
+            "std": float(pstdev(samples)) if n > 1 else 0.0,
+            "ci_low": float(samples_sorted[int(0.025 * n)]),
+            "ci_high": float(samples_sorted[min(n - 1, int(0.975 * n))]),
+        }
+    return out
+
+
+RARE_EVENT_ZERO_FRACTION = 0.5
+
+
+def rare_event_summary(vals: list[float]) -> dict:
+    """p_nonzero, its binomial standard error and the conditional mean for a zero-inflated output."""
+    n = len(vals)
+    nonzero = [v for v in vals if v != 0.0]
+    if not n or not nonzero or (n - len(nonzero)) / n < RARE_EVENT_ZERO_FRACTION:
+        return {}
+    p = len(nonzero) / n
+    return {"rare_event": True,
+            "p_nonzero": p,
+            "p_nonzero_se": math.sqrt(p * (1.0 - p) / n),
+            "mean_if_nonzero": float(mean(nonzero))}
+
+
+def interval_quantiles(level: float = 0.95) -> tuple[float, float]:
+    """Lower and upper quantiles of a central interval."""
+    if level == 0.95:
+        return 0.025, 0.975
+    if not 0.5 <= float(level) < 1:
+        raise ValueError(f"interval level {level!r} must be in [0.5, 1)")
+    a = round((1.0 - float(level)) / 2.0, 12)
+    return a, round(1.0 - a, 12)
+
+
+def summarise_outputs(outs: list, per_param_samples: dict, n_draws: int, level: float = 0.95,
+                      summary=None) -> dict:
+    """Aggregate per-draw outcome dicts into scalar_outputs, categorical_outputs, parameter_samples."""
+    qlo, qhi = interval_quantiles(level)
+    errors: list[dict] = []
+    scalar_results: dict[str, list[float]] = {}
+    categorical_results: dict[str, list[str]] = {}
+    n_nonfinite: dict[str, int] = {}
+    for i, out in enumerate(outs):
+        if isinstance(out, dict) and "_error" in out:
+            errors.append(out["_error"])
+            continue
+        if not isinstance(out, dict):
+            errors.append({"draw": i, "exception": "TypeError",
+                           "message": f"outcome_fn must return dict, "
+                                      f"got {type(out).__name__}"})
+            continue
+        for key, val in out.items():
+            if isinstance(val, bool):
+                categorical_results.setdefault(key, []).append(str(val))
+            elif isinstance(val, (int, float)):
+                if math.isfinite(val):
+                    scalar_results.setdefault(key, []).append(float(val))
+                else:
+                    n_nonfinite[key] = n_nonfinite.get(key, 0) + 1
+            elif isinstance(val, str):
+                categorical_results.setdefault(key, []).append(val)
+
+    if errors and len(errors) / max(1, n_draws) > 0.2:
+        raise RuntimeError(
+            f"outcome_fn errors on >20% of draws "
+            f"({len(errors)}/{n_draws}). Last error: "
+            f"{errors[-1]}. Aborting."
+        )
+
+    parameter_samples = parameter_summary(per_param_samples)
+    varied_params = [n for n, ps in parameter_samples.items() if ps["std"] > 0]
+
+    scalar_summary = {}
+    degenerate_outputs: list[str] = []
+    for key, vals in scalar_results.items():
+        if not vals:
+            continue
+        vals_sorted = sorted(vals)
+        n = len(vals_sorted)
+        if summary is not None:
+            est = summary(vals, level)
+            entry = {k: float(est[k]) for k in ("mean", "median", "ci_low", "ci_high")}
+        else:
+            entry = {
+                "mean": float(mean(vals)),
+                "median": float(vals_sorted[n // 2]),
+                "ci_low": float(vals_sorted[int(qlo * n)]),
+                "ci_high": float(vals_sorted[min(n - 1, int(qhi * n))]),
+            }
+        entry.update(n=n, n_nonfinite=n_nonfinite.get(key, 0))
+        entry.update(rare_event_summary(vals))
+        scale = max(abs(entry["mean"]), 1e-300)
+        if n > 1 and (vals_sorted[-1] - vals_sorted[0]) / scale < 1e-12:
+            entry["degenerate"] = True
+            entry["degenerate_diagnostic"] = (
+                "every draw produced the same value although "
+                f"{len(varied_params)} sampled parameter(s) varied — "
+                "outcome_fn likely ignores its `params` argument (e.g. reads "
+                "module-level constants or a cached result)"
+                if varied_params else
+                "every draw produced the same value AND no sampled parameter "
+                "varied — the registry priors have zero width or the sampler "
+                "returned constants")
+            degenerate_outputs.append(key)
+        scalar_summary[key] = entry
+    for key, cnt in n_nonfinite.items():
+        if key not in scalar_summary:
+            scalar_summary[key] = {"n": 0, "n_nonfinite": cnt,
+                                   "degenerate": True,
+                                   "degenerate_diagnostic":
+                                       "all draws were NaN/inf"}
+            degenerate_outputs.append(key)
+
+    categorical_summary = {}
+    for key, vals in categorical_results.items():
+        counts = Counter(vals)
+        dominant, dominant_n = counts.most_common(1)[0]
+        categorical_summary[key] = {
+            "counts": dict(counts),
+            "dominant": dominant,
+            "dominance": dominant_n / len(vals),
+            "n": len(vals),
+        }
+
+    return {"errors": errors, "scalar_outputs": scalar_summary, "categorical_outputs": categorical_summary,
+            "parameter_samples": parameter_samples, "degenerate_outputs": degenerate_outputs,
+            "varied_params": varied_params}
 
 
 class Drawer:
@@ -780,7 +915,7 @@ def run(A, plan, headline_name: str, draws=None, seed=None, pre=None, on_draw=No
     if flagged:        # calibration.joint.unmatched: flag: these units' values carry no calibrated match
         data["low_confidence_units"] = flagged
     from toolkit.analysis.core import q as _q     # hb1 fix 11 (L): one estimator for this report and uncertainty.yaml
-    agg = _pu().summarise_outputs(outs, samples, nd, level=scope["level"], summary=_q)   # signed level (Codex P1-11)
+    agg = summarise_outputs(outs, samples, nd, level=scope["level"], summary=_q)   # signed level (Codex P1-11)
     report = {"producer": PRODUCER, "produced_by": "harness", "n_draws": nd, "n_draws_requested": nd,
               "n_successful": nd - len(agg["errors"]), "n_failed": len(agg["errors"]), "seed": data["seed"],
               "interval_label": scope["label"], "interval": scope["interval"], "covers": scope["covers"],
@@ -861,7 +996,7 @@ def _self_test() -> int:
     # extremes, and gives numpy's values on ordinary draws
     import math
     from toolkit.analysis.core import q as _q
-    big = _pu().summarise_outputs([{"y": 9e307}, {"y": 1e308}], {}, 2, summary=_q)["scalar_outputs"]["y"]
+    big = summarise_outputs([{"y": 9e307}, {"y": 1e308}], {}, 2, summary=_q)["scalar_outputs"]["y"]
     ok(all(math.isfinite(big[k]) for k in ("mean", "median")) and abs(big["mean"] / 9.5e307 - 1) < 1e-12
        and abs(big["median"] / 9.5e307 - 1) < 1e-12 and not big.get("degenerate"),
        f"UQE1 draws near the largest float: finite mean and median, not flagged constant ({big})")

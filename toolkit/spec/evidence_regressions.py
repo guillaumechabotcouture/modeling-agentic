@@ -166,14 +166,6 @@ def p_signoff(d):
     return _refusal(lambda: SO.sign(d, "owner", note="n"))
 
 
-def p_brief_fixture(d):
-    import decision_brief as DB
-    import yaml
-    yaml.safe_dump(DB.example_brief(), open(os.path.join(d, DB.BRIEF), "w"))
-    yaml.safe_dump({"hard_blockers": [{"id": "HB-001", "text": "t"}]}, open(os.path.join(d, DB.CRITERIA), "w"))
-    return _refusal(lambda: DB.sign(d, "owner", note="n"))
-
-
 def p_stage(d):
     from agents import stage_machine as SM
     return _refusal(lambda: SM.sign(d, "owner", "n"))
@@ -278,7 +270,7 @@ def p_relaunch_fixture(d):
             sys.modules["results_store"] = saved_rs
 
 
-PRE_PATHS = {"signoff.sign": p_signoff, "decision_brief.sign": p_brief_fixture, "stage_machine.sign": p_stage,
+PRE_PATHS = {"signoff.sign": p_signoff, "stage_machine.sign": p_stage,
              "launch at SIGN": p_launch_sign}
 POST_PATHS = {"signoff.status": p_status, "launch past SIGN": p_launch_past, "relaunch": p_relaunch_fixture,
               "Machine.run (resume past ENGINE_CHOICE)": p_resume}

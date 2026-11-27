@@ -1,53 +1,14 @@
 #!/usr/bin/env python3
-"""
-Phase 21 β — claims-ledger provenance check.
-
-Phase 18 α made the writer bind every number to `models/claims_ledger.yaml`,
-but nothing verified that the ledger itself matched the artifacts it cites.
-In 2026-05-03_235631 the ledger claimed a DALY mean of 1,806,250 with a 95%
-CI of 749,219–2,900,144 sourced from `uncertainty_report.yaml`, while that
-file recorded mean = ci_low = ci_high = 1,769,757 (a zero-width interval).
-The report rendered the ledger faithfully — so every downstream gate saw a
-perfectly "bound" headline number that its own source contradicted.
-
-This module resolves each claim's `source_artifact` + `source_field` and
-compares the resolved value (and CI) to the ledger:
-
-  claim_source_unresolved  HIGH  artifact missing, or field cannot be resolved
-  claim_source_mismatch    HIGH  resolved value differs from ledger value
-  claim_value_not_in_source HIGH field unresolvable and the value appears
-                                nowhere in the cited artifact
-  claim_ci_unsourced       HIGH  ledger carries a CI with no resolvable CI source
-  claim_ci_mismatch        HIGH  ledger CI differs from the source CI
-
-None are scope-declarable: the fix (point the claim at the artifact that
-actually holds the number, or correct the number) is always available.
+"""Claims-ledger provenance resolver (used by `scripts/build_claims_ledger.py`).
 
 Resolvable sources (generic — no disease or domain knowledge):
   *.yaml / *.yml / *.json   dot path with optional list indices:
                             `scalar_outputs.total_cost.mean`, `folds[0].rmse`
-                            A path resolving to a mapping uses its
-                            mean/value/median/point key for the value and
-                            ci_low/ci_high (or ci_95: [lo, hi]) for the CI.
-                            If the path ends in mean/median/value/point, the
-                            sibling ci_low/ci_high keys supply the CI.
-                            An explicit `ci_source_field` (same grammar)
-                            overrides both.
   *.csv                     `<column>.<agg>()` with agg in sum, mean, median,
-                            min, max, count, nunique; or `len()` / `count()`
-                            for the row count. One optional equality row
-                            filter: `cost.sum() where group='A'` or
-                            `filter group='A'.cost.sum()`.
+                            min, max, count, nunique; or `len()` / `count()`.
   *.py                      a module-level constant name assigned a literal.
 
-Non-resolvable sources are skipped and counted, not failed: `external`,
-`literature`, and prose documents (*.md, *.txt, *.pdf, *.bib, *.docx).
-Literature values are checked by the effect-size registry and red-team,
-not here. A model output must cite a machine-readable artifact; a derived
-number (ratio, difference) must be written to an artifact first.
-
 Usage:
-    python3 scripts/lib/provenance.py <run_dir>     # prints findings
     python3 scripts/lib/provenance.py --self-test
 """
 
@@ -150,40 +111,6 @@ def resolve_dotpath(doc: Any, path: str) -> Any:
         cur = cur[next(x for x in cur if str(x) == k)]
         rest = rest[len(k):]
     return cur
-
-
-def _numeric_leaves(x: Any, out: list) -> list:
-    if isinstance(x, dict):
-        for v in x.values():
-            _numeric_leaves(v, out)
-    elif isinstance(x, (list, tuple)):
-        for v in x:
-            _numeric_leaves(v, out)
-    elif _num(x) is not None:
-        out.append(_num(x))
-    return out
-
-
-def value_in_artifact(path: str, value: Any, claim_kind: str = "",
-                      rel_tol: float = DEFAULT_REL_TOL) -> Optional[bool]:
-    """Does the claimed number appear anywhere in the artifact? None when
-    the value isn't numeric or the file can't be scanned."""
-    if _num(value) is None:
-        return None
-    ext = os.path.splitext(path)[1].lower()
-    try:
-        if os.path.getsize(path) > 50 * 1024 * 1024:
-            return None
-        if ext in (".yaml", ".yml", ".json"):
-            nums = _numeric_leaves(_load_structured(path), [])
-        elif ext == ".csv":
-            with open(path, encoding="utf-8", newline="") as f:
-                nums = [n for row in csv.reader(f) for n in map(_num, row) if n is not None]
-        else:
-            return None
-    except (OSError, UnicodeDecodeError, yaml.YAMLError, ValueError, csv.Error):
-        return None
-    return any(values_match(value, n, claim_kind, rel_tol) for n in nums)
 
 
 def _load_structured(path: str) -> Any:
@@ -363,10 +290,6 @@ def values_match(claimed: Any, resolved: Any, claim_kind: str = "",
 # Main entry
 # --------------------------------------------------------------------------- #
 
-def _f(kind: str, claim: str) -> dict:
-    return {"kind": kind, "severity": "HIGH", "stage": "ANALYZE",
-            "claim": claim, "scope_declarable": False}
-
 
 class ClaimUnresolved(Exception):
     """A claim's source cannot be resolved. `path` is the artifact when it
@@ -433,80 +356,6 @@ def resolve_claim(c: dict, run_dir: str, cache: Optional[dict] = None
     return point, ci
 
 
-def check_ledger_provenance(ledger: Any, run_dir: str,
-                            rel_tol: float = DEFAULT_REL_TOL,
-                            abs_tol: float = DEFAULT_ABS_TOL) -> dict:
-    """Verify every ledger claim against its cited artifact.
-
-    `ledger` is the parsed YAML document ({"claims": [...]}) or a list of
-    claim dicts. Returns {"findings": [...], "n_checked": int,
-    "n_external": int, "n_total": int}.
-    """
-    claims = ledger.get("claims") if isinstance(ledger, dict) else ledger
-    findings: list[dict] = []
-    n_checked = n_external = 0
-    if not isinstance(claims, list):
-        return {"findings": [_f("claim_source_unresolved",
-                                "claims_ledger.yaml has no `claims:` list")],
-                "n_checked": 0, "n_external": 0, "n_total": 0}
-    cache: dict[str, Any] = {}
-
-    for c in claims:
-        if not isinstance(c, dict):
-            continue
-        cid = c.get("id", "<no id>")
-        src = c.get("source_artifact")
-        field = c.get("source_field")
-        kind = str(c.get("claim_kind") or "")
-        if is_external(src):
-            n_external += 1
-            continue
-        try:
-            point, ci = resolve_claim(c, run_dir, cache)
-        except ClaimUnresolved as e:
-            # The path can't be followed, but the number can still be looked
-            # for: a value absent from its whole cited artifact is a
-            # mismatch, not just an unverifiable claim.
-            found = value_in_artifact(e.path, c.get("value"), kind, rel_tol) if e.path else None
-            if found is False:
-                findings.append(_f(
-                    "claim_value_not_in_source",
-                    f"[{cid}] ledger value {c.get('value')!r} appears nowhere in "
-                    f"`{src}` ({e}). Correct the value or cite the artifact that "
-                    f"holds it."))
-            else:
-                findings.append(_f("claim_source_unresolved", f"[{cid}] {e}"))
-            continue
-
-        n_checked += 1
-        if not values_match(c.get("value"), point, kind, rel_tol, abs_tol):
-            findings.append(_f(
-                "claim_source_mismatch",
-                f"[{cid}] ledger value {c.get('value')!r} does not match "
-                f"`{src}::{field}` = {point!r} (rel_tol {rel_tol:g})."))
-
-        lo, hi = c.get("ci_low"), c.get("ci_high")
-        if lo is None and hi is None:
-            continue
-        if ci is None:
-            findings.append(_f(
-                "claim_ci_unsourced",
-                f"[{cid}] ledger carries a CI [{lo}, {hi}] but `{src}::"
-                f"{field}` has no ci_low/ci_high to verify it against. Cite "
-                f"the uncertainty artifact (ci_source_field) or drop the CI."))
-            continue
-        for label, claimed, src_v in (("ci_low", lo, ci[0]),
-                                      ("ci_high", hi, ci[1])):
-            if not values_match(claimed, src_v, kind, rel_tol, abs_tol):
-                findings.append(_f(
-                    "claim_ci_mismatch",
-                    f"[{cid}] ledger {label} {claimed!r} does not match "
-                    f"source {label} {src_v!r} (`{src}::{field}`)."))
-
-    return {"findings": findings, "n_checked": n_checked,
-            "n_external": n_external, "n_total": len(claims)}
-
-
 # --------------------------------------------------------------------------- #
 # Self-test
 # --------------------------------------------------------------------------- #
@@ -519,9 +368,6 @@ def _self_test() -> int:
     def ok(cond: bool, label: str) -> None:
         if not cond:
             failures.append(label)
-
-    def kinds(res: dict) -> list[str]:
-        return [f["kind"] for f in res["findings"]]
 
     with tempfile.TemporaryDirectory() as d:
         os.makedirs(os.path.join(d, "models"))
@@ -539,158 +385,67 @@ def _self_test() -> int:
             yaml.safe_dump({"verdict": "SENSITIVE",
                             "folds": [{"rmse": 0.1}, {"rmse": 0.2}]}, f)
 
-        def run(*claims):
-            return check_ledger_provenance({"claims": list(claims)}, d)
+        # P2/P3: dotpath leaf + mapping node with sibling CI
+        pt, ci = resolve_claim({"source_artifact": "uncertainty_report.yaml",
+                                "source_field": "scalar_outputs.total_cost.mean"}, d)
+        ok(values_match(3.2e8, pt, "currency") and ci == (3.0e8, 3.4e8), f"P2 dotpath + CI: {(pt, ci)}")
+        pt_m, ci_m = resolve_claim({"source_artifact": "uncertainty_report.yaml",
+                                    "source_field": "scalar_outputs.total_cost"}, d)
+        ok(values_match(321000000, pt_m, "currency") and ci_m == (3.0e8, 3.4e8), f"P3 mapping node: {(pt_m, ci_m)}")
 
-        # P1: the 235631 class — ledger mean/CI contradict the UQ artifact.
-        r = run({"id": "c1", "claim_kind": "scalar", "value": 1806250,
-                 "ci_low": 749219, "ci_high": 2900144,
-                 "source_artifact": "uncertainty_report.yaml",
-                 "source_field": "scalar_outputs.total_outcome.mean"})
-        ok("claim_source_mismatch" in kinds(r), "P1 value mismatch fires")
-        ok(kinds(r).count("claim_ci_mismatch") == 2, "P1b both CI bounds fire")
-
-        # P2: matching value + CI via sibling keys → clean.
-        r = run({"id": "c2", "claim_kind": "currency", "value": 3.2e8,
-                 "ci_low": 3.0e8, "ci_high": 3.4e8,
-                 "source_artifact": "uncertainty_report.yaml",
-                 "source_field": "scalar_outputs.total_cost.mean"})
-        ok(kinds(r) == [], f"P2 matching claim is clean ({kinds(r)})")
-
-        # P3: path to mapping uses its mean + CI.
-        r = run({"id": "c3", "claim_kind": "currency", "value": 321000000,
-                 "ci_low": 3.0e8, "ci_high": 3.4e8,
-                 "source_artifact": "uncertainty_report.yaml",
-                 "source_field": "scalar_outputs.total_cost"})
-        ok(kinds(r) == [], f"P3 mapping node + rounding tolerance ({kinds(r)})")
-
-        # P4: free-text source_field, value present in the file → unresolved.
-        r = run({"id": "c4", "claim_kind": "scalar", "value": 0.2,
-                 "source_artifact": "models/sens.yaml",
-                 "source_field": "zone-level Pearson correlation"})
-        ok(kinds(r) == ["claim_source_unresolved"], f"P4 prose field unresolved ({kinds(r)})")
-        # P4b: free-text field, value nowhere in the file → not-in-source.
-        r = run({"id": "c4b", "claim_kind": "scalar", "value": 0.37,
-                 "source_artifact": "models/sens.yaml",
-                 "source_field": "zone-level Pearson correlation"})
-        ok(kinds(r) == ["claim_value_not_in_source"], f"P4b value absent from source ({kinds(r)})")
-        # P4d (Codex review): no basename fallback across unrelated directories.
+        # P4d: no basename fallback across unrelated directories
         os.makedirs(os.path.join(d, "data"), exist_ok=True)
-        r = run({"id": "c4f", "claim_kind": "label", "value": "SENSITIVE",
-                 "source_artifact": "data/sens.yaml", "source_field": "verdict"})
-        ok(kinds(r) == ["claim_source_unresolved"], f"P4d data/ path not aliased to models/ ({kinds(r)})")
-        # P4c: keys with dots and [key=value] selectors resolve (E5 ledger plants).
+        try:
+            resolve_claim({"source_artifact": "data/sens.yaml", "source_field": "verdict"}, d)
+            ok(False, "P4d data/ path must not alias to models/")
+        except ClaimUnresolved:
+            ok(True, "P4d")
+
+        # P4c: dotted keys + [key=value] selectors
         with open(os.path.join(d, "models", "scen.yaml"), "w") as f:
             yaml.safe_dump({"cost_3.60": {"n_changed": 248},
                             "results": [{"id": "a", "observed": 47.1}, {"id": "b", "observed": 9}]}, f)
-        r = run({"id": "c4c", "value": 340, "source_artifact": "models/scen.yaml",
-                 "source_field": "cost_3.60.n_changed"},
-                {"id": "c4d", "value": 47.1, "source_artifact": "models/scen.yaml",
-                 "source_field": "results[id=a].observed"},
-                {"id": "c4e", "value": 9, "source_artifact": "models/scen.yaml",
-                 "source_field": "results[id='b'].observed"})
-        ok(kinds(r) == ["claim_source_mismatch"] and "c4c" in r["findings"][0]["claim"],
-           f"P4c dotted key + selectors resolve ({kinds(r)})")
+        ok(resolve_claim({"source_artifact": "models/scen.yaml", "source_field": "cost_3.60.n_changed"}, d)[0] == 248, "P4c dotted key")
+        ok(resolve_claim({"source_artifact": "models/scen.yaml", "source_field": "results[id=a].observed"}, d)[0] == 47.1, "P4c selector")
+        ok(resolve_claim({"source_artifact": "models/scen.yaml", "source_field": "results[id='b'].observed"}, d)[0] == 9, "P4c quoted selector")
 
-        # P5: missing artifact → unresolved.
-        r = run({"id": "c5", "claim_kind": "scalar", "value": 1,
-                 "source_artifact": "models/nope.yaml", "source_field": "x"})
-        ok(kinds(r) == ["claim_source_unresolved"], "P5 missing artifact")
+        # P5: missing artifact raises ClaimUnresolved
+        try:
+            resolve_claim({"source_artifact": "models/nope.yaml", "source_field": "x"}, d)
+            ok(False, "P5 missing artifact")
+        except ClaimUnresolved:
+            ok(True, "P5")
 
-        # P6: CSV aggregations (empty cell skipped).
-        r = run({"id": "c6", "claim_kind": "currency", "value": 300,
-                 "source_artifact": "models/allocation.csv",
-                 "source_field": "cost.sum()"},
-                {"id": "c6b", "claim_kind": "count", "value": 3,
-                 "source_artifact": "models/allocation.csv",
-                 "source_field": "len()"},
-                {"id": "c6c", "claim_kind": "scalar", "value": 99,
-                 "source_artifact": "models/allocation.csv",
-                 "source_field": "outcome.sum()"})
-        ok(kinds(r) == ["claim_source_mismatch"],
-           f"P6 CSV sum/len resolve; wrong sum fires ({kinds(r)})")
-        r = run({"id": "c6d", "claim_kind": "currency", "value": 200,
-                 "source_artifact": "models/allocation.csv",
-                 "source_field": "filter unit='B'.cost.sum()"},
-                {"id": "c6e", "claim_kind": "scalar", "value": 5,
-                 "source_artifact": "models/allocation.csv",
-                 "source_field": "outcome.sum() where unit=A"},
-                {"id": "c6f", "claim_kind": "scalar", "value": 1,
-                 "source_artifact": "models/allocation.csv",
-                 "source_field": "outcome.sum() where nocol=A"})
-        ok(kinds(r) == ["claim_source_unresolved"],
-           f"P6b CSV row filters (prefix/suffix; bad column) ({kinds(r)})")
+        # P6/P6b: CSV aggregations and filters
+        ok(resolve_claim({"source_artifact": "models/allocation.csv", "source_field": "cost.sum()"}, d)[0] == 300.0, "P6 sum")
+        ok(resolve_claim({"source_artifact": "models/allocation.csv", "source_field": "len()"}, d)[0] == 3.0, "P6 len")
+        ok(resolve_claim({"source_artifact": "models/allocation.csv", "source_field": "filter unit='B'.cost.sum()"}, d)[0] == 200.0, "P6b prefix")
+        ok(resolve_claim({"source_artifact": "models/allocation.csv", "source_field": "outcome.sum() where unit=A"}, d)[0] == 5.0, "P6b suffix")
+        try:
+            resolve_claim({"source_artifact": "models/allocation.csv", "source_field": "outcome.sum() where nocol=A"}, d)
+            ok(False, "P6b bad filter column")
+        except ClaimUnresolved:
+            ok(True, "P6b bad col")
 
-        # P7: CSV with CI but no CI source → unsourced.
-        r = run({"id": "c7", "claim_kind": "scalar", "value": 13,
-                 "ci_low": 5, "ci_high": 20,
-                 "source_artifact": "models/allocation.csv",
-                 "source_field": "outcome.sum()"})
-        ok(kinds(r) == ["claim_ci_unsourced"], f"P7 CI unsourced ({kinds(r)})")
+        # P8: Python constants; non-literal expression rejected
+        ok(resolve_claim({"source_artifact": "models/params.py", "source_field": "UNIT_COST"}, d)[0] == 2.5, "P8 const")
+        ok(resolve_claim({"source_artifact": "models/params.py", "source_field": "RATE"}, d)[0] == 0.3, "P8 annconst")
+        try:
+            resolve_claim({"source_artifact": "models/params.py", "source_field": "DERIVED"}, d)
+            ok(False, "P8 non-literal expression")
+        except ClaimUnresolved:
+            ok(True, "P8 non-literal")
 
-        # P8: Python constant; non-literal → unresolved.
-        r = run({"id": "c8", "claim_kind": "currency", "value": 2.5,
-                 "source_artifact": "models/params.py",
-                 "source_field": "UNIT_COST"},
-                {"id": "c8b", "claim_kind": "scalar", "value": 0.3,
-                 "source_artifact": "models/params.py",
-                 "source_field": "RATE"},
-                {"id": "c8c", "claim_kind": "scalar", "value": 5,
-                 "source_artifact": "models/params.py",
-                 "source_field": "DERIVED"})
-        ok(kinds(r) == ["claim_source_unresolved"],
-           f"P8 py constants resolve; expression rejected ({kinds(r)})")
-
-        # P9: labels compare case/underscore-insensitively.
-        r = run({"id": "c9", "claim_kind": "label", "value": "sensitive",
-                 "source_artifact": "models/sens.yaml",
-                 "source_field": "verdict"},
-                {"id": "c9b", "claim_kind": "label", "value": "ROBUST",
-                 "source_artifact": "models/sens.yaml",
-                 "source_field": "verdict"})
-        ok(kinds(r) == ["claim_source_mismatch"],
-           f"P9 label match + ROBUST-vs-SENSITIVE mismatch ({kinds(r)})")
-
-        # P10: list index path.
-        r = run({"id": "c10", "claim_kind": "scalar", "value": 0.2,
-                 "source_artifact": "models/sens.yaml",
-                 "source_field": "folds[1].rmse"})
-        ok(kinds(r) == [], f"P10 list index ({kinds(r)})")
-
-        # P11: external / prose sources skipped and counted.
-        r = run({"id": "c11", "claim_kind": "scalar", "value": 0.5,
-                 "source_artifact": "external", "source_field": "Smith 2020"},
-                {"id": "c11b", "claim_kind": "scalar", "value": 0.5,
-                 "source_artifact": "citations.md", "source_field": "x"})
-        ok(kinds(r) == [] and r["n_external"] == 2, "P11 external skipped")
-
-        # P12: percentage fraction/percent equivalence.
-        with open(os.path.join(d, "models", "share.yaml"), "w") as f:
-            yaml.safe_dump({"share": 0.25}, f)
-        r = run({"id": "c12", "claim_kind": "percentage", "value": 25,
-                 "source_artifact": "models/share.yaml",
-                 "source_field": "share"})
-        ok(kinds(r) == [], "P12 percent vs fraction")
-
-        # P13: explicit ci_source_field.
-        r = run({"id": "c13", "claim_kind": "scalar", "value": 13,
-                 "ci_low": 3.0e8, "ci_high": 3.4e8,
-                 "source_artifact": "uncertainty_report.yaml",
-                 "source_field": "n_draws",
-                 "ci_source_field": "scalar_outputs.total_cost"})
-        ok("claim_ci_unsourced" not in kinds(r) and
-           "claim_source_mismatch" in kinds(r),
-           f"P13 ci_source_field honored ({kinds(r)})")
-
-        # P14: no source at all → unresolved; non-list ledger → unresolved.
-        r = run({"id": "c14", "claim_kind": "scalar", "value": 1})
-        ok(kinds(r) == ["claim_source_unresolved"], "P14 no source")
-        r = check_ledger_provenance({"claims": "oops"}, d)
-        ok(kinds(r) == ["claim_source_unresolved"], "P14b non-list ledger")
-
-        ok(all(f["scope_declarable"] is False and f["severity"] == "HIGH"
-               for f in run({"id": "x", "value": 1}).get("findings")),
-           "P15 findings are HIGH + non-declarable")
+        # P9/P10/P11/P12/P13
+        pt9, _ = resolve_claim({"source_artifact": "models/sens.yaml", "source_field": "verdict"}, d)
+        ok(values_match("sensitive", pt9, "label") and not values_match("ROBUST", pt9, "label"), "P9 label match")
+        ok(resolve_claim({"source_artifact": "models/sens.yaml", "source_field": "folds[1].rmse"}, d)[0] == 0.2, "P10 list index")
+        ok(is_external("external") and is_external("citations.md") and not is_external("models/sens.yaml"), "P11 is_external")
+        ok(values_match(25, 0.25, "percentage") and values_match(0.25, 25, "percentage"), "P12 percent vs fraction")
+        pt13, ci13 = resolve_claim({"source_artifact": "uncertainty_report.yaml",
+                                    "source_field": "n_draws",
+                                    "ci_source_field": "scalar_outputs.total_cost"}, d)
+        ok(pt13 == 200 and ci13 == (3.0e8, 3.4e8), f"P13 ci_source_field: {(pt13, ci13)}")
 
     if failures:
         print("FAIL:", file=sys.stderr)
@@ -702,22 +457,10 @@ def _self_test() -> int:
 
 
 def main() -> int:
-    args = sys.argv[1:]
-    if "--self-test" in args:
+    if "--self-test" in sys.argv[1:]:
         return _self_test()
-    if len(args) != 1:
-        print(__doc__)
-        return 2
-    run_dir = args[0]
-    path = os.path.join(run_dir, "models", "claims_ledger.yaml")
-    with open(path, encoding="utf-8") as f:
-        ledger = yaml.safe_load(f)
-    res = check_ledger_provenance(ledger, run_dir)
-    for fnd in res["findings"]:
-        print(f"[{fnd['severity']}] {fnd['kind']}: {fnd['claim']}")
-    print(f"checked={res['n_checked']} external={res['n_external']} "
-          f"total={res['n_total']} findings={len(res['findings'])}")
-    return 1 if res["findings"] else 0
+    print("ERROR: provenance.py is a library module; pass --self-test to verify.", file=sys.stderr)
+    return 2
 
 
 if __name__ == "__main__":
