@@ -2414,7 +2414,7 @@ def _self_test() -> int:
                 sc = float(u.attributes["scale"])
                 vol = (0.5 * sc if self._wired else 10.0) if on else 0.0
                 out.append(Outcomes({"y": {"g0": 1.0 - 0.5 * on}}, {}, {"vol": vol},
-                                    meta={"param_reads": {"build": [], "read_outcomes": []}}))
+                                    meta={"age_shares": {"g0": 1.0}, "param_reads": {"build": [], "read_outcomes": []}}))
             return out
     th_cd = load_thresholds()
     a6_w, a7_w = check_a6_a7(_CdStub(True), b_cd, {}, np.random.default_rng(2), n_bases=3, min_moving=2, th=th_cd)
