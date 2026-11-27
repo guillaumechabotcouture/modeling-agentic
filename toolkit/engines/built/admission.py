@@ -181,9 +181,11 @@ def _default_horizon(spec_raw: Mapping, req: Mapping) -> Horizon:
 def _sample_attr(aspec: Mapping, rng: np.random.Generator, *, ref_vec=None, u_val: float | None = None):
     at = aspec.get("type")
     if at == "continuous":
-        lo, hi = aspec.get("range") or aspec.get("test_range") or [0.0, 1.0]
+        lo, hi = [float(x) for x in (aspec.get("range") or aspec.get("test_range") or [0.0, 1.0])]
         u = float(rng.random()) if u_val is None else float(u_val)
-        return float(lo) + u * (float(hi) - float(lo))
+        if lo > 0.0 and hi / lo >= 50.0:
+            return math.exp(math.log(lo) + u * (math.log(hi) - math.log(lo)))
+        return lo + u * (hi - lo)
     if at == "integer":
         lo, hi = aspec.get("range") or aspec.get("test_range") or [0, 10]
         return int(rng.integers(int(lo), int(hi) + 1))
@@ -205,6 +207,9 @@ def _domain_points_attr(aspec: Mapping, *, ref_vec=None) -> list:
     at = aspec.get("type")
     if at == "continuous":
         lo, hi = [float(x) for x in (aspec.get("range") or aspec.get("test_range") or [0.0, 1.0])]
+        if lo > 0.0 and hi / lo >= 50.0:
+            l0, l1 = math.log(lo), math.log(hi)
+            return [lo, math.exp(l0 + 0.33 * (l1 - l0)), math.exp(l0 + 0.67 * (l1 - l0)), hi]
         return [lo, lo + 0.33 * (hi - lo), lo + 0.67 * (hi - lo), hi]
     if at == "integer":
         lo, hi = [int(x) for x in (aspec.get("range") or aspec.get("test_range") or [0, 3])]
@@ -939,6 +944,23 @@ def check_a6_a7(cand: BCAND.CandidateEngine, build_decl: Mapping, spec_raw: Mapp
                     k_norm = "attribute" if it["kind"] == "unit_attribute" else "parameter"
                     input_to_comp[(k_norm, str(it["name"]))] = (cname, list(active_vals[:4]))
 
+    # Cost drivers are often zero under the all-absent package; map each declared cost driver to
+    # active modes of components whose expected_effects include it so scale/unit attributes moving
+    # cost drivers are evaluated under active intervention modes as well as the absent package.
+    declared_cost_drivers = set((req.get("outputs") or {}).get("cost_drivers") or [])
+    output_to_active_pkgs: dict[str, list[dict]] = {}
+    for cname, cs in sorted(comp_specs.items()):
+        c_eff = expected_effects.get(cname) or {}
+        active_vals = [v for v in (cs.get("values") or []) if v != cs.get("absent")]
+        if not active_vals:
+            continue
+        for oname in c_eff:
+            lst = output_to_active_pkgs.setdefault(str(oname), [])
+            for ov in active_vals[:4]:
+                pkg_d = dict(absent_pkg, **{cname: ov})
+                if pkg_d not in lst and len(lst) < 4:
+                    lst.append(pkg_d)
+
     # Generate base units (interior of domains)
     base_units = generate_domain_units(req, n_bases, rng, ref_units=ref_units)
     a6_probs: list[str] = []
@@ -972,6 +994,20 @@ def check_a6_a7(cand: BCAND.CandidateEngine, build_decl: Mapping, spec_raw: Mapp
         if (ikind, iname) in input_to_comp:
             oc, ovas = input_to_comp[(ikind, iname)]
             base_pkgs = [dict(absent_pkg, **{oc: ov}) for ov in ovas]
+        elif ikind != "component" and any(o in declared_cost_drivers for o in out_signs):
+            extra_pkgs: list[dict] = []
+            for oname in sorted(out_signs):
+                if oname in declared_cost_drivers:
+                    for pk_d in output_to_active_pkgs.get(oname, []):
+                        if pk_d not in extra_pkgs and len(extra_pkgs) < 4:
+                            extra_pkgs.append(pk_d)
+            if not extra_pkgs:
+                for cname, cs in sorted(comp_specs.items()):
+                    for ov in [v for v in (cs.get("values") or []) if v != cs.get("absent")][:4]:
+                        pk_d = dict(absent_pkg, **{cname: ov})
+                        if pk_d not in extra_pkgs and len(extra_pkgs) < 4:
+                            extra_pkgs.append(pk_d)
+            base_pkgs = [dict(absent_pkg), *extra_pkgs]
         else:
             base_pkgs = [dict(absent_pkg)]
         start_idx = len(all_cases)
@@ -2349,6 +2385,45 @@ def _self_test() -> int:
     ok(len(u_log) == 1 and abs(u_log[0].attributes["rate"] - math.exp(-4.0)) < 1e-12
        and len(u_lin) == 1 and abs(u_lin[0].attributes["rate"] - 0.2) < 1e-12 and unb_refused,
        f"BE_CAL_ATTR1 calibrated per-unit attribute gets prior midpoint in A1 real units while unbound non-calibrated fails")
+
+    # BE_A6_COST_LOG: multi-decade positive continuous attrs sample in log space; non-decision-input attrs
+    # affecting cost_drivers are evaluated under active component modes (wired passes, dead still fails).
+    log_mid = _sample_attr({"type": "continuous", "range": [0.0005, 0.5]}, np.random.default_rng(1), u_val=0.5)
+    lin_mid = _sample_attr({"type": "continuous", "range": [0.1, 1.0]}, np.random.default_rng(1), u_val=0.5)
+    log_pts = _domain_points_attr({"type": "continuous", "range": [0.0005, 0.5]})
+    b_cd = {
+        "id": "stub_cd", "kind": "closed_form",
+        "request": {
+            "components": {"act": {"values": [0, 1], "absent": 0}},
+            "unit_attributes": {"scale": {"type": "continuous", "test_range": [10.0, 10000.0]}},
+            "outputs": {"per_capita": ["y"], "windows": {}, "cost_drivers": ["vol"]},
+            "age_groups": ["g0"],
+            "parameters": [],
+            "expected_effects": {"act": {"y": "-", "vol": "+"}, "scale": {"vol": "+"}},
+            "stochastic": False,
+        },
+    }
+    class _CdStub:
+        kind = "closed_form"
+        def __init__(self, wired: bool):
+            self._wired = wired
+        def run_many(self, cases):
+            out = []
+            for _prm, u, pk, _h, _s in cases:
+                on = int(pk.components.get("act", 0))
+                sc = float(u.attributes["scale"])
+                vol = (0.5 * sc if self._wired else 10.0) if on else 0.0
+                out.append(Outcomes({"y": {"g0": 1.0 - 0.5 * on}}, {}, {"vol": vol},
+                                    meta={"age_shares": {"g0": 1.0}, "param_reads": {"build": [], "read_outcomes": []}}))
+            return out
+    th_cd = load_thresholds()
+    a6_w, a7_w = check_a6_a7(_CdStub(True), b_cd, {}, np.random.default_rng(2), n_bases=3, min_moving=2, th=th_cd)
+    a6_d, a7_d = check_a6_a7(_CdStub(False), b_cd, {}, np.random.default_rng(2), n_bases=3, min_moving=2, th=th_cd)
+    ok(abs(log_mid - math.sqrt(0.0005 * 0.5)) < 1e-12 and abs(lin_mid - 0.55) < 1e-12
+       and log_pts[1] < 0.01 and a6_w["status"] == "pass" and a7_w["status"] == "pass"
+       and a6_d["status"] == "fail" and a7_d["status"] == "fail",
+       f"BE_A6_COST_LOG log-space sampling for multi-decade attrs & active-mode A6 for cost_driver inputs "
+       f"(log_mid={log_mid:.5f}, wired={a6_w['status']}/{a7_w['status']}, dead={a6_d['status']}/{a7_d['status']})")
 
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
