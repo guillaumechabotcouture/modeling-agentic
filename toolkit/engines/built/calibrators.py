@@ -188,11 +188,22 @@ def calibrate_as_run(make_engine, data: Mapping, config: str | None = None, leve
     (`toolkit/analysis/core.py`: `posterior` -> `mode_start.fit_posterior_panel`, `likelihood` ->
     `calibration.fit_likelihood`, `emulator_inversion` -> `calibration.invert`, `joint` ->
     `joint_calibration.run`). Returns `{intervals, classes, likelihood_classes, ridges, method, raw}`."""
+    engine = make_engine(config) if callable(make_engine) else make_engine
+    prev_session = getattr(engine, "_use_session", None)
+    if prev_session is False:
+        engine._use_session = True
+    try:
+        return _calibrate_as_run_impl(engine, data, level=level, seed=seed, **decl)
+    finally:
+        if prev_session is False:
+            engine._use_session = prev_session
+
+
+def _calibrate_as_run_impl(engine, data: Mapping, *, level: float = 0.95, seed: int = 0, **decl) -> dict:
     from toolkit.analysis import calibration as C
     from toolkit.analysis import mode_start as MS
     from toolkit.spec import schema
 
-    engine = make_engine(config) if callable(make_engine) else make_engine
     spec_raw = copy.deepcopy(decl.get("spec_raw") or data.get("spec_raw"))
     if not isinstance(spec_raw, dict):
         raise ValueError("calibrate_as_run requires `spec_raw` (the signed spec mapping)")

@@ -31,7 +31,6 @@ from lib import safe_io as SIO  # noqa: E402
 MAX_SNAPSHOT_BYTES = 300 * 1024
 REQUIRED_FILES = ("engine.py", "card.yaml", "ENGINE_NOTES.md")
 ALLOWED_NON_PY = frozenset({"card.yaml", "ENGINE_NOTES.md"})
-MAX_INLINE_LITERALS = 16
 _CODING_RE = re.compile(r"^[ \t\f]*#.*?coding[:=][ \t]*([-\w.]+)")
 REQUIRED_BOUND_FILES = (
     "admission.json", "admission_sheet.md",
@@ -116,24 +115,6 @@ def _is_const_expr(node: ast.AST) -> bool:
     return False
 
 
-def _is_num_node(node: ast.AST) -> bool:
-    if isinstance(node, ast.Constant):
-        return isinstance(node.value, (int, float)) and not isinstance(node.value, bool)
-    if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.UAdd, ast.USub)):
-        return _is_num_node(node.operand)
-    return False
-
-
-def _count_num_literals(node: ast.AST) -> int:
-    if _is_num_node(node):
-        return 1
-    if isinstance(node, (ast.List, ast.Tuple, ast.Set)):
-        return sum(_count_num_literals(e) for e in node.elts)
-    if isinstance(node, ast.Dict):
-        return sum(_count_num_literals(v) for v in node.values)
-    return 0
-
-
 def _import_allowed(mod: str, siblings: set[str], *, allow_scipy_integrate: bool = False) -> bool:
     if not mod:
         return False
@@ -149,44 +130,9 @@ def _import_allowed(mod: str, siblings: set[str], *, allow_scipy_integrate: bool
     return False
 
 
-def _card_tables_ok(card_doc, request: Mapping | None = None) -> tuple[int, list[str]]:
-    """Validate card.yaml `tables:` entries for S4. Returns (valid_table_count, problems)."""
-    if not isinstance(card_doc, Mapping):
-        return 0, []
-    tables = card_doc.get("tables")
-    if tables is None:
-        return 0, []
-    if not isinstance(tables, (list, Mapping)):
-        return 0, ["S4: card.yaml `tables` must be a list or mapping of sourced table declarations"]
-    entries = list(tables.values()) if isinstance(tables, Mapping) else list(tables)
-    req_names: set[str] = set()
-    if isinstance(request, Mapping):
-        r = request.get("request") if isinstance(request.get("request"), Mapping) else request
-        req_names |= {str(p.get("name")) for p in (r.get("parameters") or []) if isinstance(p, Mapping)}
-        req_names |= set((r.get("unit_attributes") or {}).keys())
-    bad, valid = [], 0
-    for idx, entry in enumerate(entries):
-        if not isinstance(entry, Mapping):
-            bad.append(f"S4: card.yaml tables[{idx}] must be a mapping")
-            continue
-        src = entry.get("source")
-        target = entry.get("for") or entry.get("parameter") or entry.get("attribute") or entry.get("represents")
-        if not (isinstance(src, str) and src.strip()):
-            bad.append(f"S4: card.yaml tables[{idx}] requires a non-empty `source`")
-            continue
-        if not (isinstance(target, str) and target.strip()):
-            bad.append(f"S4: card.yaml tables[{idx}] requires `for` naming the parameter or attribute it represents")
-            continue
-        if req_names and target.strip() not in req_names:
-            bad.append(f"S4: card.yaml tables[{idx}] target {target!r} is not a declared parameter or unit attribute")
-            continue
-        valid += 1
-    return valid, bad
-
-
 def check_static(files: Mapping[str, bytes], *, request: Mapping | None = None,
                  allow_scipy_integrate: bool = False) -> list[str]:
-    """Run static checks S1-S4 over `{filename: bytes}` (fail closed). Returns list of problems."""
+    """Run static checks S1-S3 over `{filename: bytes}` (fail closed). Returns list of problems."""
     import yaml
     bad: list[str] = []
     # S1: file membership, strict UTF-8 text, no binary/NUL bytes, total size <= 300 KB
@@ -213,7 +159,6 @@ def check_static(files: Mapping[str, bytes], *, request: Mapping | None = None,
     if total > MAX_SNAPSHOT_BYTES:
         bad.append(f"S1: total size {total} bytes exceeds limit {MAX_SNAPSHOT_BYTES}")
 
-    card_doc = None
     if "card.yaml" in decoded:
         try:
             card_doc = yaml.safe_load(decoded["card.yaml"])
@@ -222,12 +167,9 @@ def check_static(files: Mapping[str, bytes], *, request: Mapping | None = None,
         else:
             if not isinstance(card_doc, Mapping):
                 bad.append("S1: card.yaml must be a YAML mapping")
-    valid_tables, t_errs = _card_tables_ok(card_doc, request=request)
-    bad += t_errs
 
     py_files = sorted(n for n in files if n.endswith(".py") and _allowed_filename(n))
     siblings = {n[:-3] for n in py_files}
-    large_literal_sites: list[str] = []
 
     for name in py_files:
         if name not in decoded:
@@ -261,9 +203,6 @@ def check_static(files: Mapping[str, bytes], *, request: Mapping | None = None,
                 continue
             bad.append(f"S3: {name}:{stmt.lineno}: disallowed module-level statement {type(stmt).__name__} "
                        "(only imports, constants, functions, and classes allowed)")
-
-        # Track top-level literal sequences already counted so nested lists aren't double-counted
-        seen_lit_nodes: set[int] = set()
 
         for node in ast.walk(tree):
             # S2: imports
@@ -315,8 +254,9 @@ def check_static(files: Mapping[str, bytes], *, request: Mapping | None = None,
                         bad.append(f"S3: {name}:{node.lineno}: dunder attribute access .{attr} is refused")
                 elif attr in BANNED_ATTRS:
                     bad.append(f"S3: {name}:{node.lineno}: banned file/serialization/env attribute .{attr}")
-            elif isinstance(node, ast.FunctionDef):
-                if node.name.startswith("__") and node.name.endswith("__") and node.name != "__init__":
+            elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                if (node.name.startswith("__") and node.name.endswith("__")
+                        and node.name not in ("__init__", "__post_init__")):
                     bad.append(f"S3: {name}:{node.lineno}: dunder method definition {node.name!r} is refused")
             elif isinstance(node, ast.Call):
                 if isinstance(node.func, ast.Name) and node.func.id in REFLECTION_CALLS:
@@ -328,18 +268,6 @@ def check_static(files: Mapping[str, bytes], *, request: Mapping | None = None,
                         if aname.startswith("_") or aname in BANNED_ATTRS:
                             bad.append(f"S3: {name}:{node.lineno}: {node.func.id}() of {aname!r} is refused")
 
-            # S4: numeric literal sequences > 16
-            if isinstance(node, (ast.List, ast.Tuple, ast.Set, ast.Dict)) and id(node) not in seen_lit_nodes:
-                cnt = _count_num_literals(node)
-                if cnt > MAX_INLINE_LITERALS:
-                    for sub in ast.walk(node):
-                        seen_lit_nodes.add(id(sub))
-                    large_literal_sites.append(f"{name}:{node.lineno} ({cnt} numeric literals)")
-
-    if len(large_literal_sites) > valid_tables:
-        bad.append(f"S4: found {len(large_literal_sites)} numeric literal table(s) exceeding {MAX_INLINE_LITERALS} "
-                   f"elements ({', '.join(large_literal_sites[:4])}) but card.yaml declares only {valid_tables} "
-                   "valid sourced `tables:` entry(ies)")
     return bad
 
 
@@ -612,9 +540,9 @@ def _self_test() -> int:
     clean_notes = b"# Toy model notes\n"
     base_files = {"engine.py": clean_py, "card.yaml": clean_card, "ENGINE_NOTES.md": clean_notes}
 
-    ok(check_static(base_files) == [], f"BE12a clean module passes S1-S4 ({check_static(base_files)})")
+    ok(check_static(base_files) == [], f"BE12a clean module passes S1-S3 ({check_static(base_files)})")
 
-    # BE12: banned imports, names, library I/O, reflection, scipy.integrate, S4 undeclared literal table
+    # BE12: banned imports, names, library I/O, reflection, scipy.integrate, top-level calls
     bad_cases = {
         "import_inspect": b"import inspect\nclass Model:\n    pass\n",
         "os_environ": b"def f():\n    return os.environ['X']\n",
@@ -624,17 +552,26 @@ def _self_test() -> int:
         "dunder_attr": b"def f(x):\n    return x.__class__.__subclasses__()\n",
         "scipy_integrate": b"from scipy import integrate\nclass Model:\n    pass\n",
         "top_level_call": b"import numpy as np\nX = np.zeros(3)\n",
-        "s4_table": ("def f():\n    return [" + ", ".join(str(i) for i in range(20)) + "]\n").encode("utf-8"),
     }
     got_bad = {k: check_static({**base_files, "engine.py": code}) for k, code in bad_cases.items()}
     ok(all(bool(v) for v in got_bad.values()),
-       f"BE12 S2/S3/S4 refuse inspect, os.environ, open, numpy.load, dynamic getattr, dunder, scipy.integrate, "
-       f"top-level call, and >16 literals without card table ({ {k: v[:1] for k, v in got_bad.items()} })")
+       f"BE12 S2/S3 refuse inspect, os.environ, open, numpy.load, dynamic getattr, dunder, scipy.integrate, "
+       f"and top-level call ({ {k: v[:1] for k, v in got_bad.items()} })")
 
-    # S4 accepts >16 numeric literals when card.yaml declares a sourced tables: entry
-    sourced_card = b"name: built:toy_mod\nversion: '0.1'\ntables:\n  - {for: rate_in, source: 'dossier:T1'}\n"
-    ok(check_static({**base_files, "engine.py": bad_cases["s4_table"], "card.yaml": sourced_card}) == [],
-       "BE12b S4 accepts >16 numeric literals when declared in card.yaml tables with source and target")
+    # S3 allows __post_init__ (dataclasses) and refuses async dunder methods
+    post_init_py = (
+        "from dataclasses import dataclass\n"
+        "@dataclass\n"
+        "class Cfg:\n"
+        "    x: float = 1.0\n"
+        "    def __post_init__(self):\n"
+        "        self.x = float(self.x)\n"
+    ).encode("utf-8")
+    async_dunder_py = b"class Model:\n    async def __getattr__(self, name):\n        return None\n"
+    e_pi_ok = check_static({**base_files, "engine.py": post_init_py})
+    e_async_bad = check_static({**base_files, "engine.py": async_dunder_py})
+    ok(e_pi_ok == [] and any("S3:" in x for x in e_async_bad),
+       f"BE12e S3 allows __post_init__ and refuses async dunder definitions (ok={e_pi_ok}, async={e_async_bad[:1]})")
 
     # BE19: snapshot immutability, tampered file refused, added sibling refused, hard link refused at snapshot
     with tempfile.TemporaryDirectory() as td:

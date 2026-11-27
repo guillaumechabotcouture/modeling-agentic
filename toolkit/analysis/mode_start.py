@@ -109,10 +109,53 @@ def _optimise(P, z0, maxiter: int = MAXITER, h: float = GRAD_H):
     return z0, float(f0), False
 
 
+def _z_of_x(P, x):
+    """Map a parameter vector `x` in natural space to `z = Phi^-1(F(x))` coordinates."""
+    from scipy import stats
+    from scipy.special import ndtri
+    u = []
+    for j, n in enumerate(P.names):
+        pr = P.priors[n]
+        val = float(x[j])
+        if pr.dist in ("uniform", "loguniform"):
+            lo, hi = pr.natural_support()
+            u.append((float(pr.natural(val)) - lo) / (hi - lo))
+        elif pr.dist == "beta":
+            u.append(float(stats.beta.cdf(val, pr.a, pr.b)))
+        elif pr.dist == "triangular":
+            c = (pr.mode - pr.lo) / (pr.hi - pr.lo)
+            u.append(float(stats.triang.cdf(val, c, loc=pr.lo, scale=pr.hi - pr.lo)))
+        else:
+            u.append(0.5)
+    return ndtri(np.clip(u, 1e-9, 1 - 1e-9))
+
+
+def map_point(P, start=None, maxiter: int = 500, h: float = 1e-4):
+    """Posterior mode in z = Phi^-1(F(x)) coordinates via batched central-difference L-BFGS-B
+    (2d + 1 points in one batch per gradient step, instead of 2d+1 scalar calls in calibration._map_point)."""
+    from scipy.optimize import minimize
+    d = len(P.names)
+    z0 = np.zeros(d) if start is None else _z_of_x(P, start)
+    offsets = np.vstack([np.zeros(d), h * np.eye(d), -h * np.eye(d)])
+
+    def fg(z):
+        f = _neg_log_post(P, z[None, :] + offsets)
+        if not np.isfinite(f[0]):
+            return 1e300, np.zeros(d)
+        if not np.all(np.isfinite(f)):
+            return float(f[0]), np.zeros(d)
+        return float(f[0]), (f[1:d + 1] - f[d + 1:]) / (2.0 * h)
+
+    r = minimize(fg, z0, jac=True, method="L-BFGS-B", options={"maxiter": int(maxiter)})
+    z_out = np.asarray(r.x, float) if np.all(np.isfinite(r.x)) else z0
+    conv = bool(r.success) and bool(np.isfinite(_neg_log_post(P, z_out[None, :])[0]))
+    return P.x_of_z(z_out[None, :])[0], conv, str(r.message)
+
+
 def _hessian(P, z, h: float = HESS_H):
     """Central finite-difference Hessian of the negative log posterior at z, or None when a point has no finite
-    likelihood. The off-diagonal terms are evaluated one row of pairs at a time (bounded memory); above HESS_FULL_MAX
-    parameters only the diagonal (2d + 1 points)."""
+    likelihood. Off-diagonal terms are batched into a single evaluation call; above HESS_FULL_MAX parameters only
+    the diagonal (2d + 1 points)."""
     z = np.asarray(z, float)
     d = len(z)
     E = h * np.eye(d)
@@ -121,15 +164,22 @@ def _hessian(P, z, h: float = HESS_H):
         return None
     f0 = f[0]
     H = np.diag((f[1:d + 1] - 2.0 * f0 + f[d + 1:]) / h ** 2)
-    if d > HESS_FULL_MAX:
+    if d > HESS_FULL_MAX or d < 2:
         return H
-    for i in range(d - 1):
-        ks = np.arange(i + 1, d)
-        pts = [z + si * E[i] + sk * E[ks] for si, sk in ((1.0, 1.0), (1.0, -1.0), (-1.0, 1.0), (-1.0, -1.0))]
-        g = _neg_log_post(P, np.vstack(pts)).reshape(4, len(ks))
-        if not np.all(np.isfinite(g)):
-            return None
-        H[i, ks] = H[ks, i] = (g[0] - g[1] - g[2] + g[3]) / (4.0 * h * h)
+    pairs = [(i, k) for i in range(d - 1) for k in range(i + 1, d)]
+    ii = np.array([p[0] for p in pairs], dtype=int)
+    kk = np.array([p[1] for p in pairs], dtype=int)
+    pts = np.vstack([
+        z + E[ii] + E[kk],
+        z + E[ii] - E[kk],
+        z - E[ii] + E[kk],
+        z - E[ii] - E[kk],
+    ])
+    g = _neg_log_post(P, pts).reshape(4, len(pairs))
+    if not np.all(np.isfinite(g)):
+        return None
+    vals = (g[0] - g[1] - g[2] + g[3]) / (4.0 * h * h)
+    H[ii, kk] = H[kk, ii] = vals
     return H
 
 
@@ -491,7 +541,7 @@ def fit_posterior_panel(spec, model, rows=None, fixed_z=None, fixed_params=None,
         s = sample(P, seed=int(sd))
         c = C.classify(P, s)
     if P.names:
-        xh, conv, msg = C._map_point(P, s["best"] if s else None)
+        xh, conv, msg = map_point(P, s["best"] if s else None)
     else:
         xh, conv, msg = [], True, "every parameter fixed: the configuration is evaluated as given"
     x = dict(fixed_params or {}, **dict(zip(P.names, (float(v) for v in xh))))

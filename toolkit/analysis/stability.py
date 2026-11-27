@@ -25,7 +25,7 @@ import sys
 import numpy as np
 import yaml
 
-from toolkit.analysis import calibration as C, moves as MV
+from toolkit.analysis import calibration as C, mode_start as MS, moves as MV
 from toolkit.analysis.core import SolveFailed, auxiliary, best_known, merge_costs
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -107,8 +107,8 @@ def run(A, z0, out0, ben0, cost0, plan) -> dict:
                                         start={**{p: A.lik["x"][p] for p in A.lik["params"]},
                                                **{f"z:{u}": A.lik["z"][u] for u in A.lik["z"] if u not in hid}},
                                         identifiability=False) if A.method == "likelihood" else
-                       C.fit_posterior_panel(A.spec, A.model, rows=rows, fixed_z={i: z0[i] for i in hid},
-                                             sample_it=False))
+                       MS.fit_posterior_panel(A.spec, A.model, rows=rows, fixed_z={i: z0[i] for i in hid},
+                                              sample_it=False))
             except C.CalibrationRefused as e:     # 1C-b 2c-ii: one refused refit is that fold's result, not a crash
                 folds.append({"group": gv, "status": "not_run", "n_units": len(hid),
                               "reason": f"the calibration without the held-out units was refused ({e})"})

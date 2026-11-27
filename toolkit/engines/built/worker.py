@@ -13,6 +13,7 @@ phased `TrackedParams`, `BalanceAnalyzer`, bounded output pipes, and harness-com
 """
 from __future__ import annotations
 
+import atexit
 import base64
 import copy
 import datetime as _dt
@@ -24,7 +25,9 @@ import importlib.util
 import json
 import math
 import os
+import selectors
 import shutil
+import signal
 import site
 import subprocess
 import sys
@@ -55,6 +58,12 @@ _AGE_POP_INCLUDE = ("pop", "share", "weight", "dist")
 _AGE_POP_EXCLUDE = ("contact", "rate", "mort", "hazard", "eff")
 _SANDBOX_CACHE: list[str | None] = []
 _SANDBOX_DIAG: list[str] = []
+_RO_MOUNT_CACHE: dict[tuple, list[str]] = {}
+_SESSION_MAX_PER_PROC = 2
+_SESSION_MAX_REQUESTS = {"closed_form": 2000, "starsim_module": 64}
+_SESSION_POOL_LOCK = threading.Lock()
+_SESSION_POOL: dict[tuple, "_WorkerSession"] = {}
+_SESSION_POOL_PID: int = os.getpid()
 
 
 class EngineUnsandboxed(RuntimeError):
@@ -137,6 +146,16 @@ def unsandboxed_findings(run_dir: str) -> list[dict]:
 def _ro_mount_prefixes() -> list[str]:
     """Minimal read-only runtime paths needed for Python + numpy/scipy/starsim without mounting `/`,
     the repository, any run directory, home/temp directories, or arbitrary `sys.path` entries."""
+    cache_key = (
+        sys.executable,
+        sys.prefix,
+        sys.base_prefix,
+        os.environ.get("LD_LIBRARY_PATH") or "",
+        os.environ.get("PYTHONHOME") or "",
+    )
+    cached = _RO_MOUNT_CACHE.get(cache_key)
+    if cached is not None:
+        return list(cached)
     candidates: list[str] = []
     runtime_paths: list[str] = []
     repo_real = os.path.realpath(ROOT)
@@ -290,6 +309,7 @@ def _ro_mount_prefixes() -> list[str]:
         mounts.append(target)
         if os.path.isdir(target) and not os.path.islink(target):
             seen_dirs.append(target)
+    _RO_MOUNT_CACHE[cache_key] = list(mounts)
     return mounts
 
 
@@ -548,11 +568,42 @@ def _run_bounded_subprocess(
 
 
 # --------------------------------------------------------------------------- in-worker runtime
-class TrackedParams(dict):
-    """Parameter dict recording every parameter key accessed per execution phase (`build` vs `read_outcomes`)."""
+class _TrackedParamsView(Mapping):
+    """Shared-phase read-only view returned by `TrackedParams.copy()` so copying params in `build_sim`
+    does not eagerly mark unread parameters as read in `build` (preserving BE5 phase attribution)."""
+
+    def __init__(self, parent: "TrackedParams"):
+        self._parent = parent
+
+    def __getitem__(self, key):
+        return self._parent[key]
+
+    def get(self, key, default=None):
+        return self._parent.get(key, default)
+
+    def __contains__(self, key):
+        return key in self._parent
+
+    def __iter__(self):
+        return iter(self._parent._data)
+
+    def __len__(self):
+        return len(self._parent._data)
+
+    def copy(self):
+        return _TrackedParamsView(self._parent)
+
+    def __repr__(self):
+        return f"TrackedParams({self._parent._data!r})"
+
+
+class TrackedParams(Mapping):
+    """Parameter mapping recording every parameter key accessed per execution phase (`build` vs
+    `read_outcomes`). Subclasses `collections.abc.Mapping` (not `dict`) so `dict(params)` and
+    `{**params}` invoke `__getitem__` and record reads rather than bypassing via C-level dict fast paths."""
 
     def __init__(self, initial: Mapping[str, float]):
-        super().__init__({str(k): float(v) for k, v in initial.items()})
+        self._data: dict[str, float] = {str(k): float(v) for k, v in initial.items()}
         self._phase = "build"
         self.reads_by_phase: dict[str, set[str]] = {"build": set(), "read_outcomes": set()}
         self.reads: set[str] = set()
@@ -566,37 +617,34 @@ class TrackedParams(dict):
         self.reads.add(sk)
         self.reads_by_phase[self._phase].add(sk)
 
-    def _record_all(self) -> None:
-        for k in self.keys():
-            self._record(k)
-
     def __getitem__(self, key):
+        val = self._data[key]
         self._record(key)
-        return super().__getitem__(key)
+        return val
 
     def get(self, key, default=None):
-        if super().__contains__(key):
+        if key in self._data:
             self._record(key)
-            return super().__getitem__(key)
+            return self._data[key]
         return default
 
     def __contains__(self, key):
-        if super().__contains__(key):
+        if key in self._data:
             self._record(key)
             return True
         return False
 
-    def values(self):
-        self._record_all()
-        return super().values()
+    def __iter__(self):
+        return iter(self._data)
 
-    def items(self):
-        self._record_all()
-        return super().items()
+    def __len__(self):
+        return len(self._data)
 
     def copy(self):
-        self._record_all()
-        return dict(self)
+        return _TrackedParamsView(self)
+
+    def __repr__(self):
+        return f"TrackedParams({self._data!r})"
 
 
 def _opaque_id(salt: str, raw_id: str) -> str:
@@ -876,122 +924,683 @@ def _strip_cwd_from_sys_path() -> None:
     sys.path[:] = [p for p in sys.path if p not in bad and os.path.realpath(p) not in bad]
 
 
-def _worker_child() -> int:
-    """Subprocess entrypoint inside the minimal-mount sandbox (or dev override). Reads one JSON
-    request from stdin, executes against verified bytes only, writes JSON response ONLY to the
-    saved protocol stdout (redirecting model `print(...)` to stderr)."""
-    proto_out = sys.stdout
-    sys.stdout = sys.stderr
+def _write_fd_all(fd: int, data: bytes) -> None:
+    view = memoryview(data)
+    sent = 0
+    while sent < len(view):
+        n = os.write(fd, view[sent:])
+        if n <= 0:
+            raise OSError("short write to worker protocol fd")
+        sent += n
+
+
+def _apply_strict_rlimits(limits: Mapping) -> None:
+    import resource
+    for rname, key, extra in (("RLIMIT_AS", "memory_bytes", 0), ("RLIMIT_CPU", "cpu_s", 2),
+                              ("RLIMIT_FSIZE", "file_bytes", 0)):
+        r = getattr(resource, rname, None)
+        if r is not None and key in limits:
+            try:
+                resource.setrlimit(r, (int(limits[key]), int(limits[key]) + extra))
+            except (ValueError, OSError):
+                pass
+
+
+def _dispatch_action(model, kind: str, action: str, payload: Mapping, id_salt: str):
+    if action == "introspect":
+        return {
+            "card": _serialize_card(model.describe()),
+            "parameters": [_serialize_param(p) for p in model.parameters()],
+            "has_batch": bool(callable(getattr(model, "run_batch_state", None))),
+        }
+    if action == "describe":
+        return _serialize_card(model.describe())
+    if action == "parameters":
+        return [_serialize_param(p) for p in model.parameters()]
+    if action == "has_batch":
+        return bool(callable(getattr(model, "run_batch_state", None)))
+    if action == "run":
+        return _run_one(
+            model, kind, payload.get("params") or {}, payload["unit"], payload["package"],
+            payload["horizon"], int(payload.get("seed", 0)), id_salt,
+            payload.get("age_shares"),
+        )
+    if action == "run_many":
+        items = payload["items"]
+        return [
+            _run_one(
+                model, kind, item.get("params") or {}, item["unit"], item["package"],
+                item["horizon"], int(item.get("seed", 0)), id_salt,
+                item.get("age_shares"),
+            )
+            for item in items
+        ]
+    if action == "run_batch":
+        items = payload["items"]
+        if callable(getattr(model, "run_batch_state", None)) and items:
+            from toolkit.engines.contract import Horizon, Outcomes, Package, UnitSpec, resolve_params
+            card = model.describe()
+            first = items[0]
+            raw_attrs = copy.deepcopy(first["unit"].get("attributes") or {})
+            auth_shares = _compute_age_shares(list(card.age_groups), raw_attrs, first.get("age_shares"))
+            opaque_u = UnitSpec(_opaque_id(id_salt, str(first["unit"]["id"])), copy.deepcopy(raw_attrs))
+            hor_d = first["horizon"]
+            hor = Horizon(float(hor_d["start"]), float(hor_d["stop"]), tuple(hor_d["window"]),
+                          {str(k): list(v) for k, v in (hor_d.get("windows") or {}).items()})
+            p_list = [TrackedParams(resolve_params(model, it.get("params") or {})) for it in items]
+            pk_list = [Package(_opaque_id(id_salt, str(it["package"]["id"])),
+                               copy.deepcopy(it["package"].get("components") or {})) for it in items]
+            seed0 = int(first.get("seed", 0))
+            outs = model.run_batch_state(p_list, opaque_u, pk_list, hor, seed0)
+            if not isinstance(outs, list) or len(outs) != len(items):
+                raise WorkerError("run_batch_state must return one Outcomes per batch item")
+            results = []
+            for out, tp in zip(outs, p_list):
+                if not isinstance(out, Outcomes):
+                    raise WorkerError(f"run_batch_state item is not Outcomes (got {type(out).__name__})")
+                meta = dict(out.meta or {})
+                meta.pop("balance", None)
+                meta.pop("param_reads", None)
+                meta.pop("age_shares", None)
+                meta["age_shares"] = auth_shares
+                meta["param_reads"] = {"build": sorted(tp.reads_by_phase["build"]), "read_outcomes": []}
+                results.append(_serialize_outcomes(
+                    Outcomes(per_capita=out.per_capita, windows=out.windows,
+                             cost_drivers=out.cost_drivers, meta=meta)
+                ))
+            return results
+        return [
+            _run_one(
+                model, kind, item.get("params") or {}, item["unit"], item["package"],
+                item["horizon"], int(item.get("seed", 0)), id_salt,
+                item.get("age_shares"),
+            )
+            for item in items
+        ]
+    raise WorkerError(f"unknown worker action {action!r}")
+
+
+class _RequestTimeout(BaseException):
+    """Raised inside a persistent worker by SIGALRM when a single request exceeds its wall timeout."""
+
+
+class _StderrOverflow(BaseException):
+    """Raised inside a persistent worker when stderr/stdout log output exceeds the per-request byte cap."""
+
+
+class _BoundedStderr:
+    """Line/byte-counted stderr proxy ensuring Python-level print() overflow in a persistent session
+    fails closed deterministically alongside the parent's OS-level stderr pipe cap."""
+
+    def __init__(self, underlying, cap: int):
+        self._u = underlying
+        self._cap = int(cap)
+        self._n = 0
+        self.overflowed = False
+
+    def reset(self, cap: int) -> None:
+        self._cap = int(cap)
+        self._n = 0
+        self.overflowed = False
+
+    def write(self, s):
+        if isinstance(s, bytes):
+            nb = len(s)
+        else:
+            nb = len(str(s).encode("utf-8", errors="replace"))
+        self._n += nb
+        if self._n > self._cap:
+            self.overflowed = True
+            raise _StderrOverflow(f"engine worker exceeded stderr output limit ({self._cap} bytes)")
+        return self._u.write(s)
+
+    def flush(self):
+        return self._u.flush()
+
+    def isatty(self):
+        return False
+
+
+def _setup_worker_paths() -> None:
     _strip_cwd_from_sys_path()
     here_dir = os.path.dirname(os.path.abspath(__file__))
     if os.path.isfile(os.path.join(here_dir, "toolkit", "engines", "contract.py")):
         sys.path.insert(0, here_dir)
     else:
         sys.path.insert(0, ROOT)
+
+
+def _worker_child() -> int:
+    """One-shot subprocess entrypoint inside the minimal-mount sandbox (or dev override). Reads one
+    JSON request from stdin, executes against verified bytes only, writes JSON response ONLY to the
+    saved protocol fd (redirecting Python and C-level stdout to stderr)."""
+    proto_fd = os.dup(1)
+    os.dup2(2, 1)
+    sys.stdout = sys.stderr
+    _setup_worker_paths()
     try:
         req = json.loads(sys.stdin.read())
         limits = req.get("limits") or {}
         if req.get("strict_limits"):
-            import resource
-            for rname, key, extra in (("RLIMIT_AS", "memory_bytes", 0), ("RLIMIT_CPU", "cpu_s", 2),
-                                      ("RLIMIT_FSIZE", "file_bytes", 0)):
-                r = getattr(resource, rname, None)
-                if r is not None and key in limits:
-                    try:
-                        resource.setrlimit(r, (int(limits[key]), int(limits[key]) + extra))
-                    except (ValueError, OSError):
-                        pass
+            _apply_strict_rlimits(limits)
         files = {str(k): base64.b64decode(v) for k, v in req["files_b64"].items()}
         model = _load_model_from_bytes(files, req.get("config") or {})
-        action = req["action"]
-        if action == "introspect":
-            result = {
-                "card": _serialize_card(model.describe()),
-                "parameters": [_serialize_param(p) for p in model.parameters()],
-                "has_batch": bool(callable(getattr(model, "run_batch_state", None))),
-            }
-        elif action == "describe":
-            result = _serialize_card(model.describe())
-        elif action == "parameters":
-            result = [_serialize_param(p) for p in model.parameters()]
-        elif action == "has_batch":
-            result = bool(callable(getattr(model, "run_batch_state", None)))
-        elif action == "run":
-            p = req["payload"]
-            result = _run_one(
-                model, str(req["kind"]), p.get("params") or {}, p["unit"], p["package"],
-                p["horizon"], int(p.get("seed", 0)), str(req.get("id_salt") or "s0"),
-                p.get("age_shares"),
-            )
-        elif action == "run_many":
-            # Heterogeneous (params, unit, package, horizon, seed) calls executed sequentially in ONE
-            # worker process so each item uses its own inputs while still exposing cross-call state leaks.
-            p = req["payload"]
-            items = p["items"]
-            results = []
-            for item in items:
-                results.append(_run_one(
-                    model, str(req["kind"]), item.get("params") or {}, item["unit"], item["package"],
-                    item["horizon"], int(item.get("seed", 0)), str(req.get("id_salt") or "s0"),
-                    item.get("age_shares"),
-                ))
-            result = results
-        elif action == "run_batch":
-            p = req["payload"]
-            items = p["items"]
-            if callable(getattr(model, "run_batch_state", None)) and items:
-                from toolkit.engines.contract import Horizon, Outcomes, Package, UnitSpec, resolve_params
-                card = model.describe()
-                id_salt = str(req.get("id_salt") or "s0")
-                first = items[0]
-                raw_attrs = copy.deepcopy(first["unit"].get("attributes") or {})
-                auth_shares = _compute_age_shares(list(card.age_groups), raw_attrs, first.get("age_shares"))
-                opaque_u = UnitSpec(_opaque_id(id_salt, str(first["unit"]["id"])), copy.deepcopy(raw_attrs))
-                hor_d = first["horizon"]
-                hor = Horizon(float(hor_d["start"]), float(hor_d["stop"]), tuple(hor_d["window"]),
-                              {str(k): list(v) for k, v in (hor_d.get("windows") or {}).items()})
-                p_list = [TrackedParams(resolve_params(model, it.get("params") or {})) for it in items]
-                pk_list = [Package(_opaque_id(id_salt, str(it["package"]["id"])),
-                                   copy.deepcopy(it["package"].get("components") or {})) for it in items]
-                seed0 = int(first.get("seed", 0))
-                outs = model.run_batch_state(p_list, opaque_u, pk_list, hor, seed0)
-                if not isinstance(outs, list) or len(outs) != len(items):
-                    raise WorkerError("run_batch_state must return one Outcomes per batch item")
-                results = []
-                for out, tp in zip(outs, p_list):
-                    if not isinstance(out, Outcomes):
-                        raise WorkerError(f"run_batch_state item is not Outcomes (got {type(out).__name__})")
-                    meta = dict(out.meta or {})
-                    meta.pop("balance", None)
-                    meta.pop("param_reads", None)
-                    meta.pop("age_shares", None)
-                    meta["age_shares"] = auth_shares
-                    meta["param_reads"] = {"build": sorted(tp.reads_by_phase["build"]), "read_outcomes": []}
-                    results.append(_serialize_outcomes(
-                        Outcomes(per_capita=out.per_capita, windows=out.windows,
-                                 cost_drivers=out.cost_drivers, meta=meta)
-                    ))
-                result = results
-            else:
-                results = []
-                for item in items:
-                    results.append(_run_one(
-                        model, str(req["kind"]), item.get("params") or {}, item["unit"], item["package"],
-                        item["horizon"], int(item.get("seed", 0)), str(req.get("id_salt") or "s0"),
-                        item.get("age_shares"),
-                    ))
-                result = results
-        else:
-            raise WorkerError(f"unknown worker action {action!r}")
-        proto_out.write(json.dumps({"ok": True, "result": result}))
-        proto_out.flush()
+        result = _dispatch_action(
+            model, str(req["kind"]), str(req["action"]), req.get("payload") or {},
+            str(req.get("id_salt") or "s0"),
+        )
+        _write_fd_all(proto_fd, json.dumps({"ok": True, "result": result}).encode("utf-8"))
         return 0
     except Exception as e:  # noqa: BLE001 -- structured error back to harness
         import traceback
         tb = traceback.format_exc().splitlines()[-6:]
-        proto_out.write(json.dumps({"ok": False, "error": f"{type(e).__name__}: {e}", "traceback": tb}))
-        proto_out.flush()
+        _write_fd_all(proto_fd, json.dumps({"ok": False, "error": f"{type(e).__name__}: {e}", "traceback": tb}).encode("utf-8"))
         return 1
+    finally:
+        try:
+            os.close(proto_fd)
+        except OSError:
+            pass
+
+
+def _worker_session() -> int:
+    """Persistent NDJSON sandboxed worker loop. Compiles verified snapshot bytes ONCE per session
+    and serves sequential requests over stdin/proto_fd with per-request SIGALRM timeouts, stderr
+    byte caps, and resource usage reporting for proactive parent-side recycling."""
+    import resource
+    proto_fd = os.dup(1)
+    os.dup2(2, 1)
+    bounded_err = _BoundedStderr(sys.stderr, MAX_STDERR_BYTES)
+    sys.stderr = bounded_err
+    sys.stdout = bounded_err
+    _setup_worker_paths()
+
+    def _send(obj: dict) -> None:
+        _write_fd_all(proto_fd, (json.dumps(obj, separators=(",", ":")) + "\n").encode("utf-8"))
+
+    def _on_alarm(_sig, _frame):
+        raise _RequestTimeout("request timed out inside worker")
+
+    signal.signal(signal.SIGALRM, _on_alarm)
+    try:
+        init_line = sys.stdin.buffer.readline()
+        if not init_line:
+            return 0
+        init = json.loads(init_line.decode("utf-8"))
+        limits = init.get("limits") or {}
+        init_err_cap = int(init.get("max_stderr", MAX_STDERR_BYTES))
+        bounded_err.reset(init_err_cap)
+        if init.get("strict_limits"):
+            _apply_strict_rlimits(limits)
+        files = {str(k): base64.b64decode(v) for k, v in init["files_b64"].items()}
+        kind = str(init["kind"])
+        default_salt = str(init.get("id_salt") or "s0")
+        model = _load_model_from_bytes(files, init.get("config") or {})
+        _send({"ok": True, "ready": True, "pid": os.getpid()})
+
+        n_reqs = 0
+        while True:
+            line = sys.stdin.buffer.readline()
+            if not line:
+                return 0
+            req = json.loads(line.decode("utf-8"))
+            action = str(req.get("action") or "")
+            if action == "shutdown":
+                _send({"ok": True, "shutdown": True})
+                return 0
+            req_err_cap = int(req.get("max_stderr", init_err_cap))
+            bounded_err.reset(req_err_cap)
+            timeout_s = float(req.get("timeout_s") or 0.0)
+            if timeout_s > 0.0:
+                signal.setitimer(signal.ITIMER_REAL, timeout_s)
+            try:
+                result = _dispatch_action(
+                    model, kind, action, req.get("payload") or {},
+                    str(req.get("id_salt") or default_salt),
+                )
+                n_reqs += 1
+                ru = resource.getrusage(resource.RUSAGE_SELF)
+                rss_scale = 1 if sys.platform == "darwin" else 1024
+                stats = {
+                    "cpu_s": float(ru.ru_utime + ru.ru_stime),
+                    "rss_bytes": int(ru.ru_maxrss) * rss_scale,
+                    "requests": n_reqs,
+                    "pid": os.getpid(),
+                }
+                _send({"ok": True, "result": result, "stats": stats})
+            except _RequestTimeout:
+                _send({"ok": False, "error": f"engine worker timed out after {timeout_s}s", "fatal": True})
+                return 1
+            except _StderrOverflow as e:
+                _send({"ok": False, "error": str(e), "fatal": True})
+                return 1
+            except Exception as e:  # noqa: BLE001 -- structured error back to harness
+                import traceback
+                tb = traceback.format_exc().splitlines()[-6:]
+                _send({"ok": False, "error": f"{type(e).__name__}: {e}", "traceback": tb, "fatal": False})
+            finally:
+                signal.setitimer(signal.ITIMER_REAL, 0.0)
+                try:
+                    bounded_err.flush()
+                except OSError:
+                    pass
+    except _StderrOverflow as e:
+        try:
+            _send({"ok": False, "error": str(e), "fatal": True})
+        except OSError:
+            pass
+        return 1
+    except Exception as e:  # noqa: BLE001
+        import traceback
+        tb = traceback.format_exc().splitlines()[-6:]
+        try:
+            _send({"ok": False, "error": f"{type(e).__name__}: {e}", "traceback": tb, "fatal": True})
+        except OSError:
+            pass
+        return 1
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0.0)
+        try:
+            os.close(proto_fd)
+        except OSError:
+            pass
+
+
+class _SessionDead(RuntimeError):
+    """Internal signal that a pooled worker session exited before handling a new request."""
+
+
+class _WorkerSession:
+    """Persistent sandboxed worker process speaking bounded NDJSON over stdin/stdout."""
+
+    def __init__(
+        self,
+        cmd: list[str],
+        *,
+        cwd: str | None,
+        env: dict[str, str] | None,
+        init_req: dict,
+        init_timeout_s: float,
+        max_stdout: int,
+        max_stderr: int,
+        limits: Mapping,
+        kind: str,
+    ):
+        self._lock = threading.Lock()
+        self._closed = False
+        self._dead = False
+        self._limits = dict(limits)
+        self._kind = str(kind)
+        self._out_buf = bytearray()
+        self._err_lock = threading.Lock()
+        self._err_req_bytes = 0
+        self._err_tail = bytearray()
+        self._err_overflow = False
+        self._max_stderr = int(max_stderr)
+        self.worker_pid: int | None = None
+        self.requests_served = 0
+
+        self.proc = subprocess.Popen(
+            cmd,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            cwd=cwd,
+            env=env,
+        )
+        self._err_thread = threading.Thread(target=self._drain_stderr, daemon=True)
+        self._err_thread.start()
+        try:
+            self._write_line(init_req)
+            resp = self._read_json_line(timeout_s=init_timeout_s, max_bytes=max_stdout)
+            if not resp.get("ok") or not resp.get("ready"):
+                err = resp.get("error") or "worker session failed to initialize"
+                tb = " / ".join(resp.get("traceback") or [])
+                raise WorkerError(f"engine worker error: {err}" + (f" | {tb}" if tb else ""))
+            self.worker_pid = resp.get("pid")
+        except Exception:
+            self.close()
+            raise
+
+    def _drain_stderr(self) -> None:
+        stream = self.proc.stderr
+        if stream is None:
+            return
+        try:
+            while True:
+                chunk = stream.read(4096)
+                if not chunk:
+                    break
+                kill_now = False
+                with self._err_lock:
+                    self._err_req_bytes += len(chunk)
+                    self._err_tail.extend(chunk)
+                    if len(self._err_tail) > 4096:
+                        del self._err_tail[:-4096]
+                    if self._err_req_bytes > self._max_stderr:
+                        self._err_overflow = True
+                        kill_now = True
+                if kill_now:
+                    self._dead = True
+                    try:
+                        self.proc.kill()
+                    except OSError:
+                        pass
+                    break
+        except OSError:
+            pass
+        finally:
+            try:
+                stream.close()
+            except OSError:
+                pass
+
+    def _stderr_tail_text(self) -> str:
+        with self._err_lock:
+            return bytes(self._err_tail).decode("utf-8", errors="replace")
+
+    def is_alive(self) -> bool:
+        return not self._closed and not self._dead and self.proc.poll() is None
+
+    def _write_line(self, obj: Mapping) -> None:
+        assert self.proc.stdin is not None
+        raw = (json.dumps(obj, separators=(",", ":")) + "\n").encode("utf-8")
+        try:
+            self.proc.stdin.write(raw)
+            self.proc.stdin.flush()
+        except OSError as e:
+            self._dead = True
+            raise _SessionDead(f"worker stdin closed: {e}") from None
+
+    def _read_json_line(self, *, timeout_s: float, max_bytes: int) -> dict:
+        assert self.proc.stdout is not None
+        out_fd = self.proc.stdout.fileno()
+        deadline = time.monotonic() + max(timeout_s, 0.1)
+        sel = selectors.DefaultSelector()
+        try:
+            sel.register(out_fd, selectors.EVENT_READ)
+            while True:
+                with self._err_lock:
+                    if self._err_overflow:
+                        cap = self._max_stderr
+                        self._dead = True
+                        raise WorkerError(f"engine worker exceeded stderr output limit ({cap} bytes)")
+                nl = self._out_buf.find(b"\n")
+                if nl >= 0:
+                    line = bytes(self._out_buf[:nl])
+                    del self._out_buf[:nl + 1]
+                    break
+                if len(self._out_buf) > max_bytes:
+                    self._dead = True
+                    raise WorkerError(f"engine worker exceeded stdout output limit ({max_bytes} bytes)")
+                rem = deadline - time.monotonic()
+                if rem <= 0.0:
+                    self._dead = True
+                    raise WorkerError(f"engine worker timed out after {timeout_s}s")
+                events = sel.select(timeout=min(0.2, rem))
+                if not events:
+                    continue
+                chunk = os.read(out_fd, 65536)
+                if not chunk:
+                    self._dead = True
+                    with self._err_lock:
+                        if self._err_overflow:
+                            raise WorkerError(
+                                f"engine worker exceeded stderr output limit ({self._max_stderr} bytes)"
+                            )
+                    rc = self.proc.poll()
+                    tail = self._stderr_tail_text()[-400:]
+                    raise WorkerError(f"engine worker failed (rc={rc}): {tail}")
+                self._out_buf.extend(chunk)
+                if len(self._out_buf) > max_bytes and b"\n" not in self._out_buf:
+                    self._dead = True
+                    raise WorkerError(f"engine worker exceeded stdout output limit ({max_bytes} bytes)")
+        finally:
+            sel.close()
+        with self._err_lock:
+            if self._err_overflow:
+                self._dead = True
+                raise WorkerError(f"engine worker exceeded stderr output limit ({self._max_stderr} bytes)")
+        try:
+            return json.loads(line.decode("utf-8", errors="replace"))
+        except ValueError:
+            self._dead = True
+            raise WorkerError(f"engine worker returned invalid JSON: {line[-200:]!r}") from None
+
+    def request(
+        self,
+        action: str,
+        payload: Mapping | None,
+        *,
+        id_salt: str,
+        timeout_s: float,
+        max_stdout: int,
+        max_stderr: int,
+    ) -> tuple[object, bool]:
+        """Send one request on this session. Returns `(result, should_recycle)`."""
+        with self._lock:
+            if not self.is_alive():
+                raise _SessionDead("worker session is no longer alive")
+            with self._err_lock:
+                self._err_req_bytes = 0
+                self._err_overflow = False
+                self._max_stderr = int(max_stderr)
+                self._err_tail.clear()
+            self._write_line({
+                "action": str(action),
+                "payload": dict(payload or {}),
+                "id_salt": str(id_salt),
+                "timeout_s": float(timeout_s),
+                "max_stderr": int(max_stderr),
+            })
+            try:
+                resp = self._read_json_line(timeout_s=timeout_s, max_bytes=max_stdout)
+            except WorkerError:
+                self.close()
+                raise
+            if not resp.get("ok"):
+                err = resp.get("error") or "unknown worker error"
+                tb = " / ".join(resp.get("traceback") or [])
+                if resp.get("fatal"):
+                    self.close()
+                    if "exceeded" in str(err) and "output limit" in str(err):
+                        raise WorkerError(str(err))
+                    if "timed out" in str(err):
+                        raise WorkerError(str(err))
+                raise WorkerError(f"engine worker error: {err}" + (f" | {tb}" if tb else ""))
+            self.requests_served += 1
+            stats = resp.get("stats") or {}
+            cpu_lim = float(self._limits.get("cpu_s", DEFAULT_LIMITS["cpu_s"]))
+            mem_lim = float(self._limits.get("memory_bytes", DEFAULT_LIMITS["memory_bytes"]))
+            max_reqs = int(self._limits.get(
+                "session_max_requests", _SESSION_MAX_REQUESTS.get(self._kind, 64),
+            ))
+            should_recycle = (
+                float(stats.get("cpu_s", 0.0)) > 0.75 * cpu_lim
+                or float(stats.get("rss_bytes", 0.0)) > 0.5 * mem_lim
+                or int(stats.get("requests", self.requests_served)) >= max_reqs
+            )
+            return resp["result"], should_recycle
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        self._dead = True
+        try:
+            if self.proc.stdin is not None:
+                if self.proc.poll() is None:
+                    try:
+                        self.proc.stdin.write(b'{"action":"shutdown"}\n')
+                        self.proc.stdin.flush()
+                    except OSError:
+                        pass
+                self.proc.stdin.close()
+        except OSError:
+            pass
+        if self.proc.poll() is None:
+            try:
+                self.proc.wait(timeout=0.5)
+            except subprocess.TimeoutExpired:
+                try:
+                    self.proc.terminate()
+                except OSError:
+                    pass
+                try:
+                    self.proc.wait(timeout=1.0)
+                except subprocess.TimeoutExpired:
+                    try:
+                        self.proc.kill()
+                    except OSError:
+                        pass
+                    try:
+                        self.proc.wait(timeout=1.0)
+                    except subprocess.TimeoutExpired:
+                        pass
+        for stream in (self.proc.stdout, self.proc.stderr):
+            try:
+                if stream is not None:
+                    stream.close()
+            except OSError:
+                pass
+
+
+def close_worker_sessions() -> None:
+    """Close and evict all pooled persistent worker sessions for the current process."""
+    global _SESSION_POOL_PID
+    with _SESSION_POOL_LOCK:
+        pid = os.getpid()
+        if pid != _SESSION_POOL_PID:
+            _SESSION_POOL.clear()
+            _SESSION_POOL_PID = pid
+            return
+        sessions = list(_SESSION_POOL.values())
+        _SESSION_POOL.clear()
+    for sess in sessions:
+        sess.close()
+
+
+atexit.register(close_worker_sessions)
+
+
+def _files_digest(verified_files: Mapping[str, bytes]) -> str:
+    h = hashlib.sha256()
+    for k in sorted(verified_files):
+        h.update(str(k).encode("utf-8") + b"\0")
+        h.update(bytes(verified_files[k]))
+    return h.hexdigest()
+
+
+def _run_in_session(
+    verified_files: Mapping[str, bytes],
+    *,
+    sb: str | None,
+    kind: str,
+    action: str,
+    config: Mapping | None,
+    payload: Mapping | None,
+    lim: dict,
+    hash_seed: str,
+    id_salt: str,
+    max_stdout: int,
+    max_stderr: int,
+) -> dict:
+    global _SESSION_POOL_PID
+    wall_s = float(lim.get("wall_s", 120))
+    cfg = dict(config or {})
+    cfg_sha = hashlib.sha256(json.dumps(cfg, sort_keys=True, default=str).encode("utf-8")).hexdigest()
+    lim_key = tuple(sorted((str(k), str(v)) for k, v in lim.items()))
+    pid = os.getpid()
+    pool_key = (pid, _files_digest(verified_files), str(kind), cfg_sha, str(hash_seed), str(id_salt), lim_key, sb or "unsandboxed")
+
+    def _spawn_cmd() -> tuple[list[str], str | None, dict[str, str] | None]:
+        if sb is not None:
+            prefixes = _ro_mount_prefixes()
+            env = _minimal_env(hash_seed=hash_seed, mounted_prefixes=prefixes)
+            envargs = [a for k, v in env.items() for a in ("--setenv", k, v)]
+            cmd = _bwrap_engine_cmd(
+                sb, envargs, [sys.executable, "-s", "-B", "/harness/worker.py", "_worker_session"],
+                ro_prefixes=prefixes,
+            )
+            return cmd, None, None
+        env = _minimal_env(hash_seed=hash_seed)
+        return [sys.executable, "-s", "-B", os.path.abspath(__file__), "_worker_session"], tempfile.gettempdir(), env
+
+    def _acquire() -> _WorkerSession:
+        global _SESSION_POOL_PID
+        evicted: list[_WorkerSession] = []
+        with _SESSION_POOL_LOCK:
+            if pid != _SESSION_POOL_PID:
+                _SESSION_POOL.clear()
+                _SESSION_POOL_PID = pid
+            existing = _SESSION_POOL.get(pool_key)
+            if existing is not None:
+                if existing.is_alive():
+                    return existing
+                _SESSION_POOL.pop(pool_key, None)
+                evicted.append(existing)
+        for old in evicted:
+            old.close()
+        cmd, run_cwd, run_env = _spawn_cmd()
+        init_req = {
+            "files_b64": {str(k): base64.b64encode(bytes(v)).decode("ascii") for k, v in verified_files.items()},
+            "kind": str(kind),
+            "config": cfg,
+            "limits": lim,
+            "strict_limits": sb is not None,
+            "id_salt": str(id_salt),
+            "max_stderr": int(max_stderr),
+        }
+        sess = _WorkerSession(
+            cmd, cwd=run_cwd, env=run_env, init_req=init_req,
+            init_timeout_s=min(wall_s, 60.0), max_stdout=max_stdout, max_stderr=max_stderr,
+            limits=lim, kind=str(kind),
+        )
+        to_close: list[_WorkerSession] = []
+        with _SESSION_POOL_LOCK:
+            if pid != _SESSION_POOL_PID:
+                _SESSION_POOL.clear()
+                _SESSION_POOL_PID = pid
+            while len(_SESSION_POOL) >= _SESSION_MAX_PER_PROC:
+                old_k = next(iter(_SESSION_POOL))
+                to_close.append(_SESSION_POOL.pop(old_k))
+            prev = _SESSION_POOL.get(pool_key)
+            if prev is not None and prev.is_alive():
+                to_close.append(sess)
+                sess = prev
+            else:
+                if prev is not None:
+                    to_close.append(prev)
+                _SESSION_POOL[pool_key] = sess
+        for old in to_close:
+            old.close()
+        return sess
+
+    def _evict(sess: _WorkerSession) -> None:
+        with _SESSION_POOL_LOCK:
+            if _SESSION_POOL.get(pool_key) is sess:
+                _SESSION_POOL.pop(pool_key, None)
+        sess.close()
+
+    for attempt in range(2):
+        sess = _acquire()
+        try:
+            result, should_recycle = sess.request(
+                action, payload, id_salt=id_salt, timeout_s=wall_s,
+                max_stdout=max_stdout, max_stderr=max_stderr,
+            )
+            if should_recycle:
+                _evict(sess)
+            return {"result": result, "sandbox": sb or "unsandboxed", "unsandboxed": sb is None}
+        except _SessionDead:
+            _evict(sess)
+            if attempt == 1:
+                raise WorkerError("engine worker session died unexpectedly") from None
+        except WorkerError:
+            if not sess.is_alive():
+                _evict(sess)
+            raise
+    raise WorkerError("engine worker session failed")
 
 
 def run_in_worker(
@@ -1006,9 +1615,13 @@ def run_in_worker(
     hash_seed: str = "0",
     id_salt: str = "s0",
     _force_sandbox: str | None = "auto",
+    use_session: bool = False,
 ) -> dict:
     """Execute `action` on verified snapshot bytes inside the minimal-mount bubblewrap sandbox.
-    Raises `EngineUnsandboxed` when no sandbox is available unless `unsandboxed_ok=True`."""
+    Raises `EngineUnsandboxed` when no sandbox is available unless `unsandboxed_ok=True`.
+    When `use_session=True`, reuses a persistent sandboxed NDJSON worker session pooled per process
+    (used post-admission by `BuiltEngine` and during A10 calibration; admission checks A1-A9 & A11
+    keep `use_session=False` for fresh-process isolation)."""
     sb = engine_sandbox_kind() if _force_sandbox == "auto" else _force_sandbox
     if sb is None and not unsandboxed_ok:
         diag = f" [probe: {'; '.join(_SANDBOX_DIAG)}]" if _force_sandbox == "auto" and _SANDBOX_DIAG else ""
@@ -1018,6 +1631,11 @@ def run_in_worker(
     file_cap = int(lim.get("file_bytes", DEFAULT_LIMITS["file_bytes"]))
     max_stdout = min(MAX_STDOUT_BYTES, int(lim.get("max_stdout_bytes", file_cap)))
     max_stderr = min(MAX_STDERR_BYTES, int(lim.get("max_stderr_bytes", file_cap)))
+    if use_session:
+        return _run_in_session(
+            verified_files, sb=sb, kind=kind, action=action, config=config, payload=payload,
+            lim=lim, hash_seed=hash_seed, id_salt=id_salt, max_stdout=max_stdout, max_stderr=max_stderr,
+        )
     req = {
         "files_b64": {str(k): base64.b64encode(bytes(v)).decode("ascii") for k, v in verified_files.items()},
         "kind": str(kind),
@@ -1319,6 +1937,54 @@ def _self_test() -> int:
             ok(no_root_bind and no_devnull and "--tmpfs" in cmd and "/harness/toolkit/engines/contract.py" in cmd,
                "BE18 minimal-mount _bwrap_engine_cmd omits `--ro-bind / /` and `/dev/null` bind and mounts only runtime + contract/hooks/worker")
 
+    # BE_TP1: TrackedParams tracks dict(params)/{**params} and lazy shared-phase .copy() (no BE5 bypass)
+    tp1 = TrackedParams({"a": 1.0, "b": 2.0})
+    d_copy = dict(tp1)
+    tp2 = TrackedParams({"a": 1.0, "b": 2.0})
+    u_copy = {**tp2}
+    tp3 = TrackedParams({"a": 1.0, "b": 2.0})
+    lazy_view = tp3.copy()
+    _ = lazy_view["a"]
+    tp3.set_phase("read_outcomes")
+    _ = lazy_view["b"]
+    ok(d_copy == {"a": 1.0, "b": 2.0} and tp1.reads_by_phase["build"] == {"a", "b"}
+       and u_copy == {"a": 1.0, "b": 2.0} and tp2.reads_by_phase["build"] == {"a", "b"}
+       and tp3.reads_by_phase["build"] == {"a"} and tp3.reads_by_phase["read_outcomes"] == {"b"},
+       f"BE_TP1 TrackedParams records dict(p)/{{**p}} and preserves phase attribution across .copy() ({tp3.reads_by_phase})")
+
+    # BE_SESS1: persistent worker session reuses worker, recycles on max_requests, enforces stderr cap, and matches one-shot
+    close_worker_sessions()
+    s_r1 = run_in_worker(files, kind="closed_form", action="run", unsandboxed_ok=True, _force_sandbox=None,
+                         payload=base_payload, hash_seed="0", use_session=True)
+    pool_after_1 = list(_SESSION_POOL.values())
+    pid1 = pool_after_1[0].worker_pid if pool_after_1 else None
+    s_r2 = run_in_worker(files, kind="closed_form", action="run", unsandboxed_ok=True, _force_sandbox=None,
+                         payload=base_payload, hash_seed="0", use_session=True)
+    pool_after_2 = list(_SESSION_POOL.values())
+    pid2 = pool_after_2[0].worker_pid if pool_after_2 else None
+    # Recycle after session_max_requests=2
+    _ = run_in_worker(files, kind="closed_form", action="run", unsandboxed_ok=True, _force_sandbox=None,
+                      payload=base_payload, hash_seed="0", limits={"session_max_requests": 2}, use_session=True)
+    _ = run_in_worker(files, kind="closed_form", action="run", unsandboxed_ok=True, _force_sandbox=None,
+                      payload=base_payload, hash_seed="0", limits={"session_max_requests": 2}, use_session=True)
+    recycled_empty = not any(
+        s._limits.get("session_max_requests") == 2 for s in _SESSION_POOL.values()
+    )
+    # Stderr cap enforced in persistent session too
+    try:
+        run_in_worker(
+            {"engine.py": noisy_py, "card.yaml": b"name: built:n\n", "ENGINE_NOTES.md": b"# n\n"},
+            kind="closed_form", action="describe", unsandboxed_ok=True, _force_sandbox=None,
+            limits={"file_bytes": 1024}, use_session=True,
+        )
+        sess_capped = False
+    except WorkerError as e:
+        sess_capped = "exceeded" in str(e) and "output limit" in str(e)
+    close_worker_sessions()
+    ok(pid1 is not None and pid1 == pid2 and s_r1["result"] == res_dev["result"] and s_r2["result"] == res_dev["result"]
+       and recycled_empty and sess_capped and not _SESSION_POOL,
+       f"BE_SESS1 persistent worker session reuses pid ({pid1}=={pid2}), matches one-shot, recycles on cap, and enforces stderr cap")
+
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1
@@ -1337,6 +2003,8 @@ if __name__ == "__main__":
         sys.exit(0)
     if sys.argv[1:2] == ["_worker_child"]:
         sys.exit(_worker_child())
+    if sys.argv[1:2] == ["_worker_session"]:
+        sys.exit(_worker_session())
     if sys.argv[1:2] == ["--self-test"]:
         sys.exit(_self_test())
     print(__doc__)

@@ -142,8 +142,20 @@ def outcome_map(seed, obs, did, run) -> dict:
 
 def _card(run_dir) -> dict:
     import analysis_backend as AB
+    from toolkit.engines.built import BUILT_ADAPTER_REF
     from toolkit.spec import schema
     ref = AB.engine_choice_ref(run_dir)
+    if ref == BUILT_ADAPTER_REF:
+        try:
+            import yaml
+            from toolkit.engines.built import snapshot as BSNAP
+            adm = json.loads(open(os.path.join(run_dir, "engine_build", "admission.json"), encoding="utf-8").read())
+            snap_sha = adm.get("snapshot_sha256")
+            if isinstance(snap_sha, str) and len(snap_sha) == 64:
+                vfiles = BSNAP.read_verified_snapshot(os.path.join(run_dir, "engine_build", "snapshots"), snap_sha)
+                return yaml.safe_load(vfiles["card.yaml"].decode("utf-8")) or {}
+        except Exception:  # noqa: BLE001
+            return {}
     if ref not in schema.REGISTERED_ENGINES:        # never another engine's card for an unregistered choice (#367)
         return {}
     p = os.path.join(REPO, *ref.split(":")[0].split(".")[:-1], "card.yaml")

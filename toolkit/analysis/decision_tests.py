@@ -173,7 +173,7 @@ def check_departures(A, recs) -> list[dict]:
                 if pl["status"] == "runs" else []
         recs2[tid] = r
     deps = [d for d in A.spec.raw.get("engine_departures") or [] if isinstance(d, dict) and d.get("engine") == name]
-    return departure_verdicts(deps, BC.departure_targets(A.spec.raw, ref, A.spec.base), recs2)
+    return departure_verdicts(deps, BC.departure_targets(A.spec.raw, ref, A.spec.base, engine=A.eng), recs2)
 
 
 PRIOR_RANGE_PREFIX = "prior_range_"
@@ -1085,12 +1085,12 @@ def _run_one(A, dt, z0, ben0, cost0, plan, uq_data, out0=None) -> dict:
                 extra[v] = {"calibration_clamped_units": sum(bool(x[1]) for x in cz.values())}   # Codex r1 P1-3
             elif A.method == "posterior" and (p in (A.lik or {}).get("params", []) or p.startswith("z:")
                                               or p in (A.lik or {}).get("nuisance", [])):
-                from toolkit.analysis import calibration as C
+                from toolkit.analysis import mode_start as MS
                 if p.startswith("z:"):     # a unit attribute at each end of its range, the calibration redone
-                    fit = C.fit_posterior_panel(A.spec, A.model, fixed_z={p[2:]: float(v)}, sample_it=False)
+                    fit = MS.fit_posterior_panel(A.spec, A.model, fixed_z={p[2:]: float(v)}, sample_it=False)
                     zs = dict(fit["z"], **{p[2:]: float(v)})
                 else:                      # an engine parameter, or a source's bias parameter (never an engine input)
-                    fit = C.fit_posterior_panel(A.spec, A.model, fixed_params={p: float(v)}, sample_it=False)
+                    fit = MS.fit_posterior_panel(A.spec, A.model, fixed_params={p: float(v)}, sample_it=False)
                     zs = dict(fit["z"])
                 zs = {i: zs.get(i, fit["fixed_z"].get(i)) for i in A.ids}
                 theta = dict({k: x for k, x in A.theta0.items() if k != p or k in fit["theta"]}, **fit["theta"])

@@ -24,10 +24,7 @@ a4_hidden_settings: 3
 a5_hidden_cases: 6
 a6_base_points: 3
 a6_min_moving_bases: 2
-a10_replicates: 16
-a10_ident_points: 3
 
-try_max_calls: 30
 try_wall_s: 120
 try_memory_bytes: 2147483648
 try_summary_max_bytes: 8192

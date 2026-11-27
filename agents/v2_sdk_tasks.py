@@ -126,12 +126,7 @@ Under `engine.build`, every active component value used by `options.engine_map` 
 `request.trials` entry (or an explicit `engine_departures` entry with a decision test) for admission check A8.
 In `engine.build.mechanisms`, state unambiguously what each declared `outputs.per_capita` output equals on
 every declared `age_groups` entry and how `horizon.window` length (`stop - start`) is applied, so an
-independent A11 reference implementation agrees on every `(output, age_group)` cell. For unordered
-multi-mode `request.components`, use string labels (e.g. `["none", "mode_a", "mode_b"]`, `absent: "none"`)
-rather than integer codes (`[0, 1, 2]`): numeric component lists are checked for step-by-step monotonicity in
-A7, whereas string components compare each active mode against `absent`. In `request.expected_effects`, include every declared output (`per_capita`, `windows`, `cost_drivers`)
-under at least one non-inert input, and declare `nonzero` rather than `+`/`-` whenever an output can be
-non-monotone across an input's declared domain. Quote ISO `decision_date` values (e.g. `"2026-01-01"`) or write an integer year. The harness has copied the question's input files into data/inputs/ (same
+independent A11 reference implementation agrees on every `(output, age_group)` cell. Quote ISO `decision_date` values (e.g. `"2026-01-01"`) or write an integer year. The harness has copied the question's input files into data/inputs/ (same
 relative paths; their sha256 in data/inputs_provenance.json): read them. You write code, never
 tables. For each file the spec reads that is not a staged input (the units table, calibration
 targets, cost tables), write one script under data/derive/ and declare it in data/derivations.yaml
@@ -202,7 +197,10 @@ guess a year, a sample size or a value: when you do not have them, write no_data
 unless the evidence says otherwise; a changed range needs a decision_test the spec runs that covers
 it. The harness checks the file and declares in the report every input with no data, every chosen
 value that differs from what execution uses, every value left at the engine's, and every source it
-cannot locate. Output: {dossier} and {out} = {{"ok": true, "notes": "..."}}.""",
+cannot locate. If reading the staged inputs reveals a factual discrepancy against `decision_spec.yaml`
+(for example a published trial CI or parameter value transcribed wrongly in the spec), report it in
+`{out}` as `"spec_discrepancies": [{{"field": "...", "spec_value": ..., "file_value": ..., "source": "..."}}]`
+so the harness bounces back to `SPEC` before sign-off. Output: {dossier} and {out} = {{"ok": true, "notes": "..."}}.""",
     "pick_engine": COMMON + """
 
 Task: choose the engine. {out_in} lists the registered engines, which are eligible, and why the
@@ -211,9 +209,9 @@ needs, validated benchmarks). Output: {out} = {{"engine": "<ref>", "why": "..."}
     "build_engine": COMMON + """
 
 Task: build the agent-built engine `{engine_id}` into `{work_dir}` from the signed request in {out_in}
-and `engine_build/request.json`. You have no shell; use `mcp__engine__try` (runs static checks S1-S4
-and public cases of checks A1-A8) and `mcp__engine__run` (one sandboxed evaluation within request domains)
-to test your working copy (shared 30-call cap). You may read `{repo}/toolkit/engines/contract.py` (always
+and `engine_build/request.json`. You have no shell; use `mcp__engine__try` (runs static checks S1-S3
+and public cases of checks A1-A6, A8) and `mcp__engine__run` (one sandboxed evaluation within request domains)
+to test your working copy. You may read `{repo}/toolkit/engines/contract.py` (always
 use that full repo path, not a relative path inside the run directory). Write ONLY these files inside `{work_dir}`
 (NEVER create scratch `.txt`/`.tmp` files there — you have no delete tool and static check S1 rejects any stray file):
 - `engine.py` defining `class Model` implementing the signed contract (and optional sibling `.py` helpers)
@@ -234,14 +232,12 @@ Rules:
 - The engine carries trial effects over to the setting (principle 3); its own burden is a validation
   check, not the basis of the decision.
 - It must declare and use EXACTLY the parameters the signed request names (name, kind, value, lo, hi,
-  units, source; omit `lo`/`hi` when omitted in the request). Read the resolved `params` mapping directly
-  (do not `dict(params)` copy it) so A6 parameter-read tracking records every read. Every non-inert input
-  must move its declared `expected_effects` outputs with the declared sign inside the dynamics (never via
-  post-hoc formulas or tiny epsilon terms).
-- Obey static checks S1-S4 in {out_in}: module top level may contain ONLY imports, simple constant
+  units, source; omit `lo`/`hi` when omitted in the request). Read every non-inert parameter inside the
+  dynamics (never via post-hoc formulas or tiny epsilon terms), and make sure every declared output is live.
+- Obey static checks S1-S3 in {out_in}: module top level may contain ONLY imports, simple constant
   assignments, `def`, and `class` (NO module-level `try/except`, `if`, `for`, or bare expression calls);
   no dynamic `getattr(obj, var_name)` with non-literal attribute names; no file/process/network/interpreter
-  access; no `scipy.integrate`; no single literal container > 16 numbers.
+  access; no `scipy.integrate`.
 - Never attempt to read `engine_build/.hidden/`, `engine_build/reference/`, `analysis/`, or any other run.
 When `mcp__engine__try(checks="all")` passes cleanly, write {out} = {{"ok": true, "notes": "<summary>"}} and stop.""",
     "build_reference": COMMON + """
@@ -261,28 +257,29 @@ Write ONLY `engine_build/reference/reference.py`:
   `package.components`, `horizon.window = (t0, t1)` where duration is `t1 - t0` whether calendar or relative years).
 - You may use plain loops, `numpy`, `math`, `scipy.special`, `scipy.stats`, and `scipy.integrate`
   (this reference is a test oracle for admission check A11, never exposed to the analysis).
-- Obey static checks S1-S4 strictly: module top level may contain ONLY imports, simple constant assignments,
+- Obey static checks S1-S3 strictly: module top level may contain ONLY imports, simple constant assignments,
   `def`, and `class` (NO module-level `try/except`, `if`, `for`, or bare expression calls — put helper calls
-  inside functions/methods); no dynamic `getattr(obj, var_name)`; no file/process/network/interpreter access;
-  no single literal container > 16 numbers.
+  inside functions/methods); no dynamic `getattr(obj, var_name)`; no file/process/network/interpreter access.
 - Follow every signed mechanism, parameter, unit attribute, compartment rule, reduction, and output
   independently from first principles.
 When `engine_build/reference/reference.py` is complete, write {out} = {{"ok": true, "notes": "<summary>"}} and stop.""",
     "critique_engine": COMMON + """
 
-Task: engine review (`critique-engine`), round {round}. Inspect the admitted built engine's snapshot
-(listed in {out_in}), `ENGINE_NOTES.md`, `card.yaml`, `engine_build/admission.json`, `engine_build/admission_sheet.md`,
-and `engine_build/request.json`. Do not read `engine_build/.hidden/` or `engine_build/reference/`.
+Task: engine review (`critique-engine`), round {round}. Inspect the admitted built engine's snapshot files
+(exact paths listed in {out_in}: `<snapshot_dir>/engine.py`, `<snapshot_dir>/card.yaml`, `<snapshot_dir>/ENGINE_NOTES.md`),
+`engine_build/admission.json`, `engine_build/admission_sheet.md`, `engine_build/request.json`, and the dossier
+named in {out_in} if present. Do not read `engine_build/.hidden/` or `engine_build/reference/`.
 Check every item:
-1. `ENGINE_NOTES.md` matches the equations and behavior implemented in the snapshot code.
-2. Every state used in the model dynamics is among the signed compartment states (`request.compartments.states`).
+1. `<snapshot_dir>/ENGINE_NOTES.md` matches the equations and behavior implemented in `<snapshot_dir>/engine.py`.
+2. Every state used in the model dynamics is among the signed compartment states (`request.compartments.states`, when declared).
 3. No additive hack terms exist merely to move an output (e.g. an `epsilon * p` pattern).
 4. Each parameter's declared source and range matches the signed request and dossier.
-5. Structural assumptions and limitations are stated honestly on `card.yaml` and `ENGINE_NOTES.md`.
+5. Structural assumptions and limitations are stated honestly on `<snapshot_dir>/card.yaml` and `<snapshot_dir>/ENGINE_NOTES.md`.
 Write `critique_engine.yaml` with keys: `reviewer: critique-engine`, `round: {round}`,
 `verdict: PASS | REVISE`, and `blockers: [...]` (ids `E-NNN`, each with `id`, `severity` in
 HIGH|MEDIUM|LOW, `category`, `target_stage: ENGINE`, `claim`, `evidence`, `fix_requires`, `resolved: bool`).
-Raise HIGH only for genuine scientific, structural, or contract defects; otherwise PASS.{feedback}
+Quote any YAML scalar containing `: ` (colon-space) or use a folded block scalar (`>-`) so the YAML parses cleanly.
+Raise HIGH only for genuine scientific, structural, or contract defects; otherwise PASS (advisory MEDIUM/LOW notes are allowed with PASS).{feedback}
 Output: `critique_engine.yaml` and {out} = {{"ok": true}}.""",
     "critique": COMMON + """
 
@@ -771,6 +768,12 @@ def _allowed(path: str, run_dir: str, owns: tuple, kind: str | None = None) -> s
         return f"{rel} is written by the harness"
     if low.startswith("models/ext/engine_") and kind != "build_engine":
         return f"{rel} is an agent-built engine working copy: only build_engine may write models/ext/engine_*"
+    if kind == "build_engine" and low.startswith("models/ext/engine_"):
+        from toolkit.engines.built import snapshot as BSNAP
+        parts = rel.split("/")
+        if len(parts) != 4 or not BSNAP._allowed_filename(parts[3]):
+            return (f"{rel} is not an allowed built-engine file (write only top-level engine.py, sibling .py helpers, "
+                    "card.yaml, or ENGINE_NOTES.md inside models/ext/engine_<id>/)")
     if os.path.exists(p):
         try:
             if os.path.isfile(p) and os.stat(p).st_nlink > 1:
@@ -1275,8 +1278,8 @@ def _make_engine_mcp_server(run_dir: str, *, unsandboxed_ok: bool = False):
 
     @tool(
         "try",
-        "Snapshot the built-engine working copy, run static checks S1-S4 and public cases of requested checks "
-        "(A1-A8 or 'all'), persist engine_build/try/<n>.json, and return a <=8KB summary.",
+        "Snapshot the built-engine working copy, run static checks S1-S3 and public cases of requested checks "
+        "(A1-A6, A8, or 'all'), persist engine_build/try/<n>.json, and return a <=8KB summary.",
         {"checks": {"oneOf": [{"type": "string"}, {"type": "array", "items": {"type": "string"}}]}},
     )
     async def _try_fn(args):
@@ -1641,10 +1644,24 @@ class SdkTasks:
         try:
             adm = json.loads(_sio().read_nofollow(self.run_dir, "engine_build/admission.json")[0].decode("utf-8"))
             snap_sha = adm.get("snapshot_sha256")
+            sdir = f"engine_build/snapshots/{snap_sha}/" if snap_sha else None
+            doss_rel = None
+            try:
+                import yaml
+                sp = yaml.safe_load(_sio().read_nofollow(self.run_dir, "decision_spec.yaml")[0].decode("utf-8")) or {}
+                doss_rel = (sp.get("evidence") or {}).get("dossier") if isinstance(sp.get("evidence"), dict) else None
+            except (OSError, ValueError):
+                pass
             snap_info = {
                 "engine_id": adm.get("engine_id"),
                 "snapshot_sha256": snap_sha,
-                "snapshot_dir": f"engine_build/snapshots/{snap_sha}/" if snap_sha else None,
+                "snapshot_dir": sdir,
+                "files": {
+                    "engine_py": f"{sdir}engine.py" if sdir else None,
+                    "card_yaml": f"{sdir}card.yaml" if sdir else None,
+                    "engine_notes_md": f"{sdir}ENGINE_NOTES.md" if sdir else None,
+                },
+                "dossier_path": doss_rel,
             }
         except (OSError, ValueError):
             pass
@@ -1657,6 +1674,7 @@ class SdkTasks:
             f"Review the admitted built engine (round {round_n}) and write critique_engine.yaml.",
             OWNS["critique_engine"],
             enforcement.MODEL_DEEP,
+            force_no_cloud=True,
             stage="ENGINE_REVIEW",
         )
 

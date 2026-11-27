@@ -1389,32 +1389,6 @@ def spec_has_engine_build(run_dir: str) -> bool:
         return False
 
 
-def _extract_dossier_benchmarks(dossier_bytes: bytes | None) -> list[dict]:
-    """Extract A9 literature/dossier benchmark entries (`{id, unit, package, params, path, band}`)
-    from the signed evidence dossier YAML bytes (empty list when absent or none declared)."""
-    if not dossier_bytes:
-        return []
-    import yaml
-    try:
-        doc = yaml.safe_load(dossier_bytes.decode("utf-8"))
-    except Exception:  # noqa: BLE001
-        return []
-    if not isinstance(doc, dict):
-        return []
-    raw_items = doc.get("benchmarks")
-    if not isinstance(raw_items, list):
-        raw_items = doc.get("literature_benchmarks")
-    if not isinstance(raw_items, list):
-        return []
-    out: list[dict] = []
-    for item in raw_items:
-        if (isinstance(item, dict) and item.get("id") is not None
-                and isinstance(item.get("path"), str) and item["path"].strip()
-                and isinstance(item.get("band"), (list, tuple)) and len(item["band"]) == 2):
-            out.append(dict(item))
-    return out
-
-
 def evidence_gate(run_dir: str, engine: tuple | None = None, signoff: str | None = None) -> list[str]:
     """F6 (#218): the registered preconditions of a signed run, recomputed from its files (the sign-off record
     compared; the engine chosen in engine_choice.json, or `engine`): checked at ENGINE_CHOICE on the engine picked and
@@ -2468,7 +2442,7 @@ class Machine:
                      f"({len(req['findings'])} finding(s)); amend the spec and relaunch with reuse")
             return "SPEC"
         n = self.st.tries.get("spec", 0)
-        max_spec = MAX_SPEC_TRIES + (1 if self.st.tries.get("spec_bonus") else 0)
+        max_spec = MAX_SPEC_TRIES + int(self.st.tries.get("spec_bonus") or 0)
         if n >= max_spec:
             return self._go("FINAL", "the spec did not validate", "run_failed")
         rd = self.run_dir
@@ -2660,7 +2634,9 @@ class Machine:
             child = child if child and _made_by(child, req, self.run_dir) else None
         if la.get("status") == "refused":
             return None                   # the first refusal stands, with its reason and any kept child
-        if any(os.path.lexists(os.path.join(self.run_dir, f)) for f in LEGACY_BRIEF_SIGNOFF):
+        if req.get("source") == "ENGINE_ADMIT":
+            why = "post-admission built-engine spec amendments require owner review (lead never auto-amends trial bands or departures)"
+        elif any(os.path.lexists(os.path.join(self.run_dir, f)) for f in LEGACY_BRIEF_SIGNOFF):
             # owner decision on #330: in v2 a legacy decision-brief signature (which may bind other files than the spec)
             # never satisfies the lead's check, also when recovering an interrupted hand-off (Codex r3); the owner decides
             why = "the parent carries a legacy decision brief signature, which a lead amendment never relies on in v2"
@@ -2956,6 +2932,25 @@ class Machine:
                     return self._budget_out("EVIDENCE")
                 notes.append(f"try {n + 1}: " + (res.note if res.ok else f"failed: {res.note}")[:200])
                 fb = []
+                # Pre-SIGN factual discrepancy found in staged input files while drafting the dossier -> bounce to SPEC
+                disc = (res.output or {}).get("spec_discrepancies") if (res.ok and isinstance(res.output, dict)) else None
+                bounces = int(self.st.tries.get("evidence_spec_bounces") or 0)
+                if isinstance(disc, list) and disc and bounces < 2:
+                    disc_probs: list[str] = []
+                    for item in disc[:10]:
+                        if isinstance(item, dict):
+                            disc_probs.append(
+                                f"evidence discrepancy in {item.get('field', 'decision_spec.yaml')}: "
+                                f"spec={item.get('spec_value')!r} vs file={item.get('file_value')!r} "
+                                f"(source: {item.get('source', 'staged input')})"
+                            )
+                        elif item:
+                            disc_probs.append(f"evidence discrepancy: {item}")
+                    if disc_probs:
+                        self.st.tries["evidence_spec_bounces"] = bounces + 1
+                        self.st.tries["spec_bonus"] = int(self.st.tries.get("spec_bonus") or 0) + 1
+                        self.st.tries.pop("evidence_feedback", None)
+                        return spec_back(disc_probs)
                 try:
                     EDR.scaffold(rd, a, raw)            # an entry the task dropped is scaffolded again
                     a = EDR.assess(rd, raw)
@@ -3007,6 +3002,14 @@ class Machine:
         if has_build and (not has_auto or not eligible):
             if self.st.signoff == "none":
                 return self._go("FINAL", "an engine build needs a signed request (--signoff none refused)", "run_failed")
+            prev_eb = self.st.engine_build if isinstance(self.st.engine_build, dict) else {}
+            if (prev_eb.get("status") == "signed" or int(prev_eb.get("tries") or 0) > 0) and not self._engine_repairs_left():
+                self.st.history.append({
+                    "at": _now(), "state": "ENGINE_CHOICE", "round": self.st.round,
+                    "engine_repair_refused": True,
+                    "why": f"re-entering built engine via ENGINE_CHOICE refused (cap {MAX_ENGINE_REPAIRS})",
+                })
+                return self._go("FINAL", f"second engine repair refused (cap {MAX_ENGINE_REPAIRS})", "run_failed")
             from lib.safe_io import remove_nofollow
             from toolkit.engines.built import requested as BREQ
             build_decl = dict(raw_eng["build"])
@@ -3119,14 +3122,13 @@ class Machine:
                 "required_files": ["engine.py", "card.yaml", "ENGINE_NOTES.md"],
             },
             "checks": {
-                "S1-S4": "file/link/size audit, AST import allowlist, banned calls/dunders, literal table audit",
+                "S1-S3": "file/link/size audit, AST import allowlist, banned calls/dunders/top-level execution",
                 "A1": "conformance with EngineCard, card.yaml, exact request parameters, non-negative finite outputs",
                 "A2": "determinism across processes, PYTHONHASHSEED, case orders, opaque IDs, and seed_test_setting",
                 "A3": "optional run_batch_state equals run pair by pair",
                 "A4": "declared oracle reductions + absent-component identity + per_capita_invariant_to_N",
                 "A5": "compartment mass balance, non-negativity, conservation, transition-count witnesses (starsim_module)",
-                "A6": "sensitivity wiring over expected_effects + param_reads phase checks",
-                "A7": "declared directional signs over every A6 point",
+                "A6": "dead-parameter read tracking, read_outcomes phase check, non-trivial output movement, and output liveness",
                 "A8": "structured trial benchmarks under built coverage policy",
             },
             "feedback": list(feedback or []),
@@ -3243,26 +3245,90 @@ class Machine:
         except (OSError, ValueError):
             return
 
+    def _invalidate_engine_admission(self) -> None:
+        """Clear stale admission/review/signoff artifacts before rebuilding a built engine."""
+        from lib.safe_io import remove_nofollow
+        eb = self.st.engine_build
+        if isinstance(eb, dict):
+            eb["status"] = "building"
+            eb["snapshot_sha256"] = None
+            eb["admission_sha256"] = None
+            eb["hidden_commitment"] = None
+            eb["hidden_seed_snapshot"] = None
+            eb["compute_reservation_id"] = None
+        for stale_rel in ("engine_build/admission.json", "engine_build/admission_sheet.md",
+                          "engine_build/signoff.json", "engine_build/decline.json",
+                          "engine_build/review_status.json", "engine_build/.hidden/seed.json",
+                          "critique_engine.yaml"):
+            remove_nofollow(self.run_dir, stale_rel, missing_ok=True)
+
+    def _smoke_check_reference(self, ref_raw: bytes, build_decl: dict, raw_spec: dict) -> list[str]:
+        """Fast sandboxed runtime smoke check on `reference.py` before locking its snapshot: verifies
+        `describe()`, `parameters()`, and one evaluation produce finite non-negative declared outputs."""
+        import math
+        import numpy as np
+        from toolkit.engines.built import admission as BADM
+        from toolkit.engines.built import candidate as BCAND
+        from toolkit.engines.contract import Package
+        ref_build = dict(build_decl)
+        ref_build["kind"] = "closed_form"
+        req = ref_build.get("request") or {}
+        ref_files = {
+            "engine.py": bytes(ref_raw),
+            "card.yaml": b"name: built_reference\nkind: reference\nbenchmarks: []\n",
+            "ENGINE_NOTES.md": b"# Independent reference implementation\n",
+        }
+        try:
+            rc = BCAND.CandidateEngine(
+                ref_files, ref_build, run_dir=self.run_dir, unsandboxed_ok=self.st.engine_unsandboxed,
+            )
+            card = rc.describe()
+            _ = rc.parameters()
+            hor = BADM._default_horizon(raw_spec, req)
+            comp_specs = req.get("components") or {}
+            absent_pkg = {c: cs["absent"] for c, cs in comp_specs.items()}
+            u0 = BADM.generate_domain_units(req, 1, np.random.default_rng(17))[0]
+            out = rc.run({}, u0, Package("ref_smoke", absent_pkg), hor, seed=1)
+        except Exception as e:  # noqa: BLE001
+            return [f"reference runtime smoke check failed: {type(e).__name__}: {e}"]
+        probs: list[str] = []
+        req_outs = req.get("outputs") or {}
+        for pc in (req_outs.get("per_capita") or []):
+            pm = (out.per_capita or {}).get(pc)
+            if not isinstance(pm, dict):
+                probs.append(f"reference output missing per_capita.{pc}")
+                continue
+            for g in (req.get("age_groups") or card.age_groups or []):
+                v = pm.get(g)
+                if not isinstance(v, (int, float)) or isinstance(v, bool) or not math.isfinite(float(v)) or float(v) < 0.0:
+                    probs.append(f"reference per_capita.{pc}[{g}]={v!r} (must be finite >= 0)")
+        for drv in (req_outs.get("cost_drivers") or []):
+            dv = (out.cost_drivers or {}).get(drv)
+            if not isinstance(dv, (int, float)) or isinstance(dv, bool) or not math.isfinite(float(dv)) or float(dv) < 0.0:
+                probs.append(f"reference cost_driver {drv}={dv!r} (must be finite >= 0)")
+        for wn, ms in (req_outs.get("windows") or {}).items():
+            if wn in hor.windows:
+                wm = (out.windows or {}).get(wn)
+                if not isinstance(wm, dict):
+                    probs.append(f"reference window {wn!r} missing")
+                    continue
+                for m in (ms or []):
+                    mv = wm.get(m)
+                    if not isinstance(mv, (int, float)) or isinstance(mv, bool) or not math.isfinite(float(mv)):
+                        probs.append(f"reference window {wn}.{m}={mv!r} not finite")
+        return probs
+
     def _begin_engine_repair(self, why: str, findings: list[str] | None = None):
         """Route a GATE/FIX_LOOP finding with `target_stage: ENGINE` into the single allowed engine repair
         (§6.1, BE30): clears post_write, increments round_pending, withholds report, removes old sign-off,
         resets engine_choice.json to pending-build, and transitions to ENGINE_BUILD."""
-        from lib.safe_io import remove_nofollow
         eb = self.st.engine_build
         eb["repairs"] = int(eb.get("repairs") or 0) + 1
-        eb["status"] = "building"
-        eb["admission_sha256"] = None
-        eb["hidden_commitment"] = None
-        eb["hidden_seed_snapshot"] = None
-        eb["compute_reservation_id"] = None
+        self._invalidate_engine_admission()
         self.st.round_pending = True
         self.st.post_write = False
         self.st.engine = None
         _withhold_report(self.run_dir)
-        for stale_rel in ("engine_build/signoff.json", "engine_build/decline.json",
-                          "engine_build/review_status.json", "engine_build/.hidden/seed.json",
-                          "critique_engine.yaml"):
-            remove_nofollow(self.run_dir, stale_rel, missing_ok=True)
         self._update_pending_choice_status(str(eb["id"]), "building")
         fb = list(findings or []) or [f"post-analysis engine repair: {why}"]
         self.st.tries["engine_build_feedback"] = fb
@@ -3304,6 +3370,15 @@ class Machine:
                 eb["status"] = "refused"
                 return self._go("FINAL", f"engine build exhausted {max_tries} try/tries", ENGINE_NOT_ADMITTED)
 
+            wdir_rel = f"models/ext/engine_{bid}"
+            wdir = os.path.join(self.run_dir, wdir_rel)
+            if os.path.isdir(wdir) and not os.path.islink(wdir):
+                from lib.safe_io import remove_nofollow
+                for entry in list(os.listdir(wdir)):
+                    if not BSNAP._allowed_filename(entry):
+                        ep = os.path.join(wdir, entry)
+                        if not os.path.isdir(ep) or os.path.islink(ep):
+                            remove_nofollow(self.run_dir, f"{wdir_rel}/{entry}", missing_ok=True)
             fb = list(self.st.tries.get("engine_build_feedback") or [])
             packet = self._build_engine_packet(build_decl, fb)
             try_num = n_used + 1
@@ -3319,15 +3394,14 @@ class Machine:
             if res is None:
                 return self._budget_out("ENGINE_BUILD")
             eb["tries"] = try_num
-            wdir = os.path.join(self.run_dir, "models", "ext", f"engine_{bid}")
             static_probs: list[str] = []
-            if not res.ok:
-                static_probs.append(f"build_engine task failed: {res.note}")
             try:
                 files = BSNAP.read_working_copy(wdir)
                 static_probs.extend(BSNAP.check_static(files, request=build_decl))
             except BSNAP.SnapshotError as e:
                 static_probs.append(f"working copy invalid: {e}")
+            if static_probs and not res.ok:
+                static_probs.insert(0, f"build_engine task failed: {res.note}")
             if static_probs:
                 self.st.tries["engine_build_feedback"] = static_probs[:40]
                 if try_num < max_tries:
@@ -3358,10 +3432,14 @@ class Machine:
                 try:
                     ref_raw, ref_st = read_nofollow(self.run_dir, ref_rel)
                     if ref_st.st_nlink == 1:
-                        rman = BSNAP.create_reference_snapshot(ref_raw, ref_snaps, request=build_decl)
-                        eb["reference_snapshot_sha256"] = rman["snapshot_sha256"]
-                        eb["reference_status"] = "ready"
-                        ref_built = True
+                        smoke_probs = self._smoke_check_reference(ref_raw, build_decl, raw_spec)
+                        if not smoke_probs:
+                            rman = BSNAP.create_reference_snapshot(ref_raw, ref_snaps, request=build_decl)
+                            eb["reference_snapshot_sha256"] = rman["snapshot_sha256"]
+                            eb["reference_status"] = "ready"
+                            ref_built = True
+                        else:
+                            remove_nofollow(self.run_dir, ref_rel, missing_ok=True)
                     else:
                         remove_nofollow(self.run_dir, ref_rel, missing_ok=True)
                 except (OSError, ValueError, BSNAP.SnapshotError):
@@ -3386,22 +3464,29 @@ class Machine:
                         return self._budget_out("ENGINE_BUILD")
                     eb["reference_tries"] = ref_try
                     ref_probs: list[str] = []
-                    if not r_res.ok:
-                        ref_probs.append(f"build_reference failed: {r_res.note}")
-                    else:
+                    if os.path.lexists(os.path.join(self.run_dir, ref_rel)):
                         try:
                             ref_raw, ref_st = read_nofollow(self.run_dir, ref_rel)
                             if ref_st.st_nlink != 1:
                                 ref_probs.append("reference.py must be a single-link regular file")
                             else:
                                 rman = BSNAP.create_reference_snapshot(ref_raw, ref_snaps, request=build_decl)
-                                eb["reference_snapshot_sha256"] = rman["snapshot_sha256"]
-                                eb["reference_status"] = "ready"
-                                eb.pop("reference_feedback", None)
-                                ref_built = True
-                                break
+                                smoke_probs = self._smoke_check_reference(ref_raw, build_decl, raw_spec)
+                                if smoke_probs:
+                                    ref_probs.extend(smoke_probs)
+                                else:
+                                    eb["reference_snapshot_sha256"] = rman["snapshot_sha256"]
+                                    eb["reference_status"] = "ready"
+                                    eb.pop("reference_feedback", None)
+                                    ref_built = True
+                                    break
                         except (FileNotFoundError, OSError, ValueError, BSNAP.SnapshotError) as e:
                             ref_probs.append(f"reference static check failed: {e}")
+                    if not ref_built:
+                        if not r_res.ok:
+                            ref_probs.insert(0, f"build_reference failed: {r_res.note}")
+                        elif not ref_probs:
+                            ref_probs.append("reference.py was not written")
                     ref_fb = ref_probs[:20]
                     eb["reference_feedback"] = ref_fb
                     save_state(self.run_dir, self.st)
@@ -3427,18 +3512,26 @@ class Machine:
             return self._go("FINAL", f"cannot read decision_spec.yaml for admission: {e}", "run_failed")
 
         # BE33: reserve admission compute against the run balance BEFORE any dispatch, reusing an
-        # existing active reservation if an earlier admission attempt was interrupted before reconciling.
+        # existing active reservation (including an orphaned one after crash-before-save_state).
         cap_usd = self.st.budget_usd
         res_id = None
         prev_res_id = eb.get("compute_reservation_id")
-        if isinstance(prev_res_id, str) and prev_res_id:
-            ledger0 = RB.load_budget_ledger(self.run_dir)
-            for sess in ledger0.get("sessions") or []:
-                if (isinstance(sess, dict) and sess.get("session_id") == prev_res_id
-                        and sess.get("status") == "reserved"
-                        and float(sess.get("reserved_usd") or 0.0) + 1e-9 >= ENGINE_ADMIT_COMPUTE_CAP_USD):
+        ledger0 = RB.load_budget_ledger(self.run_dir)
+        for sess in reversed(ledger0.get("sessions") or []):
+            if not isinstance(sess, dict) or sess.get("status") != "reserved":
+                continue
+            if prev_res_id and sess.get("session_id") == prev_res_id:
+                if float(sess.get("reserved_usd") or 0.0) + 1e-9 >= ENGINE_ADMIT_COMPUTE_CAP_USD:
                     res_id = prev_res_id
                     break
+            elif (not prev_res_id and sess.get("stage") == "ENGINE_ADMIT"
+                  and sess.get("label") == "admission_compute"
+                  and float(sess.get("reserved_usd") or 0.0) + 1e-9 >= ENGINE_ADMIT_COMPUTE_CAP_USD):
+                res_id = str(sess.get("session_id"))
+                eb["compute_reservation_id"] = res_id
+                eb["compute_reserved_usd"] = float(sess.get("reserved_usd") or ENGINE_ADMIT_COMPUTE_CAP_USD)
+                save_state(self.run_dir, self.st)
+                break
         if res_id is None:
             if cap_usd is not None:
                 rem_state = round(cap_usd - self.st.spent_usd, 4)
@@ -3518,7 +3611,8 @@ class Machine:
                     dossier_bytes = d_raw
             except OSError:
                 dossier_bytes = None
-        dossier_benchmarks = _extract_dossier_benchmarks(dossier_bytes)
+        from toolkit.engines import benchmark_coverage as BC
+        from toolkit.engines.built import try_tool as BTRY
         # §7 Q2: A11 reference comparison is ON by default (matches pre-sign sheet `A11_reference: 1`); never
         # silently waived when reference.py is missing unless explicitly disabled in state.
         req_ref = bool(eb.get("require_reference")) if "require_reference" in eb else True
@@ -3535,10 +3629,8 @@ class Machine:
                 reference_files=ref_files,
                 require_reference=req_ref,
                 dossier_bytes=dossier_bytes,
-                dossier_benchmarks=dossier_benchmarks,
-                departures_status="signed",
+                departures_status=BC.signature(self.run_dir),
                 unsandboxed_ok=self.st.engine_unsandboxed,
-                run_public_baseline=True,
             )
         finally:
             RB.reconcile_compute(self.run_dir, res_id, actual_compute_usd, cap_usd=cap_usd)
@@ -3552,11 +3644,22 @@ class Machine:
         eb["hidden_commitment"] = adm.get("hidden_commitment") or commit
 
         # Check SPEC amendment routing BEFORE accepting admission (A10 is non-gating in admit(), so an
-        # otherwise-admitted engine with an unidentified decision-moving parameter still routes to SPEC).
+        # otherwise-admitted engine with an unidentified parameter still routes to SPEC).
         checks = adm.get("checks") or {}
         a8 = checks.get("A8") or {}
         a10 = checks.get("A10") or {}
-        a8_amend = a8.get("status") == "fail" and a8.get("routing") == "spec_amendment"
+        other_gating_failed = [
+            cid for cid in ("A1", "A2", "A3", "A4", "A5", "A6", "A11")
+            if (checks.get(cid) or {}).get("status") not in ("pass", "skipped", "not_applicable")
+        ]
+        a8_missing_bm = any("no benchmark" in str(p) for p in (a8.get("problems") or []))
+        n_used = int(eb.get("tries") or 0)
+        max_tries = self._max_engine_build_tries()
+        a8_amend = (
+            a8.get("status") == "fail"
+            and a8.get("routing") == "spec_amendment"
+            and (a8_missing_bm or not other_gating_failed or n_used >= max_tries)
+        )
         a10_unid = list(a10.get("unidentified") or [])
         dt_names: set[str] = set()
         for dt in ((spec_raw.get("analysis") or {}).get("decision_tests") or []):
@@ -3567,28 +3670,44 @@ class Machine:
                 for item in (dt.get("set") or []):
                     if isinstance(item, dict) and item.get("parameter"):
                         dt_names.add(str(item["parameter"]))
+                pert = dt.get("perturb")
+                if isinstance(pert, dict) and pert.get("name"):
+                    dt_names.add(str(pert["name"]))
         cal_cfg = spec_raw.get("calibration") if isinstance(spec_raw.get("calibration"), dict) else {}
         cal_method = "joint" if cal_cfg.get("joint") else str(cal_cfg.get("method") or "none")
         cal_priors = cal_cfg.get("priors") if isinstance(cal_cfg.get("priors"), dict) else {}
         a10_classes = a10.get("classes") if isinstance(a10.get("classes"), dict) else {}
-        # Under `calibration.method: posterior`, every prior-dominated parameter with a declared prior
-        # receives an automatic `prior_range_<p>` decision test during ANALYZE (and schema.py forbids
-        # declaring `prior_range_<p>` manually in the spec).
         auto_prior_range = {
             p for p in a10_unid
             if cal_method == "posterior"
             and a10_classes.get(p) == "prior_dominated"
             and p in cal_priors
         }
-        ee = (build_decl.get("request") or {}).get("expected_effects") or {}
+        req_d = build_decl.get("request") or {}
+        inert_set = set((req_d.get("inert") or {}).keys())
+        engine_inputs = (
+            {str(p["name"]) for p in (req_d.get("parameters") or []) if isinstance(p, dict) and p.get("name")}
+            | set((req_d.get("unit_attributes") or {}).keys())
+        ) - inert_set
         a10_uncovered = [
             p for p in a10_unid
-            if p in ee and p not in dt_names and p not in auto_prior_range
+            if p in engine_inputs and p not in dt_names and p not in auto_prior_range
         ]
         if a8_amend or (adm.get("status") == "admitted" and a10_uncovered):
             probs = list(a8.get("problems") or []) if a8_amend else []
             if a10_uncovered:
-                probs.append(f"A10 unidentified decision-moving parameter(s) without covering decision_test: {a10_uncovered}")
+                probs.append(f"A10 unidentified parameter(s) without covering decision_test: {a10_uncovered}")
+            claim_txt = "; ".join(probs[:6])
+            fix_req = "Owner amendment: add signed engine_departures or decision_test"
+            led = FL.load(self.run_dir)
+            led["engine_admit_amendment"] = FL.Finding(
+                id="engine_admit_amendment", kind="engine_admit_amendment", severity="HIGH",
+                source="engine-admit", owner_state="SPEC", target_stage="SPEC",
+                resolution_type="owner_decision", status="open", blocking=True,
+                scope_declarable=False, first_seen_round=self.st.round, last_seen_round=self.st.round,
+                claim=claim_txt, fix_requires=fix_req,
+            )
+            FL.save(self.run_dir, led)
             req_doc = {
                 "round": self.st.round,
                 "requested_at": _now(),
@@ -3598,8 +3717,7 @@ class Machine:
                 "briefs": [{"task": "ENGINE_ADMIT", "findings": ["A8" if a8_amend else "A10"],
                             "brief": "; ".join(probs[:4])}],
                 "findings": [{"id": "engine_admit_amendment", "severity": "HIGH",
-                              "claim": "; ".join(probs[:6]),
-                              "fix_requires": "Owner amendment: add signed engine_departures or decision_test"}],
+                              "claim": claim_txt, "fix_requires": fix_req}],
                 "next": "amend decision_spec.yaml (add engine_departures or decision_test) and relaunch with reuse",
             }
             _write_json(self.run_dir, SPEC_RETHINK_REQUEST, req_doc)
@@ -3611,25 +3729,26 @@ class Machine:
             self._update_pending_choice_status(str(eb["id"]), "admitted")
             return self._go("ENGINE_REVIEW", f"admitted snapshot {snap_sha[:12]}")
 
-        # Failed admission: retry ENGINE_BUILD if tries remain, else FINAL completed_engine_not_admitted.
+        # Failed admission: fail fast if A11 is permanently unavailable because reference build failed;
+        # otherwise retry ENGINE_BUILD if tries remain, else FINAL completed_engine_not_admitted.
         # NEVER copy hidden check problem strings (`adm["checks"][cid]["problems"]`) into builder feedback (§4.6).
         fb_lines: list[str] = []
         if adm.get("static_problems"):
             fb_lines += [f"static: {p}" for p in adm["static_problems"][:12]]
-        pub_failed = list((adm.get("feedback") or {}).get("public_failed") or [])
         failed_ids = list((adm.get("feedback") or {}).get("failed_checks") or [])
-        if pub_failed:
+        if (checks.get("A11") or {}).get("status") == "unavailable" and eb.get("reference_status") == "failed":
+            fb_lines.append("A11 independent reference implementation failed to build; cannot admit without reference")
+            eb["status"] = "refused"
+            self._write_request_for_owner(f"admission failed on checks {failed_ids}", fb_lines)
+            return self._go("FINAL", "independent reference unavailable after retries (A11)", ENGINE_NOT_ADMITTED)
+        pub_checks = [cid for cid in failed_ids if cid in BTRY.VALID_PUBLIC_CHECKS]
+        if pub_checks:
             fb_lines.append(
-                f"public checks failed: {pub_failed} — run mcp__engine__try(checks={pub_failed!r}) on your "
+                f"admission failed on check(s): {failed_ids} — run mcp__engine__try(checks={pub_checks!r}) on your "
                 "working copy to inspect public diagnostics"
             )
-        hidden_only = [cid for cid in failed_ids if cid != "public" and cid not in pub_failed]
-        if hidden_only:
-            fb_lines.append(f"hidden admission failed on check(s): {hidden_only}")
-        if adm.get("overfit_suspected"):
-            fb_lines.append("engine_overfit_suspected: public checks passed but hidden checks failed")
-        n_used = int(eb.get("tries") or 0)
-        max_tries = self._max_engine_build_tries()
+        elif failed_ids:
+            fb_lines.append(f"admission failed on check(s): {failed_ids}")
         if n_used < max_tries:
             self.st.tries["engine_build_feedback"] = fb_lines
             return self._go("ENGINE_BUILD", f"admission failed ({', '.join(failed_ids[:4])}); try {n_used}/{max_tries}")
@@ -3646,11 +3765,12 @@ class Machine:
         v = self._visit()
         repairs = int(self.st.tries.get("engine_review_repairs") or 0)
         fb = self.st.tries.get("engine_review_feedback")
-        if repairs == 0:
-            # Remove any stale critique_engine.yaml from a prior snapshot so a failed task can never reuse it
+        jkey = f"ENGINE_REVIEW#{v}:r{self.st.round}:a{repairs + 1}"
+        if repairs == 0 and (self.st.journal.get(jkey) or {}).get("status") != "completed":
+            # Remove any stale critique_engine.yaml from a prior snapshot before a fresh review task runs
             remove_nofollow(self.run_dir, BSIG.REVIEW_FILE, missing_ok=True)
         res = self._task(
-            f"ENGINE_REVIEW#{v}:r{self.st.round}:a{repairs + 1}",
+            jkey,
             "critique_engine",
             self.run_dir,
             self.st.round,
@@ -3661,10 +3781,11 @@ class Machine:
         if res is None:
             return self._budget_out("ENGINE_REVIEW")
         cpath = os.path.join(self.run_dir, BSIG.REVIEW_FILE)
-        if not res.ok:
-            doc, errs = None, [f"critique_engine task failed: {res.note or 'no output'}"]
-        else:
-            doc, errs = BSIG.validate_engine_critique(cpath, self.st.round)
+        doc, errs = (BSIG.validate_engine_critique(cpath, self.st.round)
+                     if os.path.isfile(cpath)
+                     else (None, [f"critique_engine task failed: {res.note or 'no output'}"]))
+        if doc is None and not res.ok:
+            errs = [f"critique_engine task failed: {res.note or 'no output'}"] + errs
         if doc is None:
             if repairs < 1:
                 self.st.tries["engine_review_repairs"] = repairs + 1
@@ -3692,6 +3813,7 @@ class Machine:
         })
         n_used = int(eb.get("tries") or 0)
         if open_high and n_used < self._max_engine_build_tries():
+            self._invalidate_engine_admission()
             self.st.tries["engine_build_feedback"] = [
                 f"engine reviewer {b['id']} ({b['severity']}): {b['claim']} Required: {b['fix_requires']}"
                 for b in open_high
@@ -3715,8 +3837,7 @@ class Machine:
             note = (dec or {}).get("note") or "declined"
             n_used = int(eb.get("tries") or 0)
             if n_used < self._max_engine_build_tries():
-                from lib.safe_io import remove_nofollow
-                remove_nofollow(self.run_dir, BSIG.DECLINE_REL, missing_ok=True)
+                self._invalidate_engine_admission()
                 self.st.tries["engine_build_feedback"] = [f"owner/lead declined admitted engine: {note}"]
                 return self._go("ENGINE_BUILD", f"engine declined with try left: {note[:120]}")
             eb["status"] = "declined"
@@ -3751,19 +3872,25 @@ class Machine:
                 default_cfg = dict(cfg_map.get("default") or {}) if isinstance(cfg_map, dict) else {}
             except Exception:  # noqa: BLE001
                 default_cfg = {}
+            prev_ch = {}
             try:
                 from lib.safe_io import read_nofollow
                 prev_ch = json.loads(read_nofollow(self.run_dir, AB.ENGINE_CHOICE)[0].decode("utf-8"))
-                cands = prev_ch.get("candidates") if isinstance(prev_ch, dict) else []
+                if not isinstance(prev_ch, dict):
+                    prev_ch = {}
             except (OSError, ValueError):
-                cands = []
-            _write_json(self.run_dir, AB.ENGINE_CHOICE, {
+                prev_ch = {}
+            cands = prev_ch.get("candidates") or []
+            choice_doc = {
                 "at": _now(),
-                "candidates": cands or [],
+                "candidates": cands,
                 "build": {"id": eb.get("id"), "status": "signed", "snapshot_sha256": eb.get("snapshot_sha256")},
                 "engine": {"ref": BUILT_ADAPTER_REF, "config": default_cfg},
                 "why": f"admitted and {by}-signed agent-built engine {eb.get('id')}",
-            })
+            }
+            if "engine_departures" in prev_ch:
+                choice_doc["engine_departures"] = prev_ch["engine_departures"]
+            _write_json(self.run_dir, AB.ENGINE_CHOICE, choice_doc)
             eb["status"] = "signed"
             self.st.engine = BUILT_ADAPTER_REF
             return self._go("PREREGISTER" if self.st.world_model_stages else "CONFIGURE",
@@ -4083,6 +4210,22 @@ class Machine:
             return self._go("OWNER_DECISION", f"{len(summ['owner_amendments'])} finding(s) need an owner amendment "
                                               f"({', '.join(summ['owner_amendments'])[:120]})")
         if summ.get("rethink"):
+            if summ["rethink"] == "ENGINE_CHOICE" and self._has_built_engine():
+                from toolkit.spec import schema as _SCH
+                try:
+                    eng_decl = (self._spec() or {}).get("engine")
+                except Exception:  # noqa: BLE001
+                    eng_decl = None
+                if not _SCH.engine_is_auto(eng_decl):
+                    if self._engine_repairs_left():
+                        return self._begin_engine_repair("the fix planner routed to ENGINE_CHOICE on a built-only run",
+                                                         self._rethink_reasons("ENGINE_CHOICE", planned=True))
+                    self.st.history.append({
+                        "at": _now(), "state": "FIX_LOOP", "round": self.st.round,
+                        "engine_repair_refused": True,
+                        "why": f"second engine repair refused (cap {MAX_ENGINE_REPAIRS}); finding queues for next run",
+                    })
+                    return self._go("FINAL", f"second engine repair refused (cap {MAX_ENGINE_REPAIRS})", "run_failed")
             if summ["rethink"] == "ENGINE_BUILD":
                 if not self._has_built_engine():
                     return self._go("FINAL", "ENGINE_BUILD rethink is invalid for a registered engine", "run_failed")

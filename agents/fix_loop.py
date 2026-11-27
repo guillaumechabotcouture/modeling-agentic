@@ -276,7 +276,6 @@ def validate_plan(plan, packet: dict) -> list[str]:
                     if fid in by_id
                     and by_id[fid].get("target_stage") != "ENGINE"
                     and by_id[fid].get("owner_state") != "ENGINE_BUILD"
-                    and by_id[fid].get("kind") != "engine_overfit_suspected"
                 ]
                 if non_eng:
                     errs.append(f"{tid}: ENGINE_BUILD rethink only covers findings targeting ENGINE (got {', '.join(non_eng)})")

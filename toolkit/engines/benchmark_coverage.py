@@ -477,6 +477,9 @@ def assess(ref: str, config: dict, raw: dict, departures_status: str, engine_nam
         sp = schema.Spec({k: v for k, v in raw.items() if k != "_packages"} | {"engine": {"ref": ref, "config":
                                                                                          config or {}}},
                          base or os.getcwd())
+        sp.engine_pending = False
+        sp._engine = engine()
+        sp._engine_ref = None
         return PC.decision_test_runs(sp, test_id, dict(effect, rows=rows))
     rp = getattr(engine(), "results_path", None)        # the engine's effective results file, its default included
     try:          # the effective packages the run will allocate over (after envelope pruning)
@@ -529,11 +532,19 @@ def posterior_trained(raw: dict, ref: str, config: dict | None, base: str | None
                      "eligibility cannot take the fit's chosen point"
 
 
-def departure_targets(raw: dict, ref: str, base: str | None = None) -> dict:
+def departure_targets(raw: dict, ref: str, base: str | None = None, *, engine=None) -> dict:
     """{departure key: {components, benchmark, estimand, pair}}: the spec components each departure's effect lives in
     (a benchmark's covered pairs, or the engine component no benchmark covers), over the effective packages. Read by
     the run's check of what each departure's test did (decision_tests.check_departures)."""
-    cov, _p = load(path_for(ref))
+    if engine is not None and callable(getattr(engine, "read_verified_bench", None)):
+        try:
+            cov = yaml.safe_load(engine.read_verified_bench("bench/benchmark_coverage.yaml").decode("utf-8")) or {}
+        except (ValueError, UnicodeDecodeError, yaml.YAMLError):
+            cov = None
+    elif engine is not None and getattr(engine, "coverage_path", None):
+        cov, _p = load(engine.coverage_path)
+    else:
+        cov, _p = load(path_for(ref))
     if not cov:
         return {}
     try:

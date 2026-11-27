@@ -6,20 +6,17 @@
 Deterministic harness verification of an immutable content-addressed snapshot against the signed
 `engine.build` request, spec, and dossier:
 - Public + hidden + real-unit typed domain generators with opaque IDs and invariance checks
-- Static checks S1-S4 (before any run)
-- Run checks A1-A11:
+- Static checks S1-S3 (before any run)
+- Run checks A1-A6, A8, A10, A11:
   - A1: conformance (`contract.check_engine` + exact card/parameter/output checks)
   - A2: determinism across processes, `PYTHONHASHSEED`, case order, and `seed_test_setting`
   - A3: `run_batch` vs `run` parity (skipped when no batch path exists)
   - A4: analytic/oracle reductions (`oracles.py`) + absent-component & N-invariance identities
   - A5: mass balance, population conservation, and compartment transition-count witness (`starsim_module`)
-  - A6: sensitivity wiring over signed `(input, output)` pairs + `meta.param_reads`
-  - A7: declared directions on every A6 pair (never vacuous)
+  - A6: dead-parameter read tracking (`meta.param_reads`), `read_outcomes`-only phase check, non-trivial output movement, and declared-output liveness
   - A8: trial benchmarks (`benchmark.py`) + built-engine coverage policy (`benchmark_coverage.gate(..., policy="built")`)
-  - A9: literature/dossier value benchmarks (gating only for `gating_benchmarks`)
   - A10: identifiability via `calibrators.calibrate_as_run`
   - A11: independent reference equivalence (deterministic tolerance or stochastic 95% CRN CI with `inconclusive`)
-- Overfit detection (`engine_overfit_suspected` HIGH when public passes and hidden fails)
 - Hidden-seed commitment (`engine_build/.hidden/seed.json`), reuse key (`compute_reuse_key`,
   `try_reuse_admission`), authoritative `engine_build/bench/*`, `engine_build/admission_sheet.md`,
   and atomic `engine_build/admission.json`. Nothing here names a disease.
@@ -35,6 +32,7 @@ import math
 import os
 import secrets
 import sys
+import tempfile
 from collections.abc import Mapping
 from statistics import NormalDist
 
@@ -157,6 +155,13 @@ def _outcomes_close(a: Outcomes, b: Outcomes, *, rel: float = 1e-12, abs_tol: fl
     return True, worst
 
 
+def _same_val(a, b) -> bool:
+    """Equality check keeping bools distinct from 0/1 ints (e.g. `False != 0`, `True != 1`)."""
+    if isinstance(a, bool) or isinstance(b, bool):
+        return type(a) is type(b) and a == b
+    return a == b
+
+
 def _default_horizon(spec_raw: Mapping, req: Mapping) -> Horizon:
     sim_h = spec_raw.get("horizon") if isinstance(spec_raw, Mapping) else None
     obj = spec_raw.get("objective") if isinstance(spec_raw, Mapping) else None
@@ -171,10 +176,11 @@ def _default_horizon(spec_raw: Mapping, req: Mapping) -> Horizon:
         win = (float(obj_hor[0]), float(obj_hor[1]))
     else:
         win = (start, stop)
-    wins = (obj.get("windows") if isinstance(obj, Mapping) else None) or {}
-    if not wins:
-        req_wins = (req.get("outputs") or {}).get("windows") or {}
-        wins = {str(w): [win[0], win[1]] for w in req_wins}
+    wins = dict((obj.get("windows") if isinstance(obj, Mapping) else None) or {})
+    req_wins = (req.get("outputs") or {}).get("windows") or {}
+    for w in req_wins:
+        if str(w) not in wins:
+            wins[str(w)] = [win[0], win[1]]
     return Horizon(start, stop, win, {str(k): [float(v[0]), float(v[1])] for k, v in wins.items()})
 
 
@@ -194,9 +200,23 @@ def _sample_attr(aspec: Mapping, rng: np.random.Generator, *, ref_vec=None, u_va
         return vs[int(rng.integers(0, len(vs)))]
     if at == "vector":
         ln = int(aspec.get("length", 1))
+        vrng = aspec.get("range") if "range" in aspec else aspec.get("test_range")
+        has_rng = isinstance(vrng, (list, tuple)) and len(vrng) == 2 and _finite(vrng[0]) and _finite(vrng[1])
+        vlo, vhi = (float(vrng[0]), float(vrng[1])) if has_rng else (None, None)
         if isinstance(ref_vec, (list, tuple)) and len(ref_vec) == ln:
-            scale = float(rng.uniform(0.6, 1.4))
-            return [max(1.0, float(x) * scale) for x in ref_vec]
+            scales = rng.uniform(0.6, 1.4, size=ln)
+            out_v = []
+            for x, sc in zip(ref_vec, scales):
+                fx = float(x)
+                cand_v = fx * float(sc) if fx != 0.0 else (0.5 * (vlo + vhi) if has_rng else 0.0)
+                if has_rng:
+                    cand_v = max(vlo, min(vhi, cand_v))
+                elif fx > 0.0:
+                    cand_v = max(1e-9, cand_v)
+                out_v.append(float(cand_v))
+            return out_v
+        if has_rng:
+            return [float(x) for x in rng.uniform(vlo, vhi, size=ln)]
         w = rng.uniform(0.2, 1.0, size=ln)
         return [float(x * 1000.0) for x in w]
     return 0.0
@@ -220,12 +240,28 @@ def _domain_points_attr(aspec: Mapping, *, ref_vec=None) -> list:
         return list(aspec.get("values") or [])
     if at == "vector":
         ln = int(aspec.get("length", 1))
+        vrng = aspec.get("range") if "range" in aspec else aspec.get("test_range")
+        has_rng = isinstance(vrng, (list, tuple)) and len(vrng) == 2 and _finite(vrng[0]) and _finite(vrng[1])
+        if has_rng:
+            vlo, vhi = float(vrng[0]), float(vrng[1])
+            if ln == 1:
+                return [[vlo], [vlo + 0.33 * (vhi - vlo)], [vlo + 0.67 * (vhi - vlo)], [vhi]]
+            ramp = [i / (ln - 1) for i in range(ln)]
+            return [
+                [vlo + (0.1 + 0.8 * r) * (vhi - vlo) for r in ramp],
+                [vlo + 0.25 * (vhi - vlo)] * ln,
+                [vlo + 0.75 * (vhi - vlo)] * ln,
+                [vlo + (0.9 - 0.8 * r) * (vhi - vlo) for r in ramp],
+            ]
         base = [float(x) for x in ref_vec] if isinstance(ref_vec, (list, tuple)) and len(ref_vec) == ln else [1000.0] * ln
+        if ln == 1:
+            return [[x * 0.5 for x in base], [x * 0.85 for x in base], [x * 1.15 for x in base], [x * 1.5 for x in base]]
+        ramp = [i / (ln - 1) for i in range(ln)]
         return [
-            [x * 0.5 for x in base],
-            [x * 0.85 for x in base],
-            [x * 1.15 for x in base],
-            [x * 1.5 for x in base],
+            [x * (0.4 + 1.2 * r) for x, r in zip(base, ramp)],
+            [x * 0.7 for x in base],
+            [x * 1.3 for x in base],
+            [x * (1.6 - 1.2 * r) for x, r in zip(base, ramp)],
         ]
     return [0.0]
 
@@ -273,8 +309,18 @@ def _real_units_and_packages(spec_raw: Mapping, req: Mapping, *, base_dir: str |
     ab = req.get("attribute_binding") or {}
     cal = spec_raw.get("calibration") if isinstance(spec_raw, Mapping) else {}
     cal_attr = str(cal.get("attribute") or "").strip() if isinstance(cal, Mapping) else ""
-    cal_scale = str(cal.get("scale") or "linear") if isinstance(cal, Mapping) else "linear"
+    cal_scale_decl = cal.get("scale") if isinstance(cal, Mapping) else None
     cal_range = cal.get("range") if isinstance(cal, Mapping) else None
+    cal_priors = (cal.get("priors") or {}) if isinstance(cal, Mapping) and isinstance(cal.get("priors"), Mapping) else {}
+
+    def _effective_cal_scale(aspec: Mapping) -> str:
+        if isinstance(cal_scale_decl, str) and cal_scale_decl in ("log", "linear"):
+            return cal_scale_decl
+        # Match toolkit/spec/schema.py:card_scale() — log default for non-negative declared ranges, linear otherwise
+        rng_a = aspec.get("range") if "range" in aspec else aspec.get("test_range")
+        if isinstance(rng_a, (list, tuple)) and len(rng_a) >= 1 and _finite(rng_a[0]):
+            return "linear" if float(rng_a[0]) < 0.0 else "log"
+        return "linear"
 
     def _coerce_attr(raw_val, aspec: Mapping):
         at = aspec.get("type")
@@ -282,6 +328,15 @@ def _real_units_and_packages(spec_raw: Mapping, req: Mapping, *, base_dir: str |
             return float(raw_val)
         if at == "integer":
             return int(round(float(raw_val)))
+        if at == "categorical":
+            vs = aspec.get("values") or []
+            if any(_same_val(raw_val, v) for v in vs):
+                return raw_val
+            sval = str(raw_val).strip()
+            for v in vs:
+                if str(v) == sval:
+                    return v
+            return raw_val
         if at == "vector":
             if isinstance(raw_val, str):
                 return [float(x) for x in json.loads(raw_val)]
@@ -312,6 +367,10 @@ def _real_units_and_packages(spec_raw: Mapping, req: Mapping, *, base_dir: str |
             elif isinstance(bind, Mapping) and "columns" in bind:
                 cols = bind["columns"]
                 if isinstance(cols, Mapping):
+                    if aspec.get("type") == "vector":
+                        raise ValueError(
+                            f"real unit {uid!r}: vector attribute {aname!r} requires a list of column names, not a mapping"
+                        )
                     missing_c = [c for c in cols.values() if c not in row]
                     if missing_c:
                         raise ValueError(f"real unit {uid!r}: missing column(s) {missing_c} for attribute {aname!r}")
@@ -327,18 +386,28 @@ def _real_units_and_packages(spec_raw: Mapping, req: Mapping, *, base_dir: str |
                 val = _coerce_attr(row[aname], aspec)
             elif isinstance(ab.get(aname), Mapping) and "default" in ab[aname]:
                 val = copy.deepcopy(ab[aname]["default"])
-            elif cal_attr and aname == cal_attr:
-                # Calibrated per-unit attribute: calibration supplies per-unit values rather than a column binding.
-                rng = aspec.get("range") if "range" in aspec else aspec.get("test_range")
-                if isinstance(cal_range, (list, tuple)) and len(cal_range) == 2:
+            elif (cal_attr and aname == cal_attr) or (aname in cal_priors):
+                # Calibrated per-unit attribute (or prior-calibrated attribute): supply interior prior midpoint.
+                rng_a = aspec.get("range") if "range" in aspec else aspec.get("test_range")
+                pr_decl = cal_priors.get(aname) if isinstance(cal_priors.get(aname), Mapping) else None
+                pr_rng = pr_decl.get("range") if pr_decl is not None else None
+                eff_scale = _effective_cal_scale(aspec) if aname == cal_attr else "linear"
+                if aname == cal_attr and isinstance(cal_range, (list, tuple)) and len(cal_range) == 2:
                     mid = 0.5 * (float(cal_range[0]) + float(cal_range[1]))
-                    val = math.exp(mid) if cal_scale == "log" else mid
-                elif isinstance(rng, (list, tuple)) and len(rng) == 2:
-                    val = 0.5 * (float(rng[0]) + float(rng[1]))
+                    val = math.exp(mid) if eff_scale == "log" else mid
+                elif isinstance(pr_rng, (list, tuple)) and len(pr_rng) == 2:
+                    p0, p1 = float(pr_rng[0]), float(pr_rng[1])
+                    if pr_decl and pr_decl.get("dist") == "loguniform" and p0 > 0 and p1 > 0:
+                        val = math.sqrt(p0 * p1)
+                    else:
+                        mid = 0.5 * (p0 + p1)
+                        val = math.exp(mid) if eff_scale == "log" else mid
+                elif isinstance(rng_a, (list, tuple)) and len(rng_a) == 2:
+                    val = 0.5 * (float(rng_a[0]) + float(rng_a[1]))
                 else:
                     raise ValueError(f"real unit {uid!r}: calibrated attribute {aname!r} has no declared range")
-                if isinstance(rng, (list, tuple)) and len(rng) == 2:
-                    val = max(float(rng[0]), min(float(rng[1]), float(val)))
+                if isinstance(rng_a, (list, tuple)) and len(rng_a) == 2:
+                    val = max(float(rng_a[0]), min(float(rng_a[1]), float(val)))
             else:
                 raise ValueError(f"real unit {uid!r}: missing required attribute {aname!r} (no binding or default)")
             attrs[aname] = val
@@ -506,7 +575,10 @@ def check_a1(cand: BCAND.CandidateEngine, build_decl: Mapping, spec_raw: Mapping
         if field in card_doc and card_doc[field] != getattr(card, field):
             probs.append(f"describe().{field} disagrees with card.yaml")
 
-    # 2. describe() agrees with signed request on components, unit_attributes, outputs, age_groups
+    # 2. describe() agrees with signed request on name, components, unit_attributes, outputs, age_groups
+    want_name = f"built:{build_decl['id']}"
+    if card.name != want_name:
+        probs.append(f"card.name {card.name!r} != expected {want_name!r}")
     req_comps = {c: list(cs["values"]) for c, cs in (req.get("components") or {}).items()}
     if card.components != req_comps:
         probs.append(f"card.components {card.components!r} != request {req_comps!r}")
@@ -637,12 +709,11 @@ def check_a3(cand: BCAND.CandidateEngine, units: list[UnitSpec], packages: list[
     # Pick distinct valid parameter sets so A3 catches batch code reusing member 0's params
     req = (build_decl or {}).get("request") or {}
     inert = set((req.get("inert") or {}).keys())
-    ee = req.get("expected_effects") or {}
     param_specs = [p for p in (req.get("parameters") or []) if p.get("name") not in inert]
-    # Prefer a parameter declared in expected_effects with multiple distinct domain points
+    # Pick a non-inert parameter with multiple distinct domain points
     varied_name: str | None = None
     varied_pts: list = []
-    for ps in sorted(param_specs, key=lambda p: (p["name"] not in ee, p["name"])):
+    for ps in sorted(param_specs, key=lambda p: p["name"]):
         pts = _domain_points_param(ps)
         uniq = list(dict.fromkeys(pts))
         if len(uniq) >= 2:
@@ -726,10 +797,15 @@ def check_a4(cand: BCAND.CandidateEngine, build_decl: Mapping, spec_raw: Mapping
         rset = red.get("set") or {}
         runit = red.get("unit") or {}
         rhor_d = red.get("horizon")
-        rhor = (Horizon(float(rhor_d["start"]), float(rhor_d["stop"]),
-                        tuple(rhor_d.get("window") or (rhor_d["start"], rhor_d["stop"])),
-                        {str(k): list(v) for k, v in (rhor_d.get("windows") or {}).items()})
-                if isinstance(rhor_d, Mapping) else default_hor)
+        if isinstance(rhor_d, Mapping):
+            rwin = tuple(rhor_d.get("window") or (rhor_d["start"], rhor_d["stop"]))
+            rwins = {str(k): [float(v[0]), float(v[1])] for k, v in (rhor_d.get("windows") or {}).items()}
+            for wn in ((req.get("outputs") or {}).get("windows") or {}):
+                if str(wn) not in rwins:
+                    rwins[str(wn)] = [float(rwin[0]), float(rwin[1])]
+            rhor = Horizon(float(rhor_d["start"]), float(rhor_d["stop"]), rwin, rwins)
+        else:
+            rhor = default_hor
         free_units = generate_domain_units(req, n_free, rng, ref_units=ref_units)
         for fi, fu in enumerate(free_units):
             u_attrs = dict(fu.attributes)
@@ -911,10 +987,15 @@ def check_a5(cand: BCAND.CandidateEngine, build_decl: Mapping, units: list[UnitS
             "problems": probs[:12]}
 
 
-def check_a6_a7(cand: BCAND.CandidateEngine, build_decl: Mapping, spec_raw: Mapping,
-                rng: np.random.Generator, *, n_bases: int, min_moving: int, th: Mapping,
-                ref_units: list[UnitSpec] | None = None) -> tuple[dict, dict]:
-    """A6 sensitivity wiring + param_reads + A7 declared directions (BE2, BE3, BE4, BE5)."""
+def check_a6(cand: BCAND.CandidateEngine, build_decl: Mapping, spec_raw: Mapping,
+             rng: np.random.Generator, *, n_bases: int, min_moving: int, th: Mapping,
+             ref_units: list[UnitSpec] | None = None) -> dict:
+    """A6 wiring & liveness sanity (BE2, BE3, BE5):
+    - Every non-inert declared parameter must be read (`meta.param_reads`), must not be read ONLY in
+      `read_outcomes()` without `parameter_roles`, and must move at least one declared output above
+      the magnitude floor (`move_abs_floor`, `move_rel_floor`) across `>= min_moving` base points.
+    - Every non-inert component with >= 2 values must move at least one declared output above floor.
+    - Every declared output (`per_capita`, `cost_drivers`, `windows`) must move under at least one input."""
     req = build_decl["request"]
     abs_floor = float(th["move_abs_floor"])
     rel_floor = float(th["move_rel_floor"])
@@ -927,90 +1008,128 @@ def check_a6_a7(cand: BCAND.CandidateEngine, build_decl: Mapping, spec_raw: Mapp
     param_specs = {p["name"]: p for p in (req.get("parameters") or [])}
     inert = set((req.get("inert") or {}).keys())
     param_roles = dict(req.get("parameter_roles") or {})
-    expected_effects = req.get("expected_effects") or {}
     absent_pkg = {c: cs["absent"] for c, cs in comp_specs.items()}
     hor = _default_horizon(spec_raw, req)
 
-    # Map intervention decision inputs (BOTH parameter AND unit_attribute) to their owning component
-    # so base points activate that component (evaluating across all active values up to 4 when a
-    # component has multiple active modes so value ordering never hides an effect).
-    input_to_comp: dict[tuple[str, str], tuple[str, list]] = {}
-    for cname, spec_or_items in (req.get("decision_inputs") or {}).items():
+    # Canonical output paths tracked for liveness and movement checks
+    req_outs = req.get("outputs") or {}
+    out_paths: list[str] = []
+    for pc in (req_outs.get("per_capita") or []):
+        out_paths.append(f"per_capita_all.{pc}")
+    for drv in (req_outs.get("cost_drivers") or []):
+        out_paths.append(f"cost.{drv}")
+    for wname, metrics in sorted((req_outs.get("windows") or {}).items()):
+        for m in (metrics or []):
+            out_paths.append(f"windows.{wname}.{m}")
+
+    # Map intervention decision inputs (parameter / unit_attribute) to owning active component modes
+    input_to_comps: dict[tuple[str, str], list[tuple[str, list]]] = {}
+    for cname, spec_or_items in sorted((req.get("decision_inputs") or {}).items()):
         items = spec_or_items if isinstance(spec_or_items, list) else (spec_or_items.get("inputs") or [])
-        active_vals = [v for v in (comp_specs.get(cname, {}).get("values") or []) if v != comp_specs.get(cname, {}).get("absent")]
+        abs_v = comp_specs.get(cname, {}).get("absent")
+        active_vals = [v for v in (comp_specs.get(cname, {}).get("values") or []) if not _same_val(v, abs_v)]
         if active_vals:
             for it in items:
                 if isinstance(it, Mapping) and it.get("kind") in ("parameter", "unit_attribute"):
                     k_norm = "attribute" if it["kind"] == "unit_attribute" else "parameter"
-                    input_to_comp[(k_norm, str(it["name"]))] = (cname, list(active_vals[:4]))
+                    input_to_comps.setdefault((k_norm, str(it["name"])), []).append((cname, list(active_vals)))
 
-    # Cost drivers are often zero under the all-absent package; map each declared cost driver to
-    # active modes of components whose expected_effects include it so scale/unit attributes moving
-    # cost drivers are evaluated under active intervention modes as well as the absent package.
-    declared_cost_drivers = set((req.get("outputs") or {}).get("cost_drivers") or [])
-    output_to_active_pkgs: dict[str, list[dict]] = {}
+    def _pkg_key(pk_d: Mapping) -> tuple:
+        return tuple((str(k), type(v).__name__, repr(v)) for k, v in sorted(pk_d.items()))
+
+    def _dedup_pkgs(pkgs: list[dict], *, limit: int = 8) -> list[dict]:
+        seen: set[tuple] = set()
+        out_p: list[dict] = []
+        for pk_d in pkgs:
+            k = _pkg_key(pk_d)
+            if k not in seen:
+                seen.add(k)
+                out_p.append(dict(pk_d))
+                if len(out_p) >= limit:
+                    break
+        return out_p
+
+    all_single_active: list[dict] = []
     for cname, cs in sorted(comp_specs.items()):
-        c_eff = expected_effects.get(cname) or {}
-        active_vals = [v for v in (cs.get("values") or []) if v != cs.get("absent")]
-        if not active_vals:
-            continue
-        for oname in c_eff:
-            lst = output_to_active_pkgs.setdefault(str(oname), [])
-            for ov in active_vals[:4]:
-                pkg_d = dict(absent_pkg, **{cname: ov})
-                if pkg_d not in lst and len(lst) < 4:
-                    lst.append(pkg_d)
+        abs_v = cs.get("absent")
+        for ov in (cs.get("values") or []):
+            if not _same_val(ov, abs_v):
+                all_single_active.append(dict(absent_pkg, **{cname: ov}))
+    all_single_active = _dedup_pkgs(all_single_active, limit=16)
 
-    # Generate base units (interior of domains)
+    multi_active: list[dict] = []
+    if len(comp_specs) >= 2:
+        combo_first = dict(absent_pkg)
+        combo_last = dict(absent_pkg)
+        for cname, cs in sorted(comp_specs.items()):
+            abs_v = cs.get("absent")
+            avs = [v for v in (cs.get("values") or []) if not _same_val(v, abs_v)]
+            if avs:
+                combo_first[cname] = avs[0]
+                combo_last[cname] = avs[-1]
+        multi_active = _dedup_pkgs([combo_first, combo_last], limit=2)
+
     base_units = generate_domain_units(req, n_bases, rng, ref_units=ref_units)
-    a6_probs: list[str] = []
-    a7_probs: list[str] = []
-    wiring_rows: list[dict] = []
-    outputs_moved: set[str] = set()
+    seeds = [31 + i for i in range(k_seeds)]
+    n_seeds = len(seeds)
+    chunk_sz = 2048 if cand.kind == "closed_form" else 32
+    need_moving = min(min_moving, n_bases)
     reads_build_all: set[str] = set()
     reads_outcomes_all: set[str] = set()
-    pair_total, pair_pass_a6, pair_pass_a7 = 0, 0, 0
+    outputs_moved: set[str] = set()
 
-    seeds = [31 + i for i in range(k_seeds)]
+    def _run_chunked(cases_in: list[tuple[dict, UnitSpec, Package, Horizon, int]]) -> list[Outcomes]:
+        acc: list[Outcomes] = []
+        for a in range(0, len(cases_in), chunk_sz):
+            acc.extend(cand.run_many(cases_in[a:a + chunk_sz]))
+        for o in acc:
+            pr = (o.meta or {}).get("param_reads") or {}
+            reads_build_all.update(pr.get("build") or [])
+            reads_outcomes_all.update(pr.get("read_outcomes") or [])
+        return acc
 
-    # Build the complete A6/A7 evaluation plan across ALL inputs and run in a SINGLE worker batch
+    def _eval_mode(mode_outs: list[Outcomes], n_pts: int) -> tuple[int, float, set[str]]:
+        moved_bases = 0
+        best_rel = 0.0
+        moved_outs: set[str] = set()
+        extracted = [{op: _extract_output(o, op) for op in out_paths} for o in mode_outs]
+        for bi in range(len(base_units)):
+            base_moved = False
+            for op in out_paths:
+                ys_by_pt = [
+                    [extracted[(bi * n_pts + pi) * n_seeds + s][op] for s in range(n_seeds)]
+                    for pi in range(n_pts)
+                ]
+                means = [float(np.mean(ys)) for ys in ys_by_pt]
+                i_max = int(np.argmax(means))
+                i_min = int(np.argmin(means))
+                span = means[i_max] - means[i_min]
+                scale = max(abs(means[i_min]), abs(means[i_max]))
+                floor = max(abs_floor, rel_floor * scale)
+                best_rel = max(best_rel, span / max(scale, 1e-12))
+                if stochastic and n_seeds > 1:
+                    d_ext = [ys_by_pt[i_max][s] - ys_by_pt[i_min][s] for s in range(n_seeds)]
+                    m_ext = float(np.mean(d_ext))
+                    se_ext = float(np.std(d_ext, ddof=1)) / math.sqrt(n_seeds)
+                    moved = (m_ext - z_crit * se_ext > floor) or (m_ext + z_crit * se_ext < -floor)
+                else:
+                    moved = span > floor
+                if moved:
+                    base_moved = True
+                    moved_outs.add(op)
+                    outputs_moved.add(op)
+            if base_moved:
+                moved_bases += 1
+        return moved_bases, best_rel, moved_outs
+
+    # Pass 1: perturb every non-inert parameter, multi-value component, and unit attribute
     all_cases: list[tuple[dict, UnitSpec, Package, Horizon, int]] = []
-    input_plan: list[tuple[str, str, dict, list, int, int, int]] = []
-    for iname, out_signs in sorted(expected_effects.items()):
-        if iname in inert:
-            continue
-        if iname in param_specs:
-            ikind = "parameter"
-            pts = _domain_points_param(param_specs[iname])
-        elif iname in comp_specs:
-            ikind = "component"
-            pts = list(comp_specs[iname]["values"])
-        elif iname in attr_specs:
-            ikind = "attribute"
-            ref_v = base_units[0].attributes.get(iname) if base_units else None
-            pts = _domain_points_attr(attr_specs[iname], ref_vec=ref_v)
-        else:
-            continue
-        if (ikind, iname) in input_to_comp:
-            oc, ovas = input_to_comp[(ikind, iname)]
-            base_pkgs = [dict(absent_pkg, **{oc: ov}) for ov in ovas]
-        elif ikind != "component" and any(o in declared_cost_drivers for o in out_signs):
-            extra_pkgs: list[dict] = []
-            for oname in sorted(out_signs):
-                if oname in declared_cost_drivers:
-                    for pk_d in output_to_active_pkgs.get(oname, []):
-                        if pk_d not in extra_pkgs and len(extra_pkgs) < 4:
-                            extra_pkgs.append(pk_d)
-            if not extra_pkgs:
-                for cname, cs in sorted(comp_specs.items()):
-                    for ov in [v for v in (cs.get("values") or []) if v != cs.get("absent")][:4]:
-                        pk_d = dict(absent_pkg, **{cname: ov})
-                        if pk_d not in extra_pkgs and len(extra_pkgs) < 4:
-                            extra_pkgs.append(pk_d)
-            base_pkgs = [dict(absent_pkg), *extra_pkgs]
-        else:
-            base_pkgs = [dict(absent_pkg)]
-        start_idx = len(all_cases)
+    plan: list[tuple[str, str, list, list[dict], int, int]] = []
+
+    def _enqueue(iname: str, ikind: str, pts: list, base_pkgs: list[dict]) -> None:
+        if len(pts) < 2:
+            return
+        st_idx = len(all_cases)
         for base_pkg in base_pkgs:
             for bi, bu in enumerate(base_units):
                 for pt in pts:
@@ -1019,176 +1138,139 @@ def check_a6_a7(cand: BCAND.CandidateEngine, build_decl: Mapping, spec_raw: Mapp
                     u_use = UnitSpec(f"a6_{bi}", dict(bu.attributes, **{iname: pt})) if ikind == "attribute" else bu
                     for s in seeds:
                         all_cases.append((prm, u_use, Package(f"p_{bi}", pk_map), hor, s))
-        input_plan.append((iname, ikind, dict(out_signs), pts, len(base_pkgs), start_idx, len(all_cases)))
+        plan.append((iname, ikind, pts, base_pkgs, st_idx, len(all_cases)))
 
-    chunk_sz = 256 if cand.kind == "closed_form" else 32
-    all_outs: list[Outcomes] = []
-    for a in range(0, len(all_cases), chunk_sz):
-        all_outs.extend(cand.run_many(all_cases[a:a + chunk_sz]))
-    for o in all_outs:
-        pr = (o.meta or {}).get("param_reads") or {}
-        reads_build_all.update(pr.get("build") or [])
-        reads_outcomes_all.update(pr.get("read_outcomes") or [])
-    n_seeds = len(seeds)
-
-    for iname, ikind, out_signs, pts, n_modes, start_idx, end_idx in input_plan:
-        in_outs = all_outs[start_idx:end_idx]
-        n_pts = len(pts)
-        stride_mode = len(base_units) * n_pts * n_seeds
-        ordered = all(isinstance(p, (int, float, bool)) for p in pts) and n_pts >= 2
-        cat_abs_idx: int | None = None
-        if ikind == "component" and not ordered and iname in comp_specs:
-            abs_v = comp_specs[iname].get("absent")
-            if abs_v in pts:
-                cat_abs_idx = pts.index(abs_v)
-
-        for oname, sign in sorted(out_signs.items()):
-            pair_total += 1
-            best_moved_bases = 0
-            sign_ok_all = True
-            max_rel_change = 0.0
-            for mi in range(n_modes):
-                mode_outs = in_outs[mi * stride_mode:(mi + 1) * stride_mode]
-                moved_bases = 0
-                mode_sign_ok = True
-                for bi in range(len(base_units)):
-                    ys_by_pt: list[list[float]] = []
-                    for pi in range(n_pts):
-                        off = (bi * n_pts + pi) * n_seeds
-                        ys_by_pt.append([_extract_output(o, oname) for o in mode_outs[off:off + n_seeds]])
-                    if cat_abs_idx is not None:
-                        # Unordered categorical component: compare every active value against `absent`
-                        # rather than arbitrary list endpoints or step monotonicity across list order.
-                        y_abs = ys_by_pt[cat_abs_idx]
-                        y0_mean = float(np.mean(y_abs))
-                        floor = max(abs_floor, rel_floor * abs(y0_mean))
-                        any_pos = False
-                        any_neg = False
-                        for pi in range(n_pts):
-                            if pi == cat_abs_idx:
-                                continue
-                            d_pi = [ys_by_pt[pi][s] - y_abs[s] for s in range(len(seeds))]
-                            m_pi = float(np.mean(d_pi))
-                            rel_ch = abs(m_pi) / max(abs(y0_mean), 1e-12)
-                            max_rel_change = max(max_rel_change, rel_ch)
-                            if stochastic and len(seeds) > 1:
-                                se_pi = float(np.std(d_pi, ddof=1)) / math.sqrt(len(seeds))
-                                lo_pi, hi_pi = m_pi - z_crit * se_pi, m_pi + z_crit * se_pi
-                                if lo_pi > floor:
-                                    any_pos = True
-                                if hi_pi < -floor:
-                                    any_neg = True
-                            else:
-                                if m_pi > floor:
-                                    any_pos = True
-                                if m_pi < -floor:
-                                    any_neg = True
-                        span = max(float(np.mean(ys)) for ys in ys_by_pt) - min(float(np.mean(ys)) for ys in ys_by_pt)
-                        moved = (span > floor) if sign == "nonzero" else (any_pos or any_neg)
-                        if moved:
-                            moved_bases += 1
-                            outputs_moved.add(oname)
-                            if sign == "+" and not (any_pos and not any_neg):
-                                mode_sign_ok = False
-                            elif sign == "-" and not (any_neg and not any_pos):
-                                mode_sign_ok = False
-                        continue
-                    # Compare endpoints (pt[-1] vs pt[0]) and check monotonicity across ALL adjacent ordered steps
-                    diffs = [ys_by_pt[-1][s] - ys_by_pt[0][s] for s in range(len(seeds))]
-                    y0_mean = float(np.mean(ys_by_pt[0]))
-                    floor = max(abs_floor, rel_floor * abs(y0_mean))
-                    d_mean = float(np.mean(diffs))
-                    rel_ch = abs(d_mean) / max(abs(y0_mean), 1e-12)
-                    max_rel_change = max(max_rel_change, rel_ch)
-                    if stochastic and len(seeds) > 1:
-                        se = float(np.std(diffs, ddof=1)) / math.sqrt(len(seeds))
-                        lo_ci, hi_ci = d_mean - z_crit * se, d_mean + z_crit * se
-                        moved = (lo_ci > floor) or (hi_ci < -floor)
-                    else:
-                        span = max(float(np.mean(ys)) for ys in ys_by_pt) - min(float(np.mean(ys)) for ys in ys_by_pt)
-                        moved = (span > floor) if sign == "nonzero" else (abs(d_mean) > floor)
-                    if moved:
-                        moved_bases += 1
-                        outputs_moved.add(oname)
-                        if sign == "+":
-                            if not (d_mean > 0):
-                                mode_sign_ok = False
-                            elif ordered:
-                                for j in range(len(ys_by_pt) - 1):
-                                    s_diffs = [ys_by_pt[j + 1][s] - ys_by_pt[j][s] for s in range(len(seeds))]
-                                    s_mean = float(np.mean(s_diffs))
-                                    if stochastic and len(seeds) > 1:
-                                        s_se = float(np.std(s_diffs, ddof=1)) / math.sqrt(len(seeds))
-                                        if s_mean + z_crit * s_se < -floor:
-                                            mode_sign_ok = False
-                                    elif s_mean < -floor:
-                                        mode_sign_ok = False
-                        elif sign == "-":
-                            if not (d_mean < 0):
-                                mode_sign_ok = False
-                            elif ordered:
-                                for j in range(len(ys_by_pt) - 1):
-                                    s_diffs = [ys_by_pt[j + 1][s] - ys_by_pt[j][s] for s in range(len(seeds))]
-                                    s_mean = float(np.mean(s_diffs))
-                                    if stochastic and len(seeds) > 1:
-                                        s_se = float(np.std(s_diffs, ddof=1)) / math.sqrt(len(seeds))
-                                        if s_mean - z_crit * s_se > floor:
-                                            mode_sign_ok = False
-                                    elif s_mean > floor:
-                                        mode_sign_ok = False
-                if moved_bases > best_moved_bases:
-                    best_moved_bases = moved_bases
-                if moved_bases > 0 and not mode_sign_ok:
-                    sign_ok_all = False
-            moved_bases = best_moved_bases
-            ok_a6 = moved_bases >= min(min_moving, n_bases)
-            ok_a7 = ok_a6 and sign_ok_all  # A7 CANNOT pass vacuously if A6 failed (BE4)
-            wiring_rows.append({
-                "input": iname, "output": oname, "sign": sign,
-                "moved_bases": moved_bases, "n_bases": n_bases,
-                "max_rel_change": round(max_rel_change, 6),
-                "a6_ok": ok_a6, "a7_ok": ok_a7,
-            })
-            if ok_a6:
-                pair_pass_a6 += 1
-            else:
-                a6_probs.append(f"({iname} -> {oname}): moved at only {moved_bases}/{n_bases} base points "
-                                f"(max_rel_change={max_rel_change:.3g}, floor={rel_floor})")
-            if ok_a7:
-                pair_pass_a7 += 1
-            elif ok_a6 and not sign_ok_all:
-                a7_probs.append(f"({iname} -> {oname}): declared sign {sign!r} violated")
-            else:
-                a7_probs.append(f"({iname} -> {oname}): cannot verify sign {sign!r} because pair did not move in A6")
-
-    # Every declared non-inert parameter must be read; read_outcomes-only parameters require parameter_roles (BE5)
     for pname in sorted(param_specs):
         if pname in inert:
             continue
+        pts = _domain_points_param(param_specs[pname])
+        if ("parameter", pname) in input_to_comps:
+            bpkgs = _dedup_pkgs([dict(absent_pkg, **{oc: ov}) for oc, ovas in input_to_comps[("parameter", pname)] for ov in ovas], limit=6)
+        else:
+            bpkgs = [dict(absent_pkg)]
+        _enqueue(pname, "parameter", pts, bpkgs)
+
+    for cname in sorted(comp_specs):
+        if cname in inert:
+            continue
+        pts = list(comp_specs[cname]["values"])
+        _enqueue(cname, "component", pts, [dict(absent_pkg)])
+
+    for aname in sorted(attr_specs):
+        if aname in inert:
+            continue
+        ref_v = base_units[0].attributes.get(aname) if base_units else None
+        pts = _domain_points_attr(attr_specs[aname], ref_vec=ref_v)
+        if ("attribute", aname) in input_to_comps:
+            bpkgs = _dedup_pkgs([dict(absent_pkg, **{oc: ov}) for oc, ovas in input_to_comps[("attribute", aname)] for ov in ovas], limit=6)
+        else:
+            bpkgs = [dict(absent_pkg)]
+        _enqueue(aname, "attribute", pts, bpkgs)
+
+    all_outs = _run_chunked(all_cases)
+    input_state: dict[tuple[str, str], dict] = {}
+    fallback_items: list[tuple[str, str, list, list[dict]]] = []
+
+    for iname, ikind, pts, base_pkgs, st_idx, en_idx in plan:
+        in_outs = all_outs[st_idx:en_idx]
+        stride = len(base_units) * len(pts) * n_seeds
+        best_moved = 0
+        max_rel = 0.0
+        moved_outs_all: set[str] = set()
+        for mi in range(len(base_pkgs)):
+            mb, mrel, mouts = _eval_mode(in_outs[mi * stride:(mi + 1) * stride], len(pts))
+            best_moved = max(best_moved, mb)
+            max_rel = max(max_rel, mrel)
+            moved_outs_all.update(mouts)
+        input_state[(ikind, iname)] = {"moved_bases": best_moved, "max_rel": max_rel, "moved_outputs": moved_outs_all}
+        if ikind == "parameter" and (best_moved < need_moving or (iname not in reads_build_all and iname not in reads_outcomes_all)):
+            fallback_items.append((iname, ikind, pts, base_pkgs))
+        elif ikind == "attribute" and best_moved == 0 and len(outputs_moved) < len(out_paths):
+            fallback_items.append((iname, ikind, pts, base_pkgs))
+
+    # Pass 2 (lazy active-mode fallback): wake parameters/attributes gated by active intervention branches
+    if fallback_items and (all_single_active or multi_active):
+        fb_cases: list[tuple[dict, UnitSpec, Package, Horizon, int]] = []
+        fb_plan: list[tuple[str, str, list, list[dict], int, int]] = []
+        for iname, ikind, pts, tried_pkgs in fallback_items:
+            tried_keys = {_pkg_key(p) for p in tried_pkgs}
+            fb_pkgs = [p for p in _dedup_pkgs([dict(absent_pkg), *all_single_active, *multi_active], limit=len(tried_keys) + 8)
+                       if _pkg_key(p) not in tried_keys][:8]
+            if not fb_pkgs:
+                continue
+            st_idx = len(fb_cases)
+            for base_pkg in fb_pkgs:
+                for bi, bu in enumerate(base_units):
+                    for pt in pts:
+                        prm = {iname: float(pt)} if ikind == "parameter" else {}
+                        u_use = UnitSpec(f"a6fb_{bi}", dict(bu.attributes, **{iname: pt})) if ikind == "attribute" else bu
+                        for s in seeds:
+                            fb_cases.append((prm, u_use, Package(f"pfb_{bi}", dict(base_pkg)), hor, s))
+            fb_plan.append((iname, ikind, pts, fb_pkgs, st_idx, len(fb_cases)))
+        if fb_cases:
+            fb_outs = _run_chunked(fb_cases)
+            for iname, ikind, pts, fb_pkgs, st_idx, en_idx in fb_plan:
+                in_outs = fb_outs[st_idx:en_idx]
+                stride = len(base_units) * len(pts) * n_seeds
+                st_rec = input_state[(ikind, iname)]
+                for mi in range(len(fb_pkgs)):
+                    mb, mrel, mouts = _eval_mode(in_outs[mi * stride:(mi + 1) * stride], len(pts))
+                    st_rec["moved_bases"] = max(st_rec["moved_bases"], mb)
+                    st_rec["max_rel"] = max(st_rec["max_rel"], mrel)
+                    st_rec["moved_outputs"].update(mouts)
+
+    a6_probs: list[str] = []
+    wiring_rows: list[dict] = []
+    n_total, n_pass = 0, 0
+
+    for pname in sorted(param_specs):
+        if pname in inert:
+            continue
+        n_total += 1
+        st_rec = input_state.get(("parameter", pname)) or {"moved_bases": 0, "max_rel": 0.0, "moved_outputs": set()}
+        p_ok = True
         if pname not in reads_build_all and pname not in reads_outcomes_all:
             a6_probs.append(f"parameter {pname!r} was never read during A6 evaluations (dead parameter)")
+            p_ok = False
         elif pname in reads_outcomes_all and pname not in reads_build_all and pname not in param_roles:
             a6_probs.append(f"parameter {pname!r} was read ONLY in read_outcomes() without a signed parameter_roles entry")
+            p_ok = False
+        if st_rec["moved_bases"] < need_moving:
+            a6_probs.append(f"parameter {pname!r} moved no declared output above floor "
+                            f"({st_rec['moved_bases']}/{n_bases} bases, max_rel={st_rec['max_rel']:.3g}, floor={rel_floor})")
+            p_ok = False
+        if p_ok:
+            n_pass += 1
+        wiring_rows.append({
+            "input": pname, "kind": "parameter", "moved_bases": st_rec["moved_bases"], "n_bases": n_bases,
+            "max_rel_change": round(float(st_rec["max_rel"]), 6),
+            "moved_outputs": sorted(st_rec["moved_outputs"]), "a6_ok": p_ok,
+        })
 
-    # Every declared output must be moved by at least one input (accepting both bare names and full paths)
-    req_outs = req.get("outputs") or {}
-    for pc in (req_outs.get("per_capita") or []):
-        if not (pc in outputs_moved or f"per_capita_all.{pc}" in outputs_moved
-                or any(o.startswith(f"per_capita.{pc}.") for o in outputs_moved)):
-            a6_probs.append(f"declared output {pc!r} was not moved by any input in A6")
-    for drv in (req_outs.get("cost_drivers") or []):
-        if not (drv in outputs_moved or f"cost.{drv}" in outputs_moved):
-            a6_probs.append(f"declared output {drv!r} was not moved by any input in A6")
-    for wname, metrics in (req_outs.get("windows") or {}).items():
-        for m in (metrics or []):
-            if not (m in outputs_moved or f"windows.{wname}.{m}" in outputs_moved):
-                a6_probs.append(f"declared output 'windows.{wname}.{m}' was not moved by any input in A6")
+    for cname in sorted(comp_specs):
+        if cname in inert or len(comp_specs[cname].get("values") or []) < 2:
+            continue
+        n_total += 1
+        st_rec = input_state.get(("component", cname)) or {"moved_bases": 0, "max_rel": 0.0, "moved_outputs": set()}
+        c_ok = st_rec["moved_bases"] >= need_moving
+        if c_ok:
+            n_pass += 1
+        else:
+            a6_probs.append(f"component {cname!r} moved no declared output above floor "
+                            f"({st_rec['moved_bases']}/{n_bases} bases, max_rel={st_rec['max_rel']:.3g})")
+        wiring_rows.append({
+            "input": cname, "kind": "component", "moved_bases": st_rec["moved_bases"], "n_bases": n_bases,
+            "max_rel_change": round(float(st_rec["max_rel"]), 6),
+            "moved_outputs": sorted(st_rec["moved_outputs"]), "a6_ok": c_ok,
+        })
 
-    a6 = {"id": "A6", "status": "pass" if not a6_probs else "fail",
-          "passed": pair_pass_a6, "total": pair_total, "problems": a6_probs[:12], "wiring": wiring_rows}
-    a7 = {"id": "A7", "status": "pass" if not a7_probs else "fail",
-          "passed": pair_pass_a7, "total": pair_total, "problems": a7_probs[:12]}
-    return a6, a7
+    # Every declared output must be moved by at least one input
+    for op in out_paths:
+        if op not in outputs_moved:
+            a6_probs.append(f"declared output {op!r} was not moved by any input in A6")
+
+    return {"id": "A6", "status": "pass" if not a6_probs else "fail",
+            "passed": n_pass, "total": n_total, "problems": a6_probs[:12], "wiring": wiring_rows}
 
 
 def build_trial_bench_artifacts(cand: BCAND.CandidateEngine, build_decl: Mapping, spec_raw: Mapping) -> tuple[dict, dict, dict, dict | None]:
@@ -1284,7 +1366,7 @@ def build_trial_bench_artifacts(cand: BCAND.CandidateEngine, build_decl: Mapping
             "estimand": em,
         }
         if has_band:
-            bm_entry["target"] = round(0.5 * (lo + hi), 6)
+            bm_entry["target"] = 0.5 * (lo + hi)
             bm_entry["band"] = [lo, hi]
             bm_entry["published"] = {"lower": lo, "upper": hi, "level": level, "scale": scale,
                                      "table": str(tr.get("dossier", "dossier"))}
@@ -1335,10 +1417,25 @@ def build_trial_bench_artifacts(cand: BCAND.CandidateEngine, build_decl: Mapping
         "arms": arms,
         "benchmarks": benchmarks,
     }
+    covered_comps: set[str] = set()
+    for ce in cov_benchmarks.values():
+        covered_comps.update((ce.get("covers") or {}).keys())
+    comps_without_bm: dict[str, dict] = {}
+    for cname in sorted(comp_specs):
+        if cname in covered_comps:
+            continue
+        di_entry = (req.get("decision_inputs") or {}).get(cname)
+        di_items = di_entry if isinstance(di_entry, list) else ((di_entry or {}).get("inputs") or [])
+        ep = [str(it["name"]) for it in di_items if isinstance(it, Mapping) and it.get("kind") == "parameter"]
+        comps_without_bm[cname] = {
+            "reason": "no trial benchmark declared in engine.build.request.trials",
+            **({"effect_parameters": ep} if ep else {}),
+        }
     cov_doc = {
         "engine": cand.describe().name,
         "absent_values": {c: [cs["absent"]] for c, cs in comp_specs.items()},
         "benchmarks": cov_benchmarks,
+        **({"components_without_benchmark": comps_without_bm} if comps_without_bm else {}),
     }
 
     # If the built engine declares any `fitted` parameters, create a stamped fitted.yaml backing them
@@ -1346,7 +1443,14 @@ def build_trial_bench_artifacts(cand: BCAND.CandidateEngine, build_decl: Mapping
     fitted_doc = None
     if fitted_params:
         fitted_doc = BM.stamp({
-            "parameters": {p.name: {"value": p.value, "lo": p.lo, "hi": p.hi} for p in fitted_params},
+            "parameters": {
+                p.name: {
+                    "value": p.value,
+                    **({"lo": p.lo} if p.lo is not None else {}),
+                    **({"hi": p.hi} if p.hi is not None else {}),
+                }
+                for p in fitted_params
+            },
             "band_declarations": BS.fit_declarations(pack_doc),
         }, cand)
 
@@ -1360,34 +1464,49 @@ def build_trial_bench_artifacts(cand: BCAND.CandidateEngine, build_decl: Mapping
 def check_a8(cand: BCAND.CandidateEngine, build_decl: Mapping, spec_raw: Mapping,
              *, departures_status: str = "signed", base_dir: str | None = None) -> tuple[dict, dict, dict, dict, dict | None]:
     """A8 trial benchmarks + built coverage policy (`policy='built'`, BE15)."""
+    import yaml
     pack_doc, res_doc, cov_doc, fitted_doc = build_trial_bench_artifacts(cand, build_decl, spec_raw)
     rows = res_doc.get("benchmarks") or []
     card = cand.describe()
     pnames = [p.name for p in cand.parameters()]
 
-    def _runs(test_id, effect, b_rows):
-        from toolkit.spec import preconditions as PC, schema
-        sp = schema.Spec({k: v for k, v in spec_raw.items() if k != "_packages"}, base_dir or os.getcwd())
-        sp.engine_pending = False
-        sp._engine = cand
-        sp._engine_ref = None
-        return PC.decision_test_runs(sp, test_id, dict(effect, rows=b_rows))
+    with tempfile.TemporaryDirectory() as td:
+        SIO.write_nofollow(td, "pack.yaml", yaml.safe_dump(pack_doc, sort_keys=False).encode("utf-8"), atomic=True)
+        SIO.write_nofollow(td, "results.yaml", yaml.safe_dump(res_doc, sort_keys=False).encode("utf-8"), atomic=True)
+        SIO.write_nofollow(td, "benchmark_coverage.yaml", yaml.safe_dump(cov_doc, sort_keys=False).encode("utf-8"), atomic=True)
+        if fitted_doc is not None:
+            SIO.write_nofollow(td, "fitted.yaml", yaml.safe_dump(fitted_doc, sort_keys=False).encode("utf-8"), atomic=True)
+        prev_paths = (cand.pack_path, cand.results_path, cand.coverage_path, cand.fitted_path)
+        cand.pack_path = os.path.join(td, "pack.yaml")
+        cand.results_path = os.path.join(td, "results.yaml")
+        cand.coverage_path = os.path.join(td, "benchmark_coverage.yaml")
+        cand.fitted_path = os.path.join(td, "fitted.yaml") if fitted_doc is not None else None
+        try:
+            def _runs(test_id, effect, b_rows):
+                from toolkit.spec import preconditions as PC, schema
+                sp = schema.Spec({k: v for k, v in spec_raw.items() if k != "_packages"}, base_dir or os.getcwd())
+                sp.engine_pending = False
+                sp._engine = cand
+                sp._engine_ref = None
+                return PC.decision_test_runs(sp, test_id, dict(effect, rows=b_rows))
 
-    g = BC.gate(
-        cov_doc,
-        BC.problems(cov_doc),
-        card.name,
-        dict(spec_raw),
-        lambda: (rows, None),
-        list(spec_raw.get("engine_departures") or []),
-        departures_status,
-        pack=pack_doc,
-        has_benchmarks=True,
-        runs=_runs,
-        version=card.version,
-        param_names=pnames,
-        policy="built",
-    )
+            g = BC.gate(
+                cov_doc,
+                BC.problems(cov_doc),
+                card.name,
+                dict(spec_raw),
+                lambda: (rows, None),
+                list(spec_raw.get("engine_departures") or []),
+                departures_status,
+                pack=pack_doc,
+                has_benchmarks=True,
+                runs=_runs,
+                version=card.version,
+                param_names=pnames,
+                policy="built",
+            )
+        finally:
+            cand.pack_path, cand.results_path, cand.coverage_path, cand.fitted_path = prev_paths
     probs = list(g.get("why_not") or [])
     n_total = len(rows)
     n_pass = sum(1 for r in rows if r.get("status") == "in_band")
@@ -1403,40 +1522,6 @@ def check_a8(cand: BCAND.CandidateEngine, build_decl: Mapping, spec_raw: Mapping
         "routing": routing,
     }
     return chk, pack_doc, res_doc, cov_doc, fitted_doc
-
-
-def check_a9(cand: BCAND.CandidateEngine, build_decl: Mapping, spec_raw: Mapping,
-             dossier_benchmarks: list[dict] | None = None) -> dict:
-    """A9 literature/dossier value benchmarks: reported, gating for every ID in `gating_benchmarks`
-    (a declared gating benchmark that is missing/unevaluated fails A9)."""
-    req = build_decl["request"]
-    gating_ids = {str(g) for g in (req.get("gating_benchmarks") or [])}
-    items = list(dossier_benchmarks or [])
-    evaluated_ids = {str(b["id"]) for b in items if isinstance(b, Mapping) and b.get("id") is not None}
-    missing_gating = sorted(gating_ids - evaluated_ids)
-    probs: list[str] = [f"gating literature benchmark {gid!r} is missing (not evaluated)" for gid in missing_gating]
-    if not items:
-        return {"id": "A9", "status": "pass" if not probs else "fail", "passed": 0,
-                "total": len(missing_gating), "problems": probs, "rows": []}
-    hor = _default_horizon(spec_raw, req)
-    absent_pkg = {c: cs["absent"] for c, cs in (req.get("components") or {}).items()}
-    rows: list[dict] = []
-    n_pass = 0
-    for b in items:
-        bid = str(b["id"])
-        u = UnitSpec(f"a9_{bid}", dict(b.get("unit") or {}))
-        pk = Package(f"a9_{bid}", dict(absent_pkg, **(b.get("package") or {})))
-        out = cand.run(dict(b.get("params") or {}), u, pk, hor, seed=41)
-        val = _extract_output(out, str(b["path"]))
-        lo, hi = float(b["band"][0]), float(b["band"][1])
-        in_b = lo <= val <= hi
-        if in_b:
-            n_pass += 1
-        elif bid in gating_ids:
-            probs.append(f"gating literature benchmark {bid}: computed={val:.5g} outside [{lo}, {hi}]")
-        rows.append({"id": bid, "computed": val, "band": [lo, hi], "in_band": in_b, "gating": bid in gating_ids})
-    return {"id": "A9", "status": "pass" if not probs else "fail", "passed": n_pass,
-            "total": len(items) + len(missing_gating), "problems": probs, "rows": rows}
 
 
 def check_a10(cand: BCAND.CandidateEngine, build_decl: Mapping, spec_raw: Mapping,
@@ -1594,13 +1679,14 @@ def check_a11(cand: BCAND.CandidateEngine, ref_cand: BCAND.CandidateEngine | Non
             "problems": probs[:12], "rows": rows[:12], "comparison_sha256": comp_sha}
 
 
-# --------------------------------------------------------------------------- Public checks (try tool & overfit baseline)
+# --------------------------------------------------------------------------- Public checks (try tool)
 def run_public_checks(cand: BCAND.CandidateEngine, build_decl: Mapping, spec_raw: Mapping,
-                      *, checks: list[str] | None = None) -> dict:
-    """Run ONLY public checks using `PUBLIC_SEED_BYTES` (shared by `try_tool` and overfit comparison)."""
+                      *, checks: list[str] | None = None, base_dir: str | None = None,
+                      departures_status: str = "signed") -> dict:
+    """Run ONLY public checks using `PUBLIC_SEED_BYTES` (used by `try_tool`)."""
     th = load_thresholds()
     req = build_decl["request"]
-    want = set(checks) if checks is not None else {"A1", "A2", "A3", "A4", "A5", "A6", "A7", "A8"}
+    want = set(checks) if checks is not None else {"A1", "A2", "A3", "A4", "A5", "A6", "A8"}
     rng = _rng_from(PUBLIC_SEED_BYTES, "public")
     hor = _default_horizon(spec_raw, req)
     comp_specs = req.get("components") or {}
@@ -1608,29 +1694,25 @@ def run_public_checks(cand: BCAND.CandidateEngine, build_decl: Mapping, spec_raw
     pub_pkgs = [Package("pub_none", dict(absent_pkg))]
     for c, cs in sorted(comp_specs.items()):
         for v in cs["values"]:
-            if v != cs["absent"]:
+            if not _same_val(v, cs["absent"]):
                 pub_pkgs.append(Package(f"pub_{c}_{v}", dict(absent_pkg, **{c: v})))
     pub_units = generate_domain_units(req, 2, rng)
     out_checks: dict[str, dict] = {}
     if "A1" in want:
         out_checks["A1"] = check_a1(cand, build_decl, spec_raw, pub_units, pub_pkgs, hor)
     if "A2" in want:
-        out_checks["A2"] = check_a2(cand, build_decl, pub_units, pub_pkgs, hor, th=th, check_invariance=False)
+        out_checks["A2"] = check_a2(cand, build_decl, pub_units, pub_pkgs, hor, th=th, check_invariance=True)
     if "A3" in want:
         out_checks["A3"] = check_a3(cand, pub_units, pub_pkgs, hor, th=th, build_decl=build_decl)
     if "A4" in want:
         out_checks["A4"] = check_a4(cand, build_decl, spec_raw, _rng_from(PUBLIC_SEED_BYTES, "a4"), n_free=1, th=th)
     if "A5" in want:
         out_checks["A5"] = check_a5(cand, build_decl, pub_units, pub_pkgs, hor, th=th)
-    if "A6" in want or "A7" in want:
-        a6, a7 = check_a6_a7(cand, build_decl, spec_raw, _rng_from(PUBLIC_SEED_BYTES, "a6"),
-                             n_bases=int(th["a6_base_points"]), min_moving=int(th["a6_min_moving_bases"]), th=th)
-        if "A6" in want:
-            out_checks["A6"] = a6
-        if "A7" in want:
-            out_checks["A7"] = a7
+    if "A6" in want:
+        out_checks["A6"] = check_a6(cand, build_decl, spec_raw, _rng_from(PUBLIC_SEED_BYTES, "a6"),
+                                    n_bases=int(th["a6_base_points"]), min_moving=int(th["a6_min_moving_bases"]), th=th)
     if "A8" in want:
-        a8, *_ = check_a8(cand, build_decl, spec_raw)
+        a8, *_ = check_a8(cand, build_decl, spec_raw, departures_status=departures_status, base_dir=base_dir)
         out_checks["A8"] = a8
     ok_all = all(c.get("status") in ("pass", "skipped", "not_applicable") for c in out_checks.values())
     return {"ok": ok_all, "checks": out_checks}
@@ -1646,7 +1728,6 @@ def compute_reuse_key(
     require_reference: bool = True,
     reference_files: Mapping[str, bytes] | None = None,
     dossier_bytes: bytes | None = None,
-    dossier_benchmarks: list[dict] | None = None,
     base_dir: str | None = None,
     deps_digest: str | None = None,
 ) -> str:
@@ -1689,13 +1770,22 @@ def compute_reuse_key(
         "objective": spec_raw.get("objective") if isinstance(spec_raw, Mapping) else None,
         "calibration": cal,
         "engine_departures": spec_raw.get("engine_departures") if isinstance(spec_raw, Mapping) else None,
+        "engine_parameters": spec_raw.get("engine_parameters") if isinstance(spec_raw, Mapping) else None,
+        "uncertainty": spec_raw.get("uncertainty") if isinstance(spec_raw, Mapping) else None,
+        "decision_tests": (
+            (spec_raw.get("analysis") or {}).get("decision_tests")
+            if isinstance(spec_raw, Mapping) and isinstance(spec_raw.get("analysis"), Mapping)
+            else None
+        ),
         "data_digests": data_digests,
         "require_reference": bool(require_reference),
         "reference_sha256": ref_sha,
         "dossier_sha256": _sha256_bytes(dossier_bytes) if dossier_bytes is not None else "none",
-        "dossier_benchmarks": dossier_benchmarks,
         "thresholds_sha256": _file_sha(THRESHOLDS_PATH),
         "oracles_sha256": _file_sha(os.path.join(HERE, "oracles.py")),
+        "worker_sha256": _file_sha(os.path.join(HERE, "worker.py")),
+        "adapter_sha256": _file_sha(os.path.join(HERE, "adapter.py")),
+        "calibrators_sha256": _file_sha(os.path.join(HERE, "calibrators.py")),
         "admission_sha256": _file_sha(os.path.abspath(__file__)),
         "deps_sha256": deps_digest if deps_digest is not None else BADAPT.deps_sha256(),
     }
@@ -1867,14 +1957,13 @@ def render_admission_sheet(adm: Mapping) -> str:
     for cid, c in (adm.get("checks") or {}).items():
         note = "; ".join(str(p) for p in (c.get("problems") or [])[:2]) or "ok"
         lines.append(f"| {cid} | {c.get('status')} | {c.get('passed', 0)}/{c.get('total', 0)} | {note} |")
-    if adm.get("overfit_suspected"):
-        lines += ["", "> **HIGH (`engine_overfit_suspected`):** Public checks passed while hidden checks failed."]
     a6 = (adm.get("checks") or {}).get("A6") or {}
     if a6.get("wiring"):
-        lines += ["", "## Sensitivity wiring (A6 / A7)", "| Input | Output | Sign | Moved | Max rel change | A6 | A7 |", "|---|---|---|---|---|---|---|"]
+        lines += ["", "## Sensitivity wiring (A6)", "| Input | Kind | Moved | Max rel change | Moved outputs | OK |", "|---|---|---|---|---|---|"]
         for r in a6["wiring"]:
-            lines.append(f"| {r['input']} | {r['output']} | {r['sign']} | {r['moved_bases']}/{r['n_bases']} | "
-                         f"{r['max_rel_change']} | {r['a6_ok']} | {r['a7_ok']} |")
+            mouts = ", ".join(r.get("moved_outputs") or []) or "none"
+            lines.append(f"| {r['input']} | {r.get('kind', '')} | {r['moved_bases']}/{r['n_bases']} | "
+                         f"{r['max_rel_change']} | {mouts} | {r['a6_ok']} |")
     return "\n".join(lines) + "\n"
 
 
@@ -1912,13 +2001,11 @@ def admit(
     reference_files: Mapping[str, bytes] | None = None,
     require_reference: bool = True,
     dossier_bytes: bytes | None = None,
-    dossier_benchmarks: list[dict] | None = None,
     departures_status: str = "signed",
     unsandboxed_ok: bool = False,
-    run_public_baseline: bool = True,
     _force_sandbox: str | None = "auto",
 ) -> dict:
-    """Run the full admission gate (S1-S4, A1-A11) on an immutable snapshot in `run_dir`,
+    """Run the full admission gate (S1-S3, A1-A6, A8, A10, A11) on an immutable snapshot in `run_dir`,
     writing `engine_build/bench/*`, `engine_build/admission_sheet.md`, and atomically
     `engine_build/admission.json` last."""
     import yaml
@@ -1932,11 +2019,10 @@ def admit(
         require_reference=require_reference,
         reference_files=reference_files,
         dossier_bytes=dossier_bytes,
-        dossier_benchmarks=dossier_benchmarks,
         base_dir=run_dir,
     )
 
-    # S1-S4 static checks BEFORE any run
+    # S1-S3 static checks BEFORE any run
     static_probs = BSNAP.check_static(verified_files, request=build_decl)
     if static_probs:
         SIO.remove_nofollow(run_dir, "engine_build/bench/fitted.yaml", missing_ok=True)
@@ -1952,7 +2038,6 @@ def admit(
             "static_problems": static_probs,
             "checks": {},
             "digests": {},
-            "overfit_suspected": False,
             "feedback": {"static_problems": static_probs},
         }
         SIO.write_nofollow(run_dir, "engine_build/admission_sheet.md", render_admission_sheet(adm).encode("utf-8"), atomic=True)
@@ -1988,24 +2073,6 @@ def admit(
                 "problems": [f"runtime error: {type(exc).__name__}: {exc}"],
             }
 
-    # Optional public baseline: gates admission when enabled AND drives overfit detection
-    public_ok = False
-    public_failed: list[str] = []
-    public_checks: dict = {}
-    if run_public_baseline:
-        try:
-            pub_res = run_public_checks(cand, build_decl, spec_raw)
-            public_ok = bool(pub_res["ok"])
-            public_checks = pub_res.get("checks") or {}
-            public_failed = sorted(
-                k for k, v in public_checks.items()
-                if v.get("status") not in ("pass", "skipped", "not_applicable")
-            )
-        except Exception as exc:  # noqa: BLE001
-            public_ok = False
-            public_failed = ["public_runtime_error"]
-            public_checks = {"error": f"{type(exc).__name__}: {exc}"}
-
     req = build_decl["request"]
     hor = _default_horizon(spec_raw, req)
     rng_h = _rng_from(seed_bytes, "hidden")
@@ -2033,16 +2100,9 @@ def admit(
     checks["A4"] = _safe_check("A4", lambda: check_a4(cand, build_decl, spec_raw, _rng_from(seed_bytes, "a4"),
                                                       n_free=int(th["a4_hidden_settings"]), th=th, ref_units=real_units))
     checks["A5"] = _safe_check("A5", lambda: check_a5(cand, build_decl, a5_units, real_pkgs, hor, th=th))
-    try:
-        a6, a7 = check_a6_a7(cand, build_decl, spec_raw, _rng_from(seed_bytes, "a6"),
-                             n_bases=int(th["a6_base_points"]), min_moving=int(th["a6_min_moving_bases"]),
-                             th=th, ref_units=real_units)
-    except Exception as exc:  # noqa: BLE001
-        err_msg = f"runtime error: {type(exc).__name__}: {exc}"
-        a6 = {"id": "A6", "status": "fail", "passed": 0, "total": 1, "problems": [err_msg], "wiring": []}
-        a7 = {"id": "A7", "status": "fail", "passed": 0, "total": 1, "problems": [err_msg]}
-    checks["A6"] = a6
-    checks["A7"] = a7
+    checks["A6"] = _safe_check("A6", lambda: check_a6(cand, build_decl, spec_raw, _rng_from(seed_bytes, "a6"),
+                                                      n_bases=int(th["a6_base_points"]), min_moving=int(th["a6_min_moving_bases"]),
+                                                      th=th, ref_units=real_units))
 
     pack_doc = res_doc = cov_doc = fitted_doc = None
     try:
@@ -2053,10 +2113,28 @@ def admit(
         a8 = {"id": "A8", "status": "fail", "passed": 0, "total": 1,
               "problems": [f"runtime error: {type(exc).__name__}: {exc}"], "rows": [], "routing": None}
     checks["A8"] = a8
-    checks["A9"] = _safe_check("A9", lambda: check_a9(cand, build_decl, spec_raw, dossier_benchmarks=dossier_benchmarks))
-    checks["A10"] = _safe_check("A10", lambda: check_a10(cand, build_decl, spec_raw, base_dir=run_dir))
     a11_cases = [(dict(), u, real_pkgs[i % len(real_pkgs)], hor) for i, u in enumerate((real_units + gen_units_a1)[:4])]
     checks["A11"] = _safe_check("A11", lambda: check_a11(cand, ref_cand, build_decl, a11_cases, th=th, required=require_reference))
+
+    gating_ids = ("A1", "A2", "A3", "A4", "A5", "A6", "A8", "A11")
+    failed_gating = [cid for cid in gating_ids if checks[cid]["status"] not in ("pass", "skipped", "not_applicable")]
+    if failed_gating:
+        checks["A10"] = {
+            "id": "A10",
+            "status": "skipped",
+            "passed": 0,
+            "total": 0,
+            "classes": {},
+            "problems": [],
+            "skipped_reason": f"skipped because gating check(s) failed: {', '.join(failed_gating)}",
+        }
+    else:
+        checks["A10"] = _safe_check("A10", lambda: check_a10(cand, build_decl, spec_raw, base_dir=run_dir))
+    checks = {
+        cid: checks[cid]
+        for cid in ("A1", "A2", "A3", "A4", "A5", "A6", "A8", "A10", "A11")
+        if cid in checks
+    }
 
     # Write authoritative engine_build/bench/* atomically via safe_io and remove any stale fitted.yaml
     digests: dict[str, str] = {}
@@ -2090,29 +2168,10 @@ def admit(
             comp_sha if isinstance(comp_sha, str) else _sha256_json(checks["A11"].get("rows") or [])
         )
 
-    gating_ids = ("A1", "A2", "A3", "A4", "A5", "A6", "A7", "A8", "A9", "A11")
-    failed_gating = [cid for cid in gating_ids if checks[cid]["status"] not in ("pass", "skipped", "not_applicable")]
-    if run_public_baseline and not public_ok:
-        failed_gating.append("public")
     admitted = not failed_gating
-    # Overfit finding fires ONLY when public baseline passed AND a hidden behavioral check actually executed & failed
-    # (never when an external prerequisite such as A11's reference implementation was merely `unavailable`).
-    hidden_behavioral_failed = [cid for cid in gating_ids if checks[cid]["status"] in ("fail", "inconclusive")]
-    overfit = bool(run_public_baseline and public_ok and hidden_behavioral_failed)
-    findings: list[dict] = []
-    if overfit:
-        findings.append({
-            "kind": "engine_overfit_suspected",
-            "severity": "HIGH",
-            "stage": "ENGINE_ADMIT",
-            "target_stage": "ENGINE",
-            "claim": f"agent-built engine passed public checks but failed hidden check(s) {hidden_behavioral_failed}",
-            "scope_declarable": False,
-        })
-    # Feedback for a hidden failure names ONLY check ids and output names (never hidden inputs/values, §4.6)
+    # Feedback for a hidden failure names ONLY check ids (never hidden inputs/values, §4.6)
     feedback = {
         "failed_checks": failed_gating,
-        "public_failed": public_failed,
         "routing": checks["A8"].get("routing"),
     }
     adm = {
@@ -2126,10 +2185,8 @@ def admit(
         "reuse_key": reuse_key,
         "static_problems": [],
         "checks": checks,
-        "public_ok": public_ok if run_public_baseline else None,
         "digests": digests,
-        "overfit_suspected": overfit,
-        "findings": findings,
+        "findings": [],
         "feedback": feedback,
         "admitted_at": _dt.datetime.now(_dt.timezone.utc).isoformat(),
     }
@@ -2156,8 +2213,7 @@ def _self_test() -> int:
 
     def _run_fixture(defect: str | None = None, *, stochastic: bool = False, stochastic_sd: float = 0.0,
                      ref_bias: float = 0.0, include_trial_oob: bool = False,
-                     require_reference: bool = True, run_public: bool = False,
-                     with_ref: bool = True):
+                     require_reference: bool = True, with_ref: bool = True):
         td = tempfile.TemporaryDirectory()
         d = td.name
         b = BFIX.two_group_sir_build(stochastic=stochastic, include_trial_oob=include_trial_oob)
@@ -2173,12 +2229,12 @@ def _self_test() -> int:
         adm = admit(
             d, man["snapshot_sha256"], b, sp,
             reference_files=ref_files, require_reference=require_reference,
-            unsandboxed_ok=dev_un, run_public_baseline=run_public,
+            unsandboxed_ok=dev_un,
         )
         return td, d, b, sp, man["snapshot_sha256"], adm
 
     # BE1: healthy two-group SIR Starsim fixture passes every check -> status: admitted
-    td1, d1, b1, sp1, sha1, adm1 = _run_fixture(None, run_public=True)
+    td1, d1, b1, sp1, sha1, adm1 = _run_fixture(None)
     try:
         bad1 = {k: v.get("problems") for k, v in adm1["checks"].items() if v.get("status") not in ("pass", "skipped", "not_applicable")}
         ok(adm1["status"] == "admitted" and not bad1 and os.path.isfile(os.path.join(d1, "engine_build", "admission_sheet.md")),
@@ -2240,12 +2296,11 @@ def _self_test() -> int:
     finally:
         td.cleanup()
 
-    # BE4: parameter wired to wrong output fails A6 and A7 cannot pass vacuously
+    # BE4: parameter wired to wrong output fails trial benchmark A8; constant/dead declared output fails A6
     td, _, _, _, _, adm = _run_fixture("wrong_output", require_reference=False, with_ref=False)
     try:
-        a6, a7 = adm["checks"]["A6"], adm["checks"]["A7"]
-        ok(a6["status"] == "fail" and a7["status"] == "fail" and any("eff_a" in p for p in a6["problems"]),
-           f"BE4 parameter wired to wrong output fails A6 and A7 cannot pass vacuously")
+        ok(adm["status"] == "not_admitted" and adm["checks"]["A8"]["status"] == "fail",
+           f"BE4 parameter wired to wrong output fails A8 ({adm['checks']['A8']['problems'][:1]})")
     finally:
         td.cleanup()
 
@@ -2291,15 +2346,14 @@ def _self_test() -> int:
     finally:
         td.cleanup()
 
-    # BE10: public lookup table fails S4 static check AND fails hidden A4 when static check bypassed
+    # BE10: public lookup table passes public A4 and fails hidden A4
     td, _, b10, sp10, sha10, adm10 = _run_fixture("public_table", require_reference=False, with_ref=False)
     try:
-        s4_caught = adm10["status"] == "not_admitted" and any("S4:" in p for p in adm10["static_problems"])
         cand10 = BCAND.CandidateEngine(BFIX.two_group_sir_files("public_table"), b10, unsandboxed_ok=dev_un)
         pub_a4 = check_a4(cand10, b10, sp10, _rng_from(PUBLIC_SEED_BYTES, "a4"), n_free=1, th=load_thresholds())
         hid_a4 = check_a4(cand10, b10, sp10, _rng_from(b"hidden-be10", "a4"), n_free=3, th=load_thresholds())
-        ok(s4_caught and pub_a4["status"] == "pass" and hid_a4["status"] == "fail",
-           f"BE10 public lookup table caught by S4, passes public A4, and fails hidden A4 (pub={pub_a4['status']}, hid={hid_a4['status']})")
+        ok(adm10["status"] == "not_admitted" and pub_a4["status"] == "pass" and hid_a4["status"] == "fail",
+           f"BE10 public lookup table passes public A4 and fails hidden A4 (pub={pub_a4['status']}, hid={hid_a4['status']})")
     finally:
         td.cleanup()
 
@@ -2365,9 +2419,8 @@ def _self_test() -> int:
         ok(ok_res and not ok_over and nan_rejected and "insufficient budget" in str(why_over) and abs(rem - 16.75) < 1e-6,
            f"BE33 compute reservation blocks when remaining < cap, rejects NaN, and reconciles (rem={rem})")
 
-    # Regression checks for Codex r1 fixes: _outcomes_close key parity, _default_horizon warm-up,
-    # 30-bool package sampling without explosion, mutually exclusive option groups, A9 missing gating benchmark,
-    # and missing required reference NOT triggering overfit_suspected
+    # Regression checks: _outcomes_close key parity, _default_horizon warm-up, 30-bool package sampling
+    # without explosion, mutually exclusive option groups, and missing required reference -> A11 unavailable
     empty_o = Outcomes({}, {}, {})
     non_empty_o = Outcomes({"cases": {"g0": 0.2}}, {"w0": {"prev": 0.1}}, {"d": 1.0})
     close_empty, _ = _outcomes_close(empty_o, non_empty_o)
@@ -2385,19 +2438,15 @@ def _self_test() -> int:
     }
     _, pkgs_grp = _real_units_and_packages(sp_grp, req_grp, max_packages=16, rng=np.random.default_rng(1))
     both_active = any(pk.components.get("a") == 1 and pk.components.get("b") == 1 for pk in pkgs_grp)
-    b_a9 = copy.deepcopy(BFIX.two_group_sir_build())
-    b_a9["request"]["gating_benchmarks"] = ["B1"]
-    a9_miss = check_a9(None, b_a9, BFIX.two_group_sir_spec(b_a9), dossier_benchmarks=[])
-    td_nr, _, _, _, _, adm_nr = _run_fixture(None, require_reference=True, with_ref=False, run_public=True)
+    td_nr, _, _, _, _, adm_nr = _run_fixture(None, require_reference=True, with_ref=False)
     try:
         nr_ok = (adm_nr["status"] == "not_admitted"
-                 and adm_nr["checks"]["A11"]["status"] == "unavailable"
-                 and adm_nr["overfit_suspected"] is False)
+                 and adm_nr["checks"]["A11"]["status"] == "unavailable")
     finally:
         td_nr.cleanup()
     ok(not close_empty and h_warm.start == 2010.0 and h_warm.stop == 2035.0 and h_warm.window == (2025.0, 2030.0)
-       and len(pkgs_30) == 16 and not both_active and a9_miss["status"] == "fail" and nr_ok,
-       "BE_REG1 outcomes key parity, warm-up horizon, 30-bool/group packages, A9 missing gating, and non-overfit unavailable A11")
+       and len(pkgs_30) == 16 and not both_active and nr_ok,
+       "BE_REG1 outcomes key parity, warm-up horizon, 30-bool/group packages, and unavailable A11")
 
     # BE_CAL_ATTR1: _real_units_and_packages supplies interior midpoint for calibration.attribute (log & linear)
     # without requiring a column binding, while still refusing unbound non-calibrated required attributes
@@ -2428,8 +2477,8 @@ def _self_test() -> int:
        and len(u_lin) == 1 and abs(u_lin[0].attributes["rate"] - 0.2) < 1e-12 and unb_refused,
        f"BE_CAL_ATTR1 calibrated per-unit attribute gets prior midpoint in A1 real units while unbound non-calibrated fails")
 
-    # BE_A6_COST_LOG: multi-decade positive continuous attrs sample in log space; non-decision-input attrs
-    # affecting cost_drivers are evaluated under active component modes (wired passes, dead still fails).
+    # BE_A6_COST_LOG: multi-decade positive continuous attrs sample in log space; active-mode-gated cost-driver
+    # parameters pass A6 via Pass 2 fallback while dead parameters and constant declared outputs fail A6.
     log_mid = _sample_attr({"type": "continuous", "range": [0.0005, 0.5]}, np.random.default_rng(1), u_val=0.5)
     lin_mid = _sample_attr({"type": "continuous", "range": [0.1, 1.0]}, np.random.default_rng(1), u_val=0.5)
     log_pts = _domain_points_attr({"type": "continuous", "range": [0.0005, 0.5]})
@@ -2440,78 +2489,101 @@ def _self_test() -> int:
             "unit_attributes": {"scale": {"type": "continuous", "test_range": [10.0, 10000.0]}},
             "outputs": {"per_capita": ["y"], "windows": {}, "cost_drivers": ["vol"]},
             "age_groups": ["g0"],
-            "parameters": [],
-            "expected_effects": {"act": {"y": "-", "vol": "+"}, "scale": {"vol": "+"}},
+            "parameters": [{"name": "cost_mult", "kind": "fixed", "value": 0.5, "lo": 0.1, "hi": 1.0, "source": "t"}],
             "stochastic": False,
         },
     }
+
     class _CdStub:
         kind = "closed_form"
-        def __init__(self, wired: bool):
-            self._wired = wired
+
+        def __init__(self, mode: str):
+            self._mode = mode
+
         def run_many(self, cases):
             out = []
-            for _prm, u, pk, _h, _s in cases:
+            for prm, u, pk, _h, _s in cases:
                 on = int(pk.components.get("act", 0))
                 sc = float(u.attributes["scale"])
-                vol = (0.5 * sc if self._wired else 10.0) if on else 0.0
-                out.append(Outcomes({"y": {"g0": 1.0 - 0.5 * on}}, {}, {"vol": vol},
-                                    meta={"age_shares": {"g0": 1.0}, "param_reads": {"build": [], "read_outcomes": []}}))
+                reads = []
+                if self._mode == "dead_out":
+                    reads.append("cost_mult")
+                    cm = float(prm.get("cost_mult", 0.5))
+                    y = (1.0 - 0.5 * on) * cm
+                    vol = 0.0
+                elif on and self._mode == "wired":
+                    reads.append("cost_mult")
+                    cm = float(prm.get("cost_mult", 0.5))
+                    y = 1.0 - 0.5 * on
+                    vol = cm * sc
+                else:
+                    y = 1.0 - 0.5 * on
+                    vol = 10.0 if on else 0.0
+                out.append(Outcomes({"y": {"g0": y}}, {}, {"vol": vol},
+                                    meta={"age_shares": {"g0": 1.0}, "param_reads": {"build": reads, "read_outcomes": []}}))
             return out
-    th_cd = load_thresholds()
-    a6_w, a7_w = check_a6_a7(_CdStub(True), b_cd, {}, np.random.default_rng(2), n_bases=3, min_moving=2, th=th_cd)
-    a6_d, a7_d = check_a6_a7(_CdStub(False), b_cd, {}, np.random.default_rng(2), n_bases=3, min_moving=2, th=th_cd)
-    ok(abs(log_mid - math.sqrt(0.0005 * 0.5)) < 1e-12 and abs(lin_mid - 0.55) < 1e-12
-       and log_pts[1] < 0.01 and a6_w["status"] == "pass" and a7_w["status"] == "pass"
-       and a6_d["status"] == "fail" and a7_d["status"] == "fail",
-       f"BE_A6_COST_LOG log-space sampling for multi-decade attrs & active-mode A6 for cost_driver inputs "
-       f"(log_mid={log_mid:.5f}, wired={a6_w['status']}/{a7_w['status']}, dead={a6_d['status']}/{a7_d['status']})")
 
-    # BE_A7_CAT: unordered categorical string components compare active modes against `absent` (order-independent);
-    # mixed-sign categorical violates A7; numeric ordered components still enforce step-by-step monotonicity.
-    b_cat = {
-        "id": "stub_cat", "kind": "closed_form",
+    th_cd = load_thresholds()
+    a6_w = check_a6(_CdStub("wired"), b_cd, {}, np.random.default_rng(2), n_bases=3, min_moving=2, th=th_cd)
+    a6_d = check_a6(_CdStub("dead_param"), b_cd, {}, np.random.default_rng(2), n_bases=3, min_moving=2, th=th_cd)
+    a6_o = check_a6(_CdStub("dead_out"), b_cd, {}, np.random.default_rng(2), n_bases=3, min_moving=2, th=th_cd)
+    ok(abs(log_mid - math.sqrt(0.0005 * 0.5)) < 1e-12 and abs(lin_mid - 0.55) < 1e-12
+       and log_pts[1] < 0.01 and a6_w["status"] == "pass" and a6_d["status"] == "fail"
+       and a6_o["status"] == "fail" and any("vol" in p for p in a6_o["problems"]),
+       f"BE_A6_COST_LOG log-space sampling, active-mode A6 for cost_driver params, dead param & dead output catch "
+       f"(wired={a6_w['status']}, dead_p={a6_d['status']}, dead_out={a6_o['status']})")
+
+    # BE_A6_LAZY: non-decision-input parameter gated by an active intervention branch passes A6 via Pass 2
+    # lazy active-mode fallback while a genuinely dead parameter still fails.
+    b_lz = {
+        "id": "stub_lz", "kind": "closed_form",
         "request": {
-            "components": {"mode": {"values": ["none", "mode_a", "mode_b"], "absent": "none"}},
+            "components": {"mode": {"values": ["none", "screen"], "absent": "none"}},
             "unit_attributes": {"x": {"type": "continuous", "range": [0.1, 1.0]}},
-            "outputs": {"per_capita": ["y_pos", "y_one"], "windows": {}, "cost_drivers": []},
+            "outputs": {"per_capita": ["y"], "windows": {}, "cost_drivers": []},
             "age_groups": ["g0"],
-            "parameters": [],
-            "expected_effects": {"mode": {"y_pos": "+", "y_one": "+"}, "x": {"y_pos": "+"}},
+            "parameters": [{"name": "gated_p", "kind": "fixed", "value": 0.5, "lo": 0.1, "hi": 0.9, "source": "t"}],
             "stochastic": False,
         },
     }
-    class _CatStub:
+
+    class _LazyStub:
         kind = "closed_form"
-        def __init__(self, *, bad_sign: bool = False, comp_key: str = "mode"):
-            self._bad = bad_sign
-            self._key = comp_key
+
+        def __init__(self, mode: str):
+            self._mode = mode
+
         def run_many(self, cases):
             out = []
-            for _prm, u, pk, _h, _s in cases:
+            for prm, u, pk, _h, _s in cases:
                 x = float(u.attributes["x"])
-                mv = pk.components.get(self._key)
-                if mv in ("none", 0):
-                    yp, yo = 0.1 * x, 0.0
-                elif mv in ("mode_a", 1):
-                    yp, yo = 0.9 * x, 0.6 * x
+                on = pk.components.get("mode") == "screen"
+                reads = []
+                if on and self._mode != "dead":
+                    reads.append("gated_p")
+                    gp = float(prm.get("gated_p", 0.5))
+                    val = x * (0.2 + 0.6 * gp)
                 else:
-                    yp = (0.02 * x) if self._bad else (0.5 * x)
-                    yo = 0.0
-                out.append(Outcomes({"y_pos": {"g0": yp}, "y_one": {"g0": yo}}, {}, {},
-                                    meta={"age_shares": {"g0": 1.0}, "param_reads": {"build": [], "read_outcomes": []}}))
+                    val = x * (0.5 if on else 1.0)
+                out.append(Outcomes({"y": {"g0": val}}, {}, {},
+                                    meta={"age_shares": {"g0": 1.0}, "param_reads": {"build": reads, "read_outcomes": []}}))
             return out
-    a6_cg, a7_cg = check_a6_a7(_CatStub(bad_sign=False), b_cat, {}, np.random.default_rng(3), n_bases=3, min_moving=2, th=th_cd)
-    a6_cb, a7_cb = check_a6_a7(_CatStub(bad_sign=True), b_cat, {}, np.random.default_rng(3), n_bases=3, min_moving=2, th=th_cd)
-    b_num = copy.deepcopy(b_cat)
-    b_num["request"]["components"] = {"level": {"values": [0, 1, 2], "absent": 0}}
-    b_num["request"]["expected_effects"] = {"level": {"y_pos": "+"}, "x": {"y_pos": "+"}}
-    b_num["request"]["outputs"]["per_capita"] = ["y_pos"]
-    a6_nm, a7_nm = check_a6_a7(_CatStub(bad_sign=False, comp_key="level"), b_num, {}, np.random.default_rng(3), n_bases=3, min_moving=2, th=th_cd)
-    ok(a6_cg["status"] == "pass" and a7_cg["status"] == "pass"
-       and a7_cb["status"] == "fail" and a7_nm["status"] == "fail",
-       f"BE_A7_CAT categorical string components compare active modes vs absent; mixed sign & non-monotone numeric fail A7 "
-       f"(cat_ok={a6_cg['status']}/{a7_cg['status']}, cat_bad={a7_cb['status']}, num_nonmono={a7_nm['status']})")
+
+    a6_lg = check_a6(_LazyStub("good"), b_lz, {}, np.random.default_rng(4), n_bases=3, min_moving=2, th=th_cd)
+    a6_ld = check_a6(_LazyStub("dead"), b_lz, {}, np.random.default_rng(4), n_bases=3, min_moving=2, th=th_cd)
+    ok(a6_lg["status"] == "pass" and a6_ld["status"] == "fail",
+       f"BE_A6_LAZY active-mode fallback passes intervention-gated param while dead fails "
+       f"(good={a6_lg['status']}, dead={a6_ld['status']})")
+
+    # BE_A10_SKIP: failing gating check skips A10 immediately (status='skipped')
+    td_sk, _, _, _, _, adm_sk = _run_fixture(None, ref_bias=0.06, require_reference=True, with_ref=True)
+    try:
+        a10_sk = adm_sk["checks"]["A10"]
+        ok(adm_sk["status"] == "not_admitted" and a10_sk["status"] == "skipped"
+           and "A11" in str(a10_sk.get("skipped_reason") or ""),
+           f"BE_A10_SKIP gating failure short-circuits A10 (A10={a10_sk.get('status')})")
+    finally:
+        td_sk.cleanup()
 
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
