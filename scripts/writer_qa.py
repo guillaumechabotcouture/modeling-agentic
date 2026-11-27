@@ -67,15 +67,103 @@ def normalize_verdict(v: object) -> str:
     return re.sub(r"[\s\-]+", "_", str(v or "").strip()).upper()
 
 
-# Phase 21 γ: the helpers come from scripts/lib/md_helpers.py instead of
-# exec'ing the whole validator module.
+_NUMERIC_TOKEN_RE = re.compile(
+    r"(?P<sign>[-+]?)\$?\s*"
+    r"(?P<num>\d{1,3}(?:,\d{3})+(?:\.\d+)?|\d+(?:\.\d+)?)"
+    r"(?P<suffix>[kKmMbBtT]?)\b"
+)
+_HORIZON_RE = re.compile(
+    r"/\s*(\d+)\s*(?:yr|year)|/\s*(?:yr|year)\b|per\s+year",
+    re.IGNORECASE,
+)
+
+
+def _extract_last_numeric(cell: str) -> Optional[float]:
+    """Extract the LAST numeric token from a cell string."""
+    stripped = _HORIZON_RE.sub("", cell)
+    stripped = re.sub(r"\(\s*[A-Za-z][^)]*\)", "", stripped)
+    matches = list(_NUMERIC_TOKEN_RE.finditer(stripped))
+    if not matches:
+        return None
+    m = matches[-1]
+    raw = m.group("num").replace(",", "")
+    try:
+        value = float(raw)
+    except ValueError:
+        return None
+    suffix = (m.group("suffix") or "").lower()
+    multiplier = {"k": 1e3, "m": 1e6, "b": 1e9, "t": 1e12}.get(suffix, 1.0)
+    return value * multiplier
+
+
+def _parse_md_tables(text: str) -> list[dict]:
+    """Linear scan for Markdown tables."""
+    tables = []
+    lines = text.splitlines()
+    i = 0
+    while i < len(lines):
+        line = lines[i].rstrip()
+        if not (line.startswith("|") and line.endswith("|") and "|" in line[1:-1]):
+            i += 1
+            continue
+        if i + 1 >= len(lines):
+            i += 1
+            continue
+        sep = lines[i + 1].strip()
+        if not re.fullmatch(r"\|[\s:|-]+\|", sep):
+            i += 1
+            continue
+        headers = [c.strip() for c in line.strip("|").split("|")]
+        rows = []
+        j = i + 2
+        while j < len(lines):
+            row_line = lines[j].rstrip()
+            if not (row_line.startswith("|") and row_line.endswith("|")):
+                break
+            cells = [c.strip() for c in row_line.strip("|").split("|")]
+            if len(cells) != len(headers):
+                break
+            rows.append({"label": cells[0], "cells": cells[1:]})
+            j += 1
+        if rows:
+            tables.append({"headers": headers, "rows": rows})
+        i = j
+    return tables
+
+
+_LIMITATIONS_HEADER_RE = re.compile(
+    r"^#{1,4}\s+\d*\.?\s*"
+    r"(?:Limitations?|Scope\s+Declaration|Caveats?|"
+    r"Unresolved\s+(?:HIGH|Blockers?)|Known\s+Issues?)"
+    r"[^\n]*$",
+    re.MULTILINE | re.IGNORECASE,
+)
+
+
+def _strip_limitations_and_scope(text: str) -> str:
+    """Remove §Limitations / §Scope Declaration / §Caveats sections."""
+    out_parts = []
+    last_end = 0
+    headers = list(_LIMITATIONS_HEADER_RE.finditer(text))
+    for m in headers:
+        hdr_text = m.group(0)
+        level = len(hdr_text) - len(hdr_text.lstrip("#"))
+        next_header_re = re.compile(rf"^#{{1,{level}}}\s+", re.MULTILINE)
+        section_end = len(text)
+        for next_m in next_header_re.finditer(text, m.end()):
+            section_end = next_m.start()
+            break
+        out_parts.append(text[last_end:m.start()])
+        last_end = section_end
+    out_parts.append(text[last_end:])
+    return "".join(out_parts)
+
+
 def _load_validator_helpers():
     """Return (_parse_md_tables, _extract_last_numeric,
     _strip_limitations_and_scope)."""
-    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-    from lib import md_helpers as _md
-    return (_md._parse_md_tables, _md._extract_last_numeric,
-            _md._strip_limitations_and_scope)
+    return (_parse_md_tables, _extract_last_numeric,
+            _strip_limitations_and_scope)
 
 
 # Markdown image reference: ![caption](path/to/file.png)

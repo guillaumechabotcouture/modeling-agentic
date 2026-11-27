@@ -1,12 +1,9 @@
 """What a run's finish shares with v2.
 
-- `gate_command`: the STAGE 7 validator command, used by the stage machine's legacy gate mode and by the
-  golden traces.
 - `exit_code_for`: the exit code of a terminal status.
 - `store_run_results`: the upload of a finished run directory, called by main.py's v2 path.
 
-The rest of this module, the v1 lead session's final gate, write-up, presentation pass and model card, was
-removed with pipeline v1 (owner, 2026-11-20; docs/design/v1-retirement.md)."""
+The rest of this module (including the v1 STAGE 7 validator `gate_command`) was removed."""
 
 import json
 import os
@@ -17,7 +14,6 @@ import uuid
 from agents import enforcement
 
 REPO_ROOT = enforcement.REPO_ROOT
-VALIDATOR = os.path.join(REPO_ROOT, "scripts", "validate_critique_yaml.py")
 
 
 # Terminal statuses that count as success (exit 0). Everything else is
@@ -36,21 +32,6 @@ PARTIAL_STATUSES = {"completed_scope_declared", "completed_gate_not_accepted",
                     "awaiting_engine_signoff", "completed_engine_not_admitted", "completed_engine_declined",
                     # lead-gaps β: a --signoff lead run that continued in the child run its provisional amendment made
                     "amended_provisional"}
-
-
-def gate_command(run_path: str, max_rounds: int, current_round: int, post_write: bool,
-                 validator: str = VALIDATOR, history: bool = True) -> list[str]:
-    """The STAGE 7 validator command, exactly as the final gate runs it (v2 C:
-    shared with agents/stage_machine.py's legacy gate and the golden traces)."""
-    cmd = [sys.executable, validator, run_path,
-           "--max-rounds", str(max_rounds), "--current-round", str(current_round),
-           "--spec-compliance", "--parameter-registry", "--rigor-artifacts",
-           "--json"]
-    if post_write:
-        cmd.append("--post-write")
-    if not history:
-        cmd.append("--no-history")
-    return cmd
 
 
 def exit_code_for(status: str) -> int:

@@ -15,12 +15,12 @@ How it works (no list of checks or files is kept by hand):
      rule as `structure_metrics.py`'s gate_interface). `round_n`, when the
      function takes it, is passed as the fixture's round, as the STAGE 7
      validator does.
-  2. Clean run: the positive-control run (`scripts/lib/positive_control.py`,
-     built at round 3, when every round-gated check is enforced) is built
-     once. Each check runs on a copy of it with `open` patched to record
-     which run files it opens for reading (opened for writing at any point =
-     the check's own output, not mutated). yaml/json/csv all read through
-     `open`, so patching it is enough.
+  2. Clean run: a minimal clean fixture (`_clean_fixture`, built at round 3,
+     when every round-gated check is enforced) is built once. Each check
+     runs on a copy of it with `open` patched to record which run files it
+     opens for reading (opened for writing at any point = the check's own
+     output, not mutated). yaml/json/csv all read through `open`, so patching
+     it is enough.
   3. Mutation: for each file a check read, each bug class that applies to
      that file's format writes a corrupt copy into a fresh copy of the run,
      and the check runs again in a forked child (fresh caches, a time limit).
@@ -93,25 +93,10 @@ CASE_TIMEOUT_S = 30
 # only when neither the check nor its declared owner, run on the same corrupt
 # run, reports something it did not report on the clean run.
 DELEGATES: dict[tuple[str, str], tuple[str, str]] = {
-    ("headline_binding", "models/effect_concordance.yaml"):
-        ("effect_concordance.gate_findings",
-         "headline_binding docstring item 3: 'when models/effect_concordance.yaml exists'; the file's "
-         "validity is effect_concordance's finding"),
-    ("declaration_tests", "scope_declaration.yaml"):
-        ("lib.scope_declarations.load",
-         "declaration_tests.gate_findings returns [] on an unreadable file: 'an unreadable "
-         "scope_declaration.yaml is already HIGH (scope_declaration_invalid)', from this loader"),
     ("scope_signoff", "scope_declaration.yaml"):
         ("lib.scope_declarations.load",
          "scope_signoff.gate_findings reads declarations through sd.load; an unreadable file is the "
          "gate's scope_declaration_invalid, from this loader"),
-    ("declared_limits", "scope_declaration.yaml"):
-        ("lib.scope_declarations.load",
-         "the shared loader of scope_declaration.yaml; its findings are the gate's scope_declaration_invalid"),
-    ("claim_units", "models/claims_spec.yaml"):
-        ("build_claims_ledger.build",
-         "the claims-ledger validator: validate_critique_yaml._claims_spec_violations builds the ledger "
-         "with build_claims_ledger.build and reports its spec errors as claims_spec_invalid"),
 }
 
 # Checks that are not file-backed, with the reason; any other check that gets
@@ -783,6 +768,42 @@ def _supplement(run_dir: str, round_n: int) -> None:
         w("engine_build/signoff.json", json.dumps(_so, indent=1, sort_keys=True))
 
 
+def _clean_fixture(run_dir: str, round_n: int) -> None:
+    """Minimal clean v2 fixture run dir for gate_fuzz without v1 fixtures."""
+    os.makedirs(os.path.join(run_dir, "models"), exist_ok=True)
+    with open(os.path.join(run_dir, "models", "model.py"), "w", encoding="utf-8") as f:
+        f.write("x = 1\n")
+    with open(os.path.join(run_dir, "models", "fuzz_pipeline_out.txt"), "w", encoding="utf-8") as f:
+        f.write("ok\n")
+    with open(os.path.join(run_dir, "models", "benchmark_targets.yaml"), "w", encoding="utf-8") as f:
+        yaml.safe_dump({
+            "benchmarks": [{
+                "id": "baseline_rate",
+                "metric": "incidence_per_1000",
+                "target_value": 70.0,
+                "units": "per_1000_years",
+                "tolerance_factor": 1.5,
+                "source": "Fixture benchmark (synthetic)",
+                "computed_field": "models/model_outputs.yaml::mean_incidence",
+            }],
+        }, f, sort_keys=False)
+    with open(os.path.join(run_dir, "success_criteria.yaml"), "w", encoding="utf-8") as f:
+        yaml.safe_dump({
+            "hard_blockers": [{
+                "id": "HB-001",
+                "criterion": "Full model generalizes at least as well as the null",
+                "metric": "full_rmse_loo",
+                "operator": "<=",
+                "threshold": 1.0,
+                "artifact": "model_comparison_formal.yaml",
+                "artifact_field": "models.full.rmse_loo",
+            }],
+            "minimum_bar": [],
+            "targets": [],
+        }, f, sort_keys=False)
+    _supplement(run_dir, round_n)
+
+
 def sweep(scripts_dir: str = HERE, modules=None, base: str | None = None, round_n: int = FIXTURE_ROUND,
           workers: int | None = None, log=print) -> dict:
     """Run every (module, file read, mutation) case. Returns
@@ -794,14 +815,12 @@ def sweep(scripts_dir: str = HERE, modules=None, base: str | None = None, round_
     out = {"modules": {}, "cases": []}
     with tempfile.TemporaryDirectory(prefix="gate_fuzz_") as td:
         if base is None:
-            from lib import positive_control as pc
             base = os.path.join(td, "base")
             with open(os.devnull, "w") as dn:
                 old = sys.stdout
                 sys.stdout = dn
                 try:
-                    pc.build(base, round_n=round_n)
-                    _supplement(base, round_n)
+                    _clean_fixture(base, round_n)
                 finally:
                     sys.stdout = old
             shutil.rmtree(os.path.join(base, "models", "__pycache__"), ignore_errors=True)

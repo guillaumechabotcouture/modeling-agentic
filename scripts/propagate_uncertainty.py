@@ -77,6 +77,7 @@ import json
 import math
 import os
 import random
+import re
 import sys
 import traceback
 from collections import Counter
@@ -93,6 +94,209 @@ except ImportError:
 def _import_sibling_module(name: str):
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     return __import__(name)
+
+
+# ---------------------------------------------------------------------------
+# Inlined prior registry parser and sampler (from effect_size_registry.py)
+# ---------------------------------------------------------------------------
+
+VALID_KINDS = {
+    "odds_ratio", "relative_risk", "hazard_ratio", "incidence_rate_ratio",
+    "efficacy", "coverage", "proportion", "rate", "cost_usd",
+    "prevalence", "duration_days", "dimensionless", "count",
+    "population", "probability", "ratio",
+}
+RATIO_KINDS = {"odds_ratio", "relative_risk", "hazard_ratio", "incidence_rate_ratio"}
+BOUNDED_01_KINDS = {"efficacy", "coverage", "proportion", "prevalence"}
+POSITIVE_KINDS = {"rate", "cost_usd", "duration_days"}
+
+_REGISTRY_HEADER_RE = re.compile(
+    r"^##\s*Parameter\s+Registry[^\n]*$",
+    re.IGNORECASE | re.MULTILINE,
+)
+_YAML_FENCE_RE = re.compile(
+    r"```(?:yaml|yml)?[ \t]*\n(?P<body>[\s\S]*?)\n```",
+    re.IGNORECASE,
+)
+_NEXT_H2_RE = re.compile(r"^##\s", re.MULTILINE)
+_DETAIL_HEADER_RE = re.compile(
+    r"^###\s+(?P<name>[A-Za-z_][\w]*)(?:\s+\([^)]*\))?\s*$",
+    re.MULTILINE,
+)
+_DETAIL_BULLET_RE = re.compile(
+    r"^-\s+\*\*(?P<key>[\w_-]+)\*\*\s*:[ \t]*(?P<first_line>[^\n]*)$",
+    re.MULTILINE,
+)
+_BULLET_BOUNDARY_RE = re.compile(
+    r"^(?:-\s+\*\*[\w_-]+\*\*\s*:|##\s|###\s)",
+    re.MULTILINE,
+)
+_CODE_REF_LINE_RE = re.compile(
+    r"^\s*-\s+([^\n]+)$",
+    re.MULTILINE,
+)
+
+
+def _parse_detail_sections(text: str, yaml_end: int) -> dict[str, dict]:
+    tail = text[yaml_end:]
+    out: dict[str, dict] = {}
+    headers = list(_DETAIL_HEADER_RE.finditer(tail))
+    for i, hdr in enumerate(headers):
+        name = hdr.group("name")
+        start = hdr.end()
+        end = headers[i + 1].start() if i + 1 < len(headers) else len(tail)
+        body = tail[start:end]
+        details: dict = {}
+        bullets = list(_DETAIL_BULLET_RE.finditer(body))
+        for bullet in bullets:
+            key = bullet.group("key").lower()
+            first_line = bullet.group("first_line")
+            cont_start = bullet.end()
+            cont_end = len(body)
+            boundary = _BULLET_BOUNDARY_RE.search(body, cont_start + 1)
+            if boundary is not None:
+                cont_end = boundary.start()
+            continuation = body[cont_start:cont_end]
+            if key == "code_refs":
+                refs = []
+                for m in _CODE_REF_LINE_RE.finditer(continuation):
+                    raw = m.group(1).strip()
+                    cleaned = re.split(r"\s*\(", raw, maxsplit=1)[0].strip()
+                    if cleaned:
+                        refs.append(cleaned)
+                if refs:
+                    details["code_refs"] = refs
+            else:
+                value = first_line.strip()
+                if not value:
+                    for line in continuation.splitlines():
+                        stripped = line.strip()
+                        if stripped:
+                            value = stripped
+                            break
+                details[key] = value
+        if details:
+            out[name] = details
+    return out
+
+
+def load_priors(citations_md_path: str) -> dict[str, Any]:
+    if not os.path.exists(citations_md_path):
+        raise FileNotFoundError(f"citations.md not found: {citations_md_path}")
+    with open(citations_md_path) as f:
+        text = f.read()
+    header = _REGISTRY_HEADER_RE.search(text)
+    if header is None:
+        return {"parameters": []}
+    section_start = header.end()
+    next_h2 = _NEXT_H2_RE.search(text, section_start + 1)
+    section_end = next_h2.start() if next_h2 else len(text)
+    section = text[section_start:section_end]
+    fence = _YAML_FENCE_RE.search(section)
+    if fence is not None:
+        yaml_text = fence.group("body")
+        yaml_end_in_text = section_start + fence.end()
+    else:
+        yaml_text = section
+        yaml_end_in_text = section_end
+    try:
+        body = yaml.safe_load(yaml_text)
+    except yaml.YAMLError as e:
+        raise ValueError(f"invalid YAML in Parameter Registry: {e}")
+    if isinstance(body, list):
+        body = {"parameters": body}
+    if not isinstance(body, dict) or "parameters" not in body:
+        raise ValueError("Parameter Registry must be a list of parameter "
+                         "mappings or a mapping with a `parameters:` list")
+    params = body.get("parameters") or []
+    if not isinstance(params, list):
+        raise ValueError("`parameters:` must be a list")
+    details_by_name = _parse_detail_sections(text, yaml_end_in_text)
+    for i, p in enumerate(params):
+        if not isinstance(p, dict):
+            raise ValueError(f"parameters[{i}] must be a mapping")
+        for key in ("name", "value", "kind", "source"):
+            if key not in p:
+                raise ValueError(f"parameters[{i}] missing required key '{key}'")
+        if p["kind"] not in VALID_KINDS:
+            raise ValueError(f"parameters[{i}] has invalid kind "
+                             f"{p['kind']!r}; valid: {sorted(VALID_KINDS)}")
+        if "ci_95" in p and p["ci_95"] is not None:
+            ci_95 = p["ci_95"]
+            if not isinstance(ci_95, (list, tuple)) or len(ci_95) != 2:
+                raise ValueError(
+                    f"parameters[{i}] has malformed ci_95 (must be a "
+                    f"length-2 list [low, high], got {ci_95!r})"
+                )
+            if "ci_low" not in p or p["ci_low"] is None:
+                p["ci_low"] = ci_95[0]
+            if "ci_high" not in p or p["ci_high"] is None:
+                p["ci_high"] = ci_95[1]
+        name = p["name"]
+        if name in details_by_name:
+            for key, value in details_by_name[name].items():
+                if key not in p or p[key] in (None, "", []):
+                    p[key] = value
+    return body
+
+
+def _randn(rng) -> float:
+    if hasattr(rng, "normalvariate"):
+        return rng.normalvariate(0.0, 1.0)
+    if hasattr(rng, "standard_normal"):
+        return float(rng.standard_normal())
+    return float(rng.random())
+
+
+def _beta(rng, alpha: float, beta: float) -> float:
+    if hasattr(rng, "betavariate"):
+        return rng.betavariate(alpha, beta)
+    if hasattr(rng, "beta"):
+        return float(rng.beta(alpha, beta))
+    x = rng.gammavariate(alpha, 1.0) if hasattr(rng, "gammavariate") else alpha
+    y = rng.gammavariate(beta, 1.0) if hasattr(rng, "gammavariate") else beta
+    return x / (x + y)
+
+
+def sample_prior(entry: dict, n: int, rng) -> list[float]:
+    value = float(entry["value"])
+    kind = entry["kind"]
+    ci_low = entry.get("ci_low")
+    ci_high = entry.get("ci_high")
+    if ci_low is None or ci_high is None:
+        return [value] * n
+    ci_low = float(ci_low)
+    ci_high = float(ci_high)
+    if kind in RATIO_KINDS:
+        if value <= 0 or ci_low <= 0 or ci_high <= 0:
+            return [value] * n
+        mu = math.log(value)
+        sigma = (math.log(ci_high) - math.log(ci_low)) / (2.0 * 1.96)
+        if sigma <= 0:
+            return [value] * n
+        return [math.exp(mu + sigma * _randn(rng)) for _ in range(n)]
+    if kind in BOUNDED_01_KINDS:
+        m = max(1e-6, min(1 - 1e-6, value))
+        sd = max(1e-6, (ci_high - ci_low) / 3.92)
+        v = sd * sd
+        if v >= m * (1 - m):
+            v = m * (1 - m) * 0.9
+        common = m * (1 - m) / v - 1
+        alpha = m * common
+        beta = (1 - m) * common
+        return [_beta(rng, alpha, beta) for _ in range(n)]
+    if kind in POSITIVE_KINDS:
+        if value <= 0:
+            return [value] * n
+        safe_low = max(ci_low, value * 0.01)
+        safe_high = max(ci_high, safe_low * 1.001)
+        mu = math.log(value)
+        sigma = (math.log(safe_high) - math.log(safe_low)) / (2.0 * 1.96)
+        if sigma <= 0:
+            return [value] * n
+        return [math.exp(mu + sigma * _randn(rng)) for _ in range(n)]
+    sd = (ci_high - ci_low) / 3.92
+    return [max(0.0, value + sd * _randn(rng)) for _ in range(n)]
 
 
 # ---------------------------------------------------------------------------
@@ -233,11 +437,10 @@ def draw_params(params: list, n_draws: int, seed: int) -> tuple[dict, list]:
     regenerates a report's draws this way). A later enhancement would
     support correlated priors (e.g. two intervention effects sharing a
     common driver)."""
-    registry_module = _import_sibling_module("effect_size_registry")
     rng = random.Random(seed)
     per_param_samples: dict[str, list[float]] = {}
     for p in params:
-        per_param_samples[p["name"]] = registry_module.sample_prior(p, n_draws, rng)
+        per_param_samples[p["name"]] = sample_prior(p, n_draws, rng)
     params_list = [{name: per_param_samples[name][i] for name in per_param_samples}
                    for i in range(n_draws)]
     return per_param_samples, params_list
@@ -433,10 +636,8 @@ def propagate(run_dir: str, n_draws: int = 200, seed: int = 42,
     lowPriorityCoreQuota > 0 (not Free Trial). Default False uses dedicated
     nodes, which always work within Free Trial's 4-vCPU quota.
     """
-    registry_module = _import_sibling_module("effect_size_registry")
-
     citations_path = os.path.join(run_dir, "citations.md")
-    registry = registry_module.load_priors(citations_path)
+    registry = load_priors(citations_path)
     params = registry.get("parameters", [])
     if not params:
         raise ValueError(

@@ -227,6 +227,17 @@ def list_existing_skills(skills_root: str) -> set[str]:
     return out
 
 
+def _split_frontmatter(text: str) -> tuple[str | None, str | None]:
+    """(yaml_text, None) for a leading `---` … `---` block, else (None, reason)."""
+    lines = text.split("\n")
+    if not lines or lines[0].rstrip("\r") != "---":
+        return None, "no frontmatter (file must start with a '---' line)"
+    for i in range(1, len(lines)):
+        if lines[i].rstrip("\r") == "---":
+            return "\n".join(lines[1:i]), None
+    return None, "frontmatter is not closed by a '---' line"
+
+
 def check_frontmatter(skill_md_path: str) -> str | None:
     """Return None when the SKILL.md frontmatter is valid, else a short
     reason string. Valid means: file starts with a `---` line, a closing
@@ -240,8 +251,7 @@ def check_frontmatter(skill_md_path: str) -> str | None:
             text = f.read()
     except (OSError, UnicodeDecodeError) as e:
         return f"unreadable: {e}"
-    from lib.md_helpers import split_frontmatter   # the runtime readers' rule
-    block, why = split_frontmatter(text)
+    block, why = _split_frontmatter(text)
     if block is None:
         return why
     try:

@@ -95,14 +95,25 @@ ACTION = "AWAIT_OWNER"
 _TOKEN = re.compile(r"[a-z][a-z0-9]*")
 
 
-def _dt_mod():
-    from lib.siblings import load_private
-    return load_private("declaration_tests", "_ma_p49_")
+ALLOCATION_GLOBS = ("*allocation*.csv", "*budget*.csv", "*optimization*.csv")
+
+_REQUIRED_ANALYSIS_ARTIFACTS = {
+    "allocation_robustness": ("models/allocation_robustness.yaml", "allocation"),
+    "sensitivity_analysis": ("models/sensitivity_analysis.yaml", "allocation"),
+    "optimization_quality": ("models/optimization_quality.yaml", "allocation"),
+    "within_zone_heterogeneity": ("models/within_zone_heterogeneity.yaml", "aggregation_ratio_lt_0.1"),
+    "outcome_fn": ("models/outcome_fn.py", "always"),
+    "identifiability": ("models/identifiability.yaml", "always"),
+}
 
 
-def _sibling(name: str):
-    from lib.siblings import load_private
-    return load_private(name, "_ma_p49_")
+def allocation_present(run_dir: str) -> bool:
+    import glob
+    for pat in ALLOCATION_GLOBS:
+        for sub in ("", "data", "models"):
+            if glob.glob(os.path.join(run_dir, sub, pat)):
+                return True
+    return os.path.exists(os.path.join(run_dir, "decision_rule.md"))
 
 
 def load_map(path: str = POLICY) -> dict:
@@ -196,11 +207,11 @@ def bears(run_dir: str, v: dict, cfg: dict, ctx: dict) -> Optional[str]:
     if rule["when"] == "allocation":
         if "allocation" not in ctx:
             try:
-                ctx["allocation"] = _sibling("alloc_toolkit_use").allocation_present(run_dir)
+                ctx["allocation"] = allocation_present(run_dir)
             except Exception:  # noqa: BLE001 — fail closed: cannot rule the allocation out
                 ctx["allocation"] = True
         return rule["reason"] if ctx["allocation"] else None
-    key = _dt_mod().key_of(v)
+    key = sd.key_of(v)
     if "vocab" not in ctx:
         ctx["vocab"], ctx["names"] = interventions(run_dir, cfg["generic"])
     b = _benchmark(run_dir, key) if key else None
@@ -233,12 +244,11 @@ def _evidence_text(text) -> str:
 def build_item(run_dir: str, v: dict, reason: str, entries: list[dict], evidence: Optional[str] = None,
                cover: Optional[list] = None, sources: tuple = ()) -> dict:
     """What the owner is shown for one finding, with its fingerprint."""
-    dt = _dt_mod()
-    ident = dt._ident(v)
-    cover = dt.covering(entries, v) if cover is None else cover
+    ident = sd._ident(v)
+    cover = sd.covering(entries, v) if cover is None else cover
     decls, tests = [], {}
     for e in cover:
-        status, detail, res = dt.entry_status(run_dir, e, v)
+        status, detail, res = sd.entry_status(run_dir, e, v)
         t = {"status": status}
         if status in ("tested", "changes"):
             t.update({"decision_test": detail, "decision_changes": res["decision_changes"],
@@ -453,7 +463,6 @@ def gate_findings(run_dir: str, round_n: Optional[int] = None, current: Optional
     if mode == "none":
         return []
     cfg = load_map()
-    dt = _dt_mod()
     answers, out = verified_answers(run_dir)
     _doc, entries, problems = sd.load(run_dir)
     if problems:
@@ -463,7 +472,7 @@ def gate_findings(run_dir: str, round_n: Optional[int] = None, current: Optional
     todo = [(x, None) for x in (current or []) if isinstance(x, dict)]
     todo += [(x, [e]) for x, e in _not_applicable_analyses(run_dir, entries, cfg, ctx)]
     for v, na_entry in todo:
-        if v.get("severity") != "HIGH" or dt.critic_derived(v) \
+        if v.get("severity") != "HIGH" or sd.critic_derived(v) \
                 or non_declarable(str(v.get("kind") or ""), v.get("scope_declarable")):
             continue
         reason = bears(run_dir, v, cfg, ctx)
@@ -506,8 +515,6 @@ def _not_applicable_analyses(run_dir: str, entries: list[dict], cfg: dict, ctx: 
     if rule is None:
         return []
     kind = next(k for k, r in cfg["kinds"].items() if r is rule)
-    from lib.rigor_artifacts import load_artifacts
-    arts = {a.id: a for a in load_artifacts()}
     out = []
     for e in entries:
         na = e.get("not_applicable")
@@ -515,20 +522,23 @@ def _not_applicable_analyses(run_dir: str, entries: list[dict], cfg: dict, ctx: 
             continue
         for aid in (na if isinstance(na, list) else [na]):
             aid = str(aid).strip()
-            a = arts.get(aid)
-            if aid not in rule["artifacts"] or a is None or os.path.exists(os.path.join(run_dir, a.path)):
+            spec = _REQUIRED_ANALYSIS_ARTIFACTS.get(aid)
+            if aid not in rule["artifacts"] or spec is None:
                 continue
-            if a.triggered_by == "allocation":
+            art_path, triggered_by = spec
+            if os.path.exists(os.path.join(run_dir, art_path)):
+                continue
+            if triggered_by == "allocation":
                 if "allocation" not in ctx:
                     try:
-                        ctx["allocation"] = _sibling("alloc_toolkit_use").allocation_present(run_dir)
+                        ctx["allocation"] = allocation_present(run_dir)
                     except Exception:  # noqa: BLE001 — fail closed
                         ctx["allocation"] = True
                 if not ctx["allocation"]:
                     continue
             out.append(({"kind": kind, "severity": "HIGH", "stage": "GATE", "target_stage": "MODEL",
                          "artifact": aid, "key": aid, "scope_declarable": True,
-                         "claim": (f"`{aid}` ({a.path}) is declared not applicable in scope_declaration.yaml (entry "
+                         "claim": (f"`{aid}` ({art_path}) is declared not applicable in scope_declaration.yaml (entry "
                                    f"{e.get('id') or '?'}). It is a decision analysis, so only the owner may accept "
                                    "its absence; or produce it.")}, e))
     return out

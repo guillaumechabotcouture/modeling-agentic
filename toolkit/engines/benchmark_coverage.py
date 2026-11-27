@@ -834,18 +834,18 @@ def _self_test_posterior(ok, cov, both):
            f"{g3['blocking']}")
     except Exception as e:  # noqa: BLE001 -- a failing case, not a crash of the self-test
         ok(False, f"BC11-BC12 ({type(e).__name__}: {e})")
-    from toolkit.engines.malaria.benchmarks import net_effect_fit as NEF
+    from toolkit.engines import effect_fit as EF
     from toolkit.engines.benchmark_sources import band_digest
     from toolkit.spec import schema
-    base = yaml.safe_load(open(NEF.PACK))
+    base = EF._fixture_pack()
     decl = {b["id"]: b for b in base["benchmarks"]}
     with tempfile.TemporaryDirectory() as d:
         p = schema.toy_spec(d)
         raw = yaml.safe_load(open(p))
         rows = [{"eff_a": 0.3 + 0.01 * i, "eff_b": 0.2 + 0.01 * i} for i in range(12)]
         f = os.path.join(d, "nef.yaml")
-        NEF._fixture_placeholder(f, schema.load(p).engine(), rows, {"eff_a": [0, 1], "eff_b": [0, 1]})
-        replayed = sorted(NEF.pack_bands())
+        EF._fixture_placeholder(f, schema.load(p).engine(), rows, {"eff_a": [0, 1], "eff_b": [0, 1]})
+        replayed = sorted(EF._pack_bands(base))
         t0, t1 = replayed[0], replayed[1]
         held = next(k for k in decl if k not in replayed)     # a real benchmark the replay does not check (Codex r3)
 
@@ -907,11 +907,13 @@ def _self_test_posterior(ok, cov, both):
     except Exception as e:  # noqa: BLE001
         got18 = f"{type(e).__name__}: {e}"
     ok(got18 == (None, None), f"BC18 a malformed uncertainty section declares no posterior: {got18}")
-    # Codex r3: run() records the digests of the pack it evaluated; in a normal fit that pack's declarations are
-    # the pack file's, so a current fit's targets count
-    eff = NEF.build_pack(base)
-    ok(NEF.target_digests(eff, NEF.pack_bands()) == NEF.target_digests(base, NEF.pack_bands())
-       and "target_digests=target_digests(pack, bands)" in open(NEF.__file__).read(),
+    # Codex r3: fit() records target_digests matching the pack file's declarations
+    dcl, pk, _cv, _ver = EF.pack_files(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                                    "malaria", "benchmarks", "effect_fit.yaml"))
+    td = EF.target_digests(dcl, pk)
+    ok(set(td) == set(dcl["targets"]) | set(dcl.get("monitor") or [])
+       and all(isinstance(v, str) and len(v) == 64 for v in td.values())
+       and '"target_digests": tdig' in open(EF.__file__).read(),
        "BC19 the fit writes the digests of the pack it evaluated, which a normal fit shares with the pack file")
 
 

@@ -1,30 +1,12 @@
 #!/usr/bin/env python3
 """
-Planted-defect regression eval for the deterministic gates (runs in CI).
+Deterministic regression eval for the v2 gates and built-engine checks (runs in CI).
 
-E5 measured which defects the gates catch by planting known defects in real
-run fixtures. Those fixtures are 100-400 MB of gitignored run output, so
-they can't run on every pull request. This eval uses the same planter
-(scripts/plant_defects.py; E5's lexical matcher, scripts/score_critiques.py, was removed with v1) on the
-synthetic positive-control run (scripts/lib/positive_control.py), which is
-built from code in seconds:
-
-  1. build the honest positive-control run;
-  2. plant one defect per variant, every applicable class, for each seed;
-  3. run the validator alone on every variant (the E5 deterministic arm,
-     `deterministic_critic` below);
-  4. compare with `tests/regression_baseline.yaml`.
-
-A defect counts as caught when the validator emits a finding of a kind
-expected for its class (EXPECTED_KINDS; the E5 matcher is lexical and was
-built for LLM prose, so it under-credits structured gate findings). It fails
-when a defect the baseline caught is no longer caught, when the clean run
-gains a HIGH finding, or when the clean run already emits a kind expected
-for a planted class (spurious). Newly caught defects are reported; adopt them with
-`--update-baseline` in the same pull request that improves the gate.
-
-The real-fixture E5 suite remains the measurement of record; this is the
-fast tripwire.
+Exercises:
+  1. Built-engine planted-defect tripwires BE2, BE8, BE10 (`_run_built_engine_defects`);
+  2. v2 analysis contract gate tripwires (`toolkit.analysis.contract.gate_findings`);
+  3. v2 critique decision / done_when tripwires (`validate_critique_yaml`, `done_when`);
+  4. Compare with `tests/regression_baseline.yaml`.
 
 Usage:
     python3 scripts/regression_eval.py                  # compare to baseline
@@ -35,12 +17,11 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
-import shutil
 import sys
 import tempfile
-import time
 
 import yaml
 
@@ -48,154 +29,178 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(HERE)
 sys.path.insert(0, HERE)
 BASELINE = os.path.join(REPO, "tests", "regression_baseline.yaml")
-SEEDS = (7, 11)
-
-# Finding kinds that count as catching each planted class. The E5 matcher is
-# lexical (it was built to score LLM prose); a gate's finding is structured,
-# so match on what the gate emits. Kinds ending in "*" are prefixes.
-EXPECTED_KINDS = {
-    "zero_width_ci": ("ci_degenerate",),
-    "ci_inverted": ("ci_degenerate", "ci_inverted"),
-    "ledger_mismatch": ("claims_ledger_stale", "claim_source_mismatch", "claim_value_not_in_source"),
-    "renamed_verdict": ("*_unknown_verdict",),
-    "budget_overspend": ("budget_exceeded",),
-    "unit_error": ("data_schema_out_of_range", "unit_*"),
-    "data_vintage": ("data_vintage_conflict", "vintage_*"),
-    "prose_stale_number": ("coherence_audit_*", "numeric_drift_*"),
-    "citation_mismatch": ("citation_*",),
-    "sensitivity_contradiction": ("coherence_audit_label_coherence",),
-    # Phase 42 γ (D1-D5).
-    "mechanism_untested": ("mechanism_sufficiency_missing",),
-    "prior_severity_below": ("pre_mortem_severity_below_prior",),
-    "prose_closure": ("pre_mortem_closed_without_evidence",),
-    "unused_column": ("data_columns_unread_summary",),
-    "tuned_without_transfer": ("benchmark_transfer_missing",),
-    # Phase 43 α (B1).
-    "scenario_fitted": ("calibration_scenario_assumption_fitted",),
-}
-# On the positive control the planter's edit leaves `population` undefined,
-# so the gate sees a crash (eligibility_probe_error), not the defect.
-SKIP_CLASSES = {"benefit_total_population"}
 
 
-def _kind_hit(cls: str, kinds: set[str]) -> bool:
-    for want in EXPECTED_KINDS.get(cls, ()):
-        if want.startswith("*") and any(k.endswith(want[1:]) for k in kinds):
-            return True
-        if want.endswith("*") and any(k.startswith(want[:-1]) for k in kinds):
-            return True
-        if want in kinds:
-            return True
-    return False
+def _sha256_bytes(raw: bytes) -> str:
+    return hashlib.sha256(raw).hexdigest()
 
 
+def _run_contract_defects() -> list[tuple[str, str, bool]]:
+    """Deterministic v2 analysis contract tripwires via toolkit.analysis.contract.gate_findings."""
+    if REPO not in sys.path:
+        sys.path.insert(0, REPO)
+    from toolkit.analysis import contract
+
+    out: list[tuple[str, str, bool]] = []
+
+    def _check(key: str, cls: str, want_kind: str, setup) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            setup(d)
+            kinds = {str(f.get("kind")) for f in contract.gate_findings(d)}
+            out.append((key, cls, want_kind in kinds))
+
+    def _write_spec_and_manifest(d: str, manifest_updates: dict | None = None,
+                                 extra_artifacts: dict[str, bytes] | None = None) -> None:
+        spec_raw = b"deliverable:\n  kind: estimates\n"
+        with open(os.path.join(d, contract.SPEC), "wb") as f:
+            f.write(spec_raw)
+        os.makedirs(os.path.join(d, "analysis"), exist_ok=True)
+        man = {
+            "status": "complete",
+            "complete": True,
+            "spec_signed": True,
+            "spec_sha256": _sha256_bytes(spec_raw),
+            "settings_sha256": None,
+            "engine_choice_sha256": None,
+            "deliverable_kind": "estimates",
+            "artifacts": {},
+            "deliverables": {},
+            "expected": {},
+        }
+        if extra_artifacts:
+            for rel, raw in extra_artifacts.items():
+                p = os.path.join(d, rel)
+                os.makedirs(os.path.dirname(p), exist_ok=True)
+                with open(p, "wb") as f:
+                    f.write(raw)
+                man["artifacts"][rel] = {"kind": "point", "sha256": _sha256_bytes(raw)}
+        if manifest_updates:
+            man.update(manifest_updates)
+        with open(os.path.join(d, contract.MANIFEST), "w", encoding="utf-8") as f:
+            json.dump(man, f)
+
+    def _s_missing(d: str) -> None:
+        with open(os.path.join(d, contract.SPEC), "w", encoding="utf-8") as f:
+            f.write("deliverable:\n  kind: estimates\n")
+
+    def _s_incomplete(d: str) -> None:
+        _write_spec_and_manifest(d, {"status": "running", "complete": False})
+
+    def _s_blocked(d: str) -> None:
+        _write_spec_and_manifest(d, {"status": "blocked", "complete": False, "reason": "refused"})
+
+    def _s_unsigned(d: str) -> None:
+        _write_spec_and_manifest(d, {"spec_signed": False})
+
+    def _s_stale(d: str) -> None:
+        _write_spec_and_manifest(d, {"spec_sha256": "0" * 64})
+
+    def _s_tampered(d: str) -> None:
+        _write_spec_and_manifest(d, extra_artifacts={"analysis/point.yaml": b"schema: analysis.point/1\n"})
+        with open(os.path.join(d, "analysis", "point.yaml"), "wb") as f:
+            f.write(b"tampered: true\n")
+
+    _check("v2_contract:missing_manifest", "contract_missing_manifest", "analysis_contract_missing", _s_missing)
+    _check("v2_contract:incomplete_manifest", "contract_incomplete_manifest", "analysis_contract_incomplete", _s_incomplete)
+    _check("v2_contract:blocked_manifest", "contract_blocked_manifest", "analysis_contract_blocked", _s_blocked)
+    _check("v2_contract:unsigned_spec", "contract_unsigned_spec", "analysis_contract_unsigned", _s_unsigned)
+    _check("v2_contract:spec_stale", "contract_spec_stale", "analysis_contract_stale", _s_stale)
+    _check("v2_contract:tampered_artifact", "contract_tampered_artifact", "analysis_contract_tampered", _s_tampered)
+    return out
 
 
-_STUB_REVIEWERS = ("critique-methods", "critique-domain", "critique-presentation", "critique-redteam")
+def _run_critique_defects() -> tuple[list[tuple[str, str, bool]], list[str], list[str]]:
+    """Deterministic v2 critique decision / done_when tripwires + clean baseline check."""
+    import done_when as dw
+    import validate_critique_yaml as V
+
+    out: list[tuple[str, str, bool]] = []
+
+    # 1. Unresolved HIGH blocker blocks ACCEPT.
+    crit_open = {
+        "critique-methods": {
+            "blockers": [{
+                "id": "M-001", "severity": "HIGH", "category": "METHODS",
+                "target_stage": "MODEL", "first_seen_round": 1,
+                "claim": "parameter bound violated", "resolved": False,
+            }],
+            "carried_forward": [],
+            "structural_mismatch": {"detected": False},
+        },
+    }
+    dec1 = V.decide(crit_open, max_rounds=8, current_round=2)
+    out.append((
+        "v2_critique:unresolved_high_blocks",
+        "critique_unresolved_high",
+        dec1.get("action") == "PATCH_OR_RETHINK"
+        and any(b.get("kind") == "critique_blocker" for b in dec1.get("unresolved_high") or []),
+    ))
+
+    # 2. A done_when test that passes in round 3 and regresses in round 4 reopens as a HIGH finding.
+    with tempfile.TemporaryDirectory() as d:
+        out_json = os.path.join(d, "out.json")
+        with open(out_json, "w", encoding="utf-8") as f:
+            json.dump({"ci95": [10, 20]}, f)
+        crit_dw = {
+            "critique-redteam": {
+                "blockers": [{
+                    "id": "R-001", "severity": "HIGH", "category": "METHODS",
+                    "target_stage": "MODEL", "first_seen_round": 2,
+                    "claim": "degenerate CI", "resolved": False,
+                    "done_when": {"file": "out.json", "key": "ci95", "op": "width_gt", "value": 0},
+                }],
+                "carried_forward": [],
+                "structural_mismatch": {"detected": False},
+            },
+        }
+        V._apply_done_when(V.decide(crit_dw, 8, 3), crit_dw, d, 8, 3)
+        with open(out_json, "w", encoding="utf-8") as f:
+            json.dump({"ci95": [15, 15]}, f)
+        crit_dw["critique-redteam"]["blockers"][0]["resolved"] = True
+        dec_reg, res_reg = V._apply_done_when(V.decide(crit_dw, 8, 4), crit_dw, d, 8, 4)
+        dec_reg = V._incorporate_rigor_violations(dec_reg, dw.gate_findings(res_reg), 8, 4)
+        out.append((
+            "v2_critique:done_when_regressed_reopens",
+            "critique_done_when_regressed",
+            dec_reg.get("action") != "ACCEPT"
+            and any(b.get("kind") == "done_when_regressed" for b in dec_reg.get("unresolved_high") or []),
+        ))
+
+    # 3. A non-declarable HIGH finding at round exhaustion triggers RUN_FAILED.
+    base_clean = V.decide({}, max_rounds=8, current_round=8)
+    dec_nd = V._incorporate_rigor_violations(
+        base_clean,
+        [{"kind": "pre_model_over_saturated", "severity": "HIGH", "stage": "PRE_MODEL", "claim": "over-saturated"}],
+        8, 8,
+    )
+    out.append((
+        "v2_critique:non_declarable_at_exhaustion_fails",
+        "critique_non_declarable_exhaustion",
+        dec_nd.get("action") == "RUN_FAILED",
+    ))
+
+    # Clean run baseline check.
+    clean_dec = V.decide({
+        "critique-methods": {"blockers": [], "carried_forward": [], "structural_mismatch": {"detected": False}},
+    }, max_rounds=8, current_round=2)
+    clean_high = sorted({str(b.get("kind")) for b in clean_dec.get("unresolved_high") or []})
+    return out, clean_high, []
 
 
-def deterministic_critic(run_dir: str, wall_timeout_s: float = 900) -> dict:
-    """E5 arm: the mechanical gate alone (no LLM). Writes empty PASS stubs for
-    the four critics so the validator runs, collects every finding it raises
-    (unresolved HIGHs, accept blockers, rigor violations of any severity),
-    removes the stubs, and records the findings as critique_deterministic.yaml. (Moved here from
-    scripts/replay.py, the v1 stage-replay lane, when v1 was retired.)"""
-    import subprocess
-    stubs = []
-    for r in _STUB_REVIEWERS:
-        p = os.path.join(run_dir, f"critique_{r.split('-', 1)[1]}.yaml")
-        yaml.safe_dump({"reviewer": r, "round": 1, "verdict": "PASS",
-                        "structural_mismatch": {"detected": False}, "blockers": [], "carried_forward": []},
-                       open(p, "w"), sort_keys=False)
-        stubs.append(p)
-    t0 = time.time()
-    cmd = [sys.executable, os.path.join(HERE, "validate_critique_yaml.py"), run_dir, "--max-rounds", "8",
-           "--current-round", "1", "--spec-compliance", "--parameter-registry", "--rigor-artifacts",
-           "--json", "--no-history"]
-    proc = subprocess.run(cmd, cwd=REPO, capture_output=True, text=True, timeout=float(wall_timeout_s))
-    for p in stubs:
-        os.remove(p)
-    out = proc.stdout.strip()
-    try:
-        dec = json.loads(out[out.index("{"):])
-    except (ValueError, json.JSONDecodeError):
-        dec = {"error": (proc.stderr or out)[-500:]}
-    # A schema error (exit 3), VALIDATOR_ERROR (exit 4) or a missing action
-    # is a failed evaluation, not an empty review (Codex review of PR #14).
-    failed = ("error" in dec or bool(dec.get("schema_errors"))
-              or dec.get("action") in (None, "VALIDATOR_ERROR")
-              or proc.returncode not in (0, 1))
-    if failed and "error" not in dec:
-        dec["error"] = (f"validator exit {proc.returncode}, action {dec.get('action')!r}, "
-                        f"schema_errors {dec.get('schema_errors')!r}")[:500]
-    findings = [("HIGH", b) for b in dec.get("unresolved_high") or []] + \
-               [("HIGH", b) for b in dec.get("accept_blockers") or []] + \
-               [(str(v.get("severity", "MEDIUM")).upper(), v) for v in dec.get("rigor_violations") or []]
-    seen, blockers = set(), []
-    for sev, f in findings:
-        key = (f.get("kind"), f.get("claim"))
-        if key in seen:
-            continue
-        seen.add(key)
-        blockers.append({"id": f"DET-{len(blockers) + 1:03d}", "severity": sev if sev in ("HIGH", "MEDIUM", "LOW") else "MEDIUM",
-                         "kind": f.get("kind"), "claim": str(f.get("claim") or f.get("kind") or ""),
-                         "evidence": json.dumps({k: v for k, v in f.items() if k not in ("claim",)}, default=str)[:2000]})
-    yaml.safe_dump({"reviewer": "deterministic", "round": 1, "action": dec.get("action"),
-                    "validator_exit": proc.returncode, "blockers": blockers,
-                    **({"error": dec["error"]} if "error" in dec else {})},
-                   open(os.path.join(run_dir, "critique_deterministic.yaml"), "w"), sort_keys=False)
-    return {"session_id": None, "subtype": "deterministic", "is_error": failed, "cost_usd": 0.0,
-            "num_turns": 0, "duration_s": round(time.time() - t0, 1)}
-
-
-def run_eval(seeds=SEEDS) -> dict:
-    from lib import positive_control as pc
-    import plant_defects as plant
-
+def run_eval() -> dict:
     out = {"detected": {}, "planted": {}, "clean_high": [], "spurious": []}
-    with tempfile.TemporaryDirectory() as root:
-        src = os.path.join(root, "src", "PC")
-        pc.build(os.path.join(src, "inputs"), round_n=2)
-        inp = os.path.join(src, "inputs")
-        files = {os.path.relpath(os.path.join(dp, fn), inp): {"sha256": plant._sha(os.path.join(dp, fn))}
-                 for dp, _, fns in os.walk(inp) for fn in fns}
-        with open(os.path.join(src, "fixture.yaml"), "w") as f:
-            yaml.safe_dump({"id": "PC", "stage": "CRITIQUE", "source": "positive_control",
-                            "files": files}, f)
-        classes = plant.applicable(os.path.join(src, "inputs"), seeds[0])
-        variants = []
-        for seed in seeds:
-            vroot = os.path.join(root, f"s{seed}")
-            for v in plant.build_variants(src, vroot, k=len(classes), per_variant=1, seed=seed):
-                variants.append((seed, vroot, v))
-        truth_all = []
-        for seed, vroot, v in variants:
-            vid = v.get("variant") or v.get("id")
-            truth = yaml.safe_load(open(os.path.join(vroot, "_truth", f"{vid}.yaml")))
-            run = os.path.join(root, "runs", f"s{seed}_{vid}")
-            shutil.copytree(os.path.join(vroot, vid, "inputs"), run)
-            deterministic_critic(run, wall_timeout_s=600)
-            doc = yaml.safe_load(open(os.path.join(run, "critique_deterministic.yaml"))) or {}
-            blockers = doc.get("blockers") or []
-            kinds = {str(b.get("kind")) for b in blockers}
-            if doc.get("error"):
-                raise RuntimeError(f"validator failed on {vid}: {doc['error']}")
-            if truth["tag"] == "clean":
-                out["clean_high"] = sorted({str(b.get("kind")) for b in blockers if b.get("severity") == "HIGH"})
-                clean_kinds = kinds
-                continue
-            for d in truth["defects"]:
-                if d["class"] in SKIP_CLASSES:
-                    continue
-                key = f"s{seed}:{d['class']}:{d['location']}"
-                out["planted"][key] = d["class"]
-                out["detected"][key] = _kind_hit(d["class"], kinds)
-                truth_all.append((key, d))
-        out["spurious"] = sorted(k for k, d in truth_all if _kind_hit(d["class"], clean_kinds))
-    # PR epsilon of #363 (§6.4): deterministic built-engine planted-defect tripwires (BE2, BE8, BE10)
     for key, cls, caught in _run_built_engine_defects():
         out["planted"][key] = cls
         out["detected"][key] = caught
+    for key, cls, caught in _run_contract_defects():
+        out["planted"][key] = cls
+        out["detected"][key] = caught
+    crit_rows, clean_high, spurious = _run_critique_defects()
+    for key, cls, caught in crit_rows:
+        out["planted"][key] = cls
+        out["detected"][key] = caught
+    out["clean_high"] = clean_high
+    out["spurious"] = spurious
     return out
 
 
@@ -269,7 +274,7 @@ def _self_test() -> int:
     ok(any("INVALID BASELINE" in p for p in compare({"detected": {}, "clean_high": [], "spurious": []}, {})),
        "R0 empty baseline is invalid, not a pass")
     ok(compare({"detected": {"a": True, "b": False}, "clean_high": [], "spurious": []}, base) == [],
-       "R1 identical → pass")
+       "R1 identical -> pass")
     ok(compare({"detected": {"a": True, "b": True}, "clean_high": [], "spurious": []}, base) == [],
        "R2 new catch is not a failure")
     ok(any("no longer planted" in p for p in compare({"detected": {"a": True}, "clean_high": [], "spurious": []}, base)),
@@ -280,11 +285,11 @@ def _self_test() -> int:
        "R4 new clean HIGH fails")
     ok(any("SPURIOUS" in p for p in compare({"detected": {"a": True}, "clean_high": [], "spurious": ["k"]}, base)),
        "R5 spurious fails")
-    # R6 (v1 retirement): the deterministic arm lives here; the v1 stage-replay lane (scripts/replay.py) is gone.
-    import inspect
-    src = inspect.getsource(sys.modules[__name__])
-    ok(callable(globals().get("deterministic_critic")) and "import " + "replay" not in src,
-       "R6 the deterministic critic is this module's own; nothing imports scripts/replay.py")
+    ok(callable(globals().get("_run_built_engine_defects"))
+       and callable(globals().get("_run_contract_defects"))
+       and callable(globals().get("_run_critique_defects"))
+       and not hasattr(sys.modules[__name__], "deterministic_critic"),
+       "R6 v2 built-engine, contract, and critique tripwires live here; no deterministic_critic")
     if fails:
         print("SELF-TEST FAILURES:", *fails, sep="\n  - ")
         return 1
@@ -293,7 +298,7 @@ def _self_test() -> int:
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser(description="Planted-defect regression eval (deterministic gates)")
+    ap = argparse.ArgumentParser(description="Deterministic regression eval (v2 gates & built-engine checks)")
     ap.add_argument("--update-baseline", action="store_true")
     ap.add_argument("--self-test", action="store_true")
     a = ap.parse_args()

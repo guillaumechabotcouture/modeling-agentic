@@ -300,8 +300,7 @@ REVIEWED: dict = {
                       "never their targets"),
         "tempfile-dir": (1, "the aside dir (mkdtemp inside the run dir, a random name the harness owns)"),
         "open-write": (2, "the derivation's column-stripped input and mount points in its temporary work dirs")},
-    "scripts/plant_defects.py": {"open-write": (3, _EVAL), "shutil": (4, _EVAL)},
-    "scripts/regression_eval.py": {"open-write": (4, _EVAL), "shutil": (1, _EVAL), "os-remove": (1, _EVAL)},
+    "scripts/regression_eval.py": {"open-write": (8, _EVAL)},
     "scripts/results_store.py": {"safeio-derived-root": (1, "download() streams to the path its caller names (the "
                                                          "launcher's out dir, a VM staging dir): no run root "
                                                          "exists there; safe_io.stream_nofollow, no link followed"),
@@ -310,11 +309,6 @@ REVIEWED: dict = {
                                                      "outside any run dir), deleted on close")},
     "scripts/resume_smoke.py": {"open-write": (4, "the smoke's own temporary work dir (toy runs it creates) and the "
                                                    "--json report the operator names")},
-    "scripts/lib/positive_control.py": {"open-write": (2, "builds the positive-control fixture run in a dir it creates")},
-    "scripts/validate_critique_yaml.py": {"os-remove": (1, "its own NamedTemporaryFile in the system temp dir")},
-    "toolkit/analysis/dt_golden.py": {"open-write": (2, "toolkit/analysis/dt_golden.json in the repo, only under "
-                                                         "MA_DT_GOLDEN_UPDATE=1 from run.py's self-test or by the "
-                                                         "operator's `record <log>` command")},
     "toolkit/analysis/figures.py": {"method-write": (2, "savefig / Image.save into an in-memory buffer "
                                                          "(_fig_bytes, contact_sheets), then lib.safe_io")},
     "toolkit/analysis/run.py": {"open-write": (6, _FIX + " (_resign, _direct_toy, _given_column)"), "os-remove": (1, _FIX),
@@ -322,16 +316,12 @@ REVIEWED: dict = {
     "toolkit/engines/benchmark.py": {"open-write": (4, _REPO + " (the benchmark CLI's outputs)")},
     "toolkit/engines/compartmental/benchmarks/compat_proof.py": {
         "open-write": (2, _REPO + " (the proof record and the re-stamped coverage results in the engine's benchmarks/)")},
-    "toolkit/engines/compartmental/benchmarks/runtime_spike.py": {"open-write": (1, _REPO)},
     "toolkit/engines/compartmental/engine.py": {"open-write": (1, _REPO + " (write_card)")},
     "toolkit/engines/renewal/engine.py": {"open-write": (1, _REPO + " (write_card)")},
-    "toolkit/engines/malaria/benchmarks/b15_mechanisms.py": {"open-write": (1, _REPO)},
     "toolkit/engines/malaria/benchmarks/equilibration.py": {"open-write": (1, _REPO)},
     "toolkit/engines/malaria/benchmarks/guess_sensitivity.py": {"open-write": (1, _REPO)},
-    "toolkit/engines/malaria/benchmarks/net_effect_fit.py": {"open-write": (2, _REPO + " (net_effect_fit.yaml or a smoke's --out; a copy under the job's JOB_OUT)")},
     "toolkit/engines/malaria/benchmarks/render_notes.py": {"open-write": (1, _REPO)},
     "toolkit/engines/malaria/benchmarks/restamp_proof.py": {"open-write": (4, _REPO + " (restamp_proof.yaml and the evidence files; a copy of the proof under the job's JOB_OUT)")},
-    "toolkit/engines/malaria/benchmarks/runtime.py": {"open-write": (1, _REPO)},
     "toolkit/engines/malaria/engine.py": {"open-write": (1, _REPO + " (write_card)")},
     "tools/run_console/run_console.py": {"open-write": (2, "the console's temporary answers file (mkstemp)"),
                                          "os-remove": (2, "the console's temporary answers file (mkstemp)")},
@@ -344,15 +334,7 @@ _V1 = ("v1 pipeline (main.py without --v2, its hooks and gates): writes in its r
 OPEN_ITEMS: dict = {
     "agents/run_finish.py": {"open-write": (1, "store_run_results (shared with v2): metadata.json's stored/store_error "
                                               "fields, a plain open in the run dir")},
-    "scripts/benchmark_match.py": {"open-write": (1, _V1)},
-    "scripts/coherence_audit.py": {"open-write": (1, _V1)},
-    "scripts/compare_models.py": {"open-write": (1, _V1)},
-    "scripts/cross_model_critic.py": {"open-write": (4, _V1), "os-rename": (1, _V1)},
-    "scripts/effort_floors.py": {"open-write": (1, _V1)},
-    "scripts/eligibility_probe.py": {"open-write": (1, _V1)},
     "scripts/identifiability.py": {"open-write": (1, _V1)},
-    "scripts/open_problems.py": {"open-write": (2, _V1), "os-rename": (2, _V1)},
-    "scripts/presentation_pass.py": {"open-write": (2, _V1), "os-rename": (1, _V1)},
     "scripts/propagate_uncertainty.py": {"open-write": (1, _V1)},
     "scripts/writer_qa.py": {"open-write": (1, _V1)},
 }
@@ -629,10 +611,10 @@ def _self_test_round6(ok) -> None:
                                   f"({os.listdir(out)})")
     with tempfile.TemporaryDirectory() as d, tempfile.TemporaryDirectory() as out:
         run_dir(d)
-        import figure_validator as FV
+        from toolkit.analysis import figures as FG
         os.symlink(out, os.path.join(d, "figures"))
         open(os.path.join(out, "f.png"), "wb").write(b"png")
-        call(FV.validate_figure, os.path.join(d, "figures", "f.png"))
+        call(FG.validate_figure, os.path.join(d, "figures", "f.png"))
         ok(os.listdir(out) == ["f.png"], f"WA16 figure provenance is not written through a planted figures/ link "
                                          f"({os.listdir(out)})")
     with tempfile.TemporaryDirectory() as d, tempfile.TemporaryDirectory() as out:
@@ -742,11 +724,11 @@ def _self_test_round7(ok) -> None:
            f"WA21 a root spelled through a planted link (run/analysis/..) is not resolved to the link's parent: "
            f"validated and anchored on one identity ({os.listdir(out)})")
     with tempfile.TemporaryDirectory() as d, tempfile.TemporaryDirectory() as out:
-        import figure_validator as FV
+        from toolkit.analysis import figures as FG
         os.symlink(out, os.path.join(d, "figures"))         # the run's marker deleted by an agent: no metadata.json
         open(os.path.join(out, "f.png"), "wb").write(b"png")
         for fn in (lambda: SIO.publish(os.path.join(d, "figures", "x.json"), "x", None),
-                   lambda: FV.validate_figure(os.path.join(d, "figures", "f.png"))):
+                   lambda: FG.validate_figure(os.path.join(d, "figures", "f.png"))):
             try:
                 fn()
             except (ValueError, OSError, TypeError):

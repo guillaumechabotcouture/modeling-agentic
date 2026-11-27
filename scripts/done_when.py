@@ -824,10 +824,12 @@ def _self_test() -> int:
            f"{[x['id'] for x in r32['dropped']]}")
         g33 = [g for g in gate_findings(run(dm, {"critique-domain": {"blockers": []}}, 3, record=False))
                if g["kind"] == "done_when_dropped"]
-        import stall_rule as _sr
-        ok(sorted(_sr.finding_key(g) for g in g33) == ["D-021", "D-022"] and all(g.get("done_when") for g in g33),
+        if os.path.dirname(os.path.abspath(__file__)) not in sys.path:
+            sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        from lib.scope_declarations import finding_key as _finding_key
+        ok(sorted(_finding_key(g) for g in g33) == ["D-021", "D-022"] and all(g.get("done_when") for g in g33),
            f"DW33 each dropped finding keeps its own key (one ledger row each) and its test: "
-           f"{[(_sr.finding_key(g), bool(g.get('done_when'))) for g in g33]}")
+           f"{[(_finding_key(g), bool(g.get('done_when'))) for g in g33]}")
         dl = os.path.join(d, "s34")
         os.makedirs(dl)
         ck2 = {"critique-domain": {"blockers": [dict(b, resolved=True) for b in ck["critique-domain"]["blockers"]]}}

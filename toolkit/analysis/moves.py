@@ -21,6 +21,10 @@ import sys
 
 import yaml
 
+ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+if ROOT not in sys.path:
+    sys.path.insert(0, ROOT)
+
 PRODUCER = "toolkit/analysis/moves.py"
 CRITERIA = ("share", "regret", "dollars")
 SPEC_KEYS = {"share": "share_threshold", "regret": "regret_threshold", "dollars": "dollars_threshold"}
@@ -359,9 +363,7 @@ def _self_test() -> int:
                             "stable_provision": 2, "stable_absence": 4, "changed": 2},
        f"MV11 stable provision is counted apart from stable absence, per component ({s}, {e8!r})")
     # mechanism_manifest (the Phase 49 loader) accepts a verdict that a regret or dollars criterion explains
-    sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
-                                    "scripts"))
-    import mechanism_manifest as MM
+    from toolkit.analysis import contract as MM
     res = {"decision_changes": True, "share_units_changed": 0.05, "share_threshold": 0.1, "regret_share": 0.02,
            "regret_threshold": 0.01, "dollars_share": 0.0, "dollars_threshold": 0.05, "triggered_by": ["regret"]}
     ok(MM._result_conflicts("t.yaml", res, "x", None) == [],
@@ -584,7 +586,6 @@ def _self_test() -> int:
        "it, a proven solve, and a point plan the test makes infeasible are not")
     # Codex narrow round (2 P1) on core.best_known: the point plan is promoted only when it is feasible by the rule
     # this module's rows use and within the solver's own budget tolerance; the bound is computed on gains
-    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
     from toolkit.analysis import core as CO
 
     class _B:

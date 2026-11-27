@@ -48,10 +48,7 @@ EXEMPT = {
     "toolkit/spec/toy_engines.py": "self-test toy engines (refused in production by toolkit/import_guard.py); "
                                    "exercised by toolkit/spec/engine_parameters.py's self-test",
     "toolkit/engines/malaria/model.py": "engine module; exercised by toolkit/engines/malaria/engine.py --self-test",
-    "toolkit/engines/compartmental/benchmarks/runtime_spike.py": "one-off timing script for the dev VM",
     "toolkit/engines/renewal/benchmarks/oracles.py": "benchmark-pack oracles and probes; exercised by toolkit/engines/renewal/engine.py --self-test",
-    "toolkit/engines/malaria/benchmarks/b15_mechanisms.py": "diagnostic scan script, not a library",
-    "toolkit/engines/malaria/benchmarks/runtime.py": "timing and peak-memory measurement script for a VM, not a library",
 }
 MARKER = "--self-test"
 
@@ -135,7 +132,7 @@ WEIGHTS_S = {
     "toolkit/analysis/calibration.py": 182, "toolkit/analysis/run.py": 176,
     "toolkit/calibration/history_matching.py": 81, "toolkit/analysis/joint_calibration.py": 46,
     "toolkit/engines/compartmental/selftest_age.py": 32, "toolkit/spec/engine_parameters.py": 31,
-    "toolkit/analysis/figures.py": 25, "scripts/pipeline.py": 25, "scripts/validate_critique_yaml.py": 22,
+    "toolkit/analysis/figures.py": 25, "scripts/pipeline.py": 25, "scripts/validate_critique_yaml.py": 5,
     "agents/analysis_backend.py": 21, "toolkit/analysis/trajectories.py": 19, "toolkit/analysis/model.py": 15,
 }
 DEFAULT_WEIGHT_S = 5

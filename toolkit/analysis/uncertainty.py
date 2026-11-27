@@ -82,8 +82,8 @@ def posterior_input(spec) -> dict | None:
     path, dig = spec.resolve(p["path"]), p["sha256"].lower()
     got = getattr(spec, "_net_effect_posterior", None)
     if got is None or (got["path"], got["sha256"]) != (path, dig):
-        from toolkit.engines.malaria.benchmarks import net_effect_fit as NEF
-        got = {"path": path, "sha256": dig, "data": NEF.read_signed(path, dig)}
+        from toolkit.engines import effect_fit as EF
+        got = {"path": path, "sha256": dig, "data": EF.read_signed(path, dig)}
         spec._net_effect_posterior = got
     return dict(got, margin=float(m), exception=exc)
 
@@ -143,7 +143,7 @@ def net_effect_sample(spec, eng, fitted: dict | None = None, priors: dict | None
     post = posterior_input(spec)
     if post is None:
         return None
-    from toolkit.engines.malaria.benchmarks import net_effect_fit as NEF
+    from toolkit.engines import effect_fit as EF
     if fitted is None:
         from toolkit.analysis.batch import fitted_ranges
         fitted = fitted_ranges(eng)
@@ -164,9 +164,9 @@ def net_effect_sample(spec, eng, fitted: dict | None = None, priors: dict | None
     cache = getattr(spec, "_net_effect_sample", None)
     if cache is not None and cache[0] == key:
         return cache[1]
-    ne = NEF.load_posterior(post["path"], eng, varied, post["sha256"], post["data"], exception=post.get("exception"))
+    ne = EF.load_posterior(post["path"], eng, varied, post["sha256"], post["data"], exception=post.get("exception"))
     ne["margin"] = post["margin"]
-    ne["ranges"] = NEF.posterior_ranges(ne, post["margin"], NEF.hard_bounds(eng, ne["names"]))
+    ne["ranges"] = EF.posterior_ranges(ne, post["margin"], EF.hard_bounds(eng, ne["names"]))
     ne["point"] = chosen_point(post, ne["names"])
     spec._net_effect_sample = (key, ne)
     return ne
@@ -179,12 +179,12 @@ def chosen_point(post: dict, names) -> dict:
     columns, or hold a value that is not a finite number; a point that is not exactly the fit's recorded `parameters`
     values."""
     import yaml
-    from toolkit.engines.malaria.benchmarks import net_effect_fit as NEF
+    from toolkit.engines import effect_fit as EF
     doc = yaml.safe_load(post["data"])
     pt = ((((doc.get("joint_region") or {}).get("verified") or {}).get("chosen") or {}).get("point"))
     if not isinstance(pt, dict) or sorted(pt) != sorted(names) or any(
             isinstance(pt[k], bool) or not isinstance(pt[k], (int, float)) or not np.isfinite(pt[k]) for k in names):
-        raise NEF.PosteriorRefused(f"net-effect posterior {post['path']}: no verified chosen point whose coordinates are "
+        raise EF.PosteriorRefused(f"net-effect posterior {post['path']}: no verified chosen point whose coordinates are "
                                    f"the sample's columns {list(names)}, each a finite number "
                                    f"(joint_region.verified.chosen.point: {pt!r})")
     # run() writes the chosen point from its fit's parameter values: they must be the same numbers (Codex r1 P1-4, r2)
@@ -193,7 +193,7 @@ def chosen_point(post: dict, names) -> dict:
         k for k in names if not isinstance(fp.get(k), dict) or isinstance(fp[k].get("value"), bool)
         or not isinstance(fp[k].get("value"), (int, float)) or not float(fp[k]["value"]) == float(pt[k])]
     if off:
-        raise NEF.PosteriorRefused(f"net-effect posterior {post['path']}: the chosen point of {off} is not the fit's "
+        raise EF.PosteriorRefused(f"net-effect posterior {post['path']}: the chosen point of {off} is not the fit's "
                                    f"recorded parameter values (parameters: {[fp.get(k) for k in off]}; chosen point: "
                                    f"{[pt.get(k) for k in off]})")
     return {k: float(pt[k]) for k in names}
@@ -1010,7 +1010,7 @@ def _self_test_posterior(ok):
     import tempfile
     import types
     from toolkit.engines.malaria.engine import MalariaEngine
-    from toolkit.engines.malaria.benchmarks import net_effect_fit as NEF
+    from toolkit.engines import effect_fit as EF
     from toolkit.spec import priors as PRI
     e = MalariaEngine()
     card = PRI.load_card(e)["priors"]
@@ -1046,7 +1046,7 @@ def _self_test_posterior(ok):
     rows = [{"net_kill_shift": round(-0.5 + v, 6), "cfp_kill": round(0.35 + 0.3 * v, 6)} for v in x]
     box = {"net_kill_shift": [-0.618, 0.66], "cfp_kill": [0.0, 0.8]}
     with tempfile.TemporaryDirectory() as d:
-        NEF._fixture_placeholder(os.path.join(d, "net_effect_fit.yaml"), e, rows, box)
+        EF._fixture_placeholder(os.path.join(d, "net_effect_fit.yaml"), e, rows, box)
         # NP1: recorded before this change (branch f6-netfit-adopt): the first draw at seed 9 without the field
         th0 = {"net_kill_shift": 0.11657722739764786, "use_rate": 0.87768660115964, "cfp_kill": 0.6480996815880338}
         D0, D1 = Drawer(fake(d), 9), Drawer(fake(d, "net_effect_fit.yaml"), 9)
@@ -1067,12 +1067,12 @@ def _self_test_posterior(ok):
         # Codex r1 P2-4: the file is read once; the manifest, the engine artifact and the drawer use those bytes
         A5 = fake(d, sig)
         i1 = posterior_input(A5.spec)                   # run.py's read, before the manifest is written
-        NEF._fixture_placeholder(os.path.join(d, "net_effect_fit.yaml"), e, rows[1:], box)      # the file is replaced after
+        EF._fixture_placeholder(os.path.join(d, "net_effect_fit.yaml"), e, rows[1:], box)      # the file is replaced after
         D5 = Drawer(A5, 9)
         try:
             posterior_input(fake(d, sig).spec)          # a fresh read of the replaced file under the signed digest
             fresh = "accepted"
-        except NEF.PosteriorRefused as ex:
+        except EF.PosteriorRefused as ex:
             fresh = str(ex)
         ok(i1["sha256"] == sig["sha256"] == D5.posterior_provenance()["sha256"] and len(D5.ne["rows"]) == 30
            and "signed sha256" in fresh,
@@ -1087,13 +1087,13 @@ def _self_test_posterior(ok):
                                fake(d, "net_effect_fit.yaml", sources=("costs",)), "not varied")):
             try:
                 Drawer(A, 9)
-            except NEF.PosteriorRefused as ex:
+            except EF.PosteriorRefused as ex:
                 refused += [label] if why in str(ex) else []
         ok(len(refused) == 3, f"NP4 the draws refuse the sample, each for its reason, for {refused} (fail closed)")
         # NP5 (owner, 14 Nov, f6-posterior-ranges): a sample whose hull exceeds the draw ranges (cfp_kill 0.2-0.8 against
         # the fitted 0.3-0.7) loads; its hull sets its columns' draw ranges, the other parameters keep theirs
         wide = [{"net_kill_shift": round(-0.5 + v, 6), "cfp_kill": round(0.2 + 0.6 * v, 6)} for v in x]
-        NEF._fixture_placeholder(os.path.join(d, "wide.yaml"), e, wide, box)
+        EF._fixture_placeholder(os.path.join(d, "wide.yaml"), e, wide, box)
         hull = {k: (min(r[k] for r in wide), max(r[k] for r in wide)) for k in box}
         D6 = Drawer(fake(d, "wide.yaml"), 9)
         t6 = [D6.draw()[0] for _ in range(40)]
@@ -1131,7 +1131,7 @@ def _self_test_posterior(ok):
         try:
             net_effect_sample(A9.spec, ToyEngine(), fitted=A9.fr, priors=A9.pr)
             why9 = "accepted"
-        except NEF.PosteriorRefused as ex:
+        except EF.PosteriorRefused as ex:
             why9 = str(ex)
         ok("fitted under engine" in why9, f"NP9 the cached sample does not bypass another engine's check: {why9[:100]}")
 
