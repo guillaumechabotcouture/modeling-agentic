@@ -488,6 +488,30 @@ def validate_build(build: Mapping) -> list[str]:
                     bad.append(f"engine.build.request.expected_effects.{iname}.{oname}: undeclared output")
                 if not isinstance(sign, str) or sign not in EFFECT_SIGNS:
                     bad.append(f"engine.build.request.expected_effects.{iname}.{oname}: sign {sign!r} not in {list(EFFECT_SIGNS)}")
+        covered_outs: set[str] = set()
+        for iname, outs in ee_raw.items():
+            if iname not in inert_raw and isinstance(outs, Mapping):
+                covered_outs.update(str(k) for k in outs if _is_str(k))
+        for pc in per_cap:
+            if not (pc in covered_outs or f"per_capita_all.{pc}" in covered_outs
+                    or any(o.startswith(f"per_capita.{pc}.") for o in covered_outs)):
+                bad.append(
+                    f"engine.build.request.expected_effects: declared per_capita output {pc!r} is not named "
+                    "for any non-inert input (A6 requires every declared output to be moved by at least one input)"
+                )
+        for drv in cost_drivers:
+            if not (drv in covered_outs or f"cost.{drv}" in covered_outs):
+                bad.append(
+                    f"engine.build.request.expected_effects: declared cost_driver {drv!r} is not named "
+                    "for any non-inert input (A6 requires every declared output to be moved by at least one input)"
+                )
+        for wname, metrics in windows_map.items():
+            for m in sorted(metrics):
+                if not (m in covered_outs or f"windows.{wname}.{m}" in covered_outs):
+                    bad.append(
+                        f"engine.build.request.expected_effects: declared window output 'windows.{wname}.{m}' is not "
+                        "named for any non-inert input (A6 requires every declared output to be moved by at least one input)"
+                    )
 
     # Compartments (required for starsim_module)
     cmps = req.get("compartments")
@@ -1031,7 +1055,7 @@ def example_build() -> dict:
                 "comp_a": {"cases": "-", "units_delivered": "+"},
                 "eff_a": {"cases": "-"},
                 "sev_mult": {"severe": "+"},
-                "rate_in": {"cases": "+"},
+                "rate_in": {"cases": "+", "prev": "+"},
                 "n_strains": {"cases": "+"},
             },
             "inert": {"N": {"reason": "per-capita rates are invariant to population size",
@@ -1126,6 +1150,14 @@ def _self_test() -> int:
     ok(bool(validate_build(b_empty_di)) and validate_build(b_none_di) == []
        and bool(validate_build(b_unhash)) and "validation errors" in "\n".join(sheet_lines(b_unhash)),
        "BE24c7 empty decision_inputs refused without none_reason; unhashable name returns error instead of TypeError")
+    b_uncov_drv = copy.deepcopy(b0)
+    b_uncov_drv["request"]["expected_effects"]["comp_a"] = {"cases": "-"}
+    b_uncov_win = copy.deepcopy(b0)
+    b_uncov_win["request"]["expected_effects"]["rate_in"] = {"cases": "+"}
+    e_ud, e_uw = validate_build(b_uncov_drv), validate_build(b_uncov_win)
+    ok(any("cost_driver 'units_delivered'" in x for x in e_ud)
+       and any("windows.w0.prev" in x for x in e_uw),
+       f"BE24c8 declared outputs missing from expected_effects refused before sign-off (drv={e_ud[:1]}, win={e_uw[:1]})")
 
     # BE24: build spec validates through RequestedEngine; missing component, bad trial, bad reduction, bad unit type refused
     with tempfile.TemporaryDirectory() as d:

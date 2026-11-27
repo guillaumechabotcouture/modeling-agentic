@@ -129,8 +129,9 @@ every declared `age_groups` entry and how `horizon.window` length (`stop - start
 independent A11 reference implementation agrees on every `(output, age_group)` cell. For unordered
 multi-mode `request.components`, use string labels (e.g. `["none", "mode_a", "mode_b"]`, `absent: "none"`)
 rather than integer codes (`[0, 1, 2]`): numeric component lists are checked for step-by-step monotonicity in
-A7, whereas string components compare each active mode against `absent`. In `request.expected_effects`,
-declare `nonzero` rather than `+`/`-` whenever an output can be non-monotone across an input's declared domain. Quote ISO `decision_date` values (e.g. `"2026-01-01"`) or write an integer year. The harness has copied the question's input files into data/inputs/ (same
+A7, whereas string components compare each active mode against `absent`. In `request.expected_effects`, include every declared output (`per_capita`, `windows`, `cost_drivers`)
+under at least one non-inert input, and declare `nonzero` rather than `+`/`-` whenever an output can be
+non-monotone across an input's declared domain. Quote ISO `decision_date` values (e.g. `"2026-01-01"`) or write an integer year. The harness has copied the question's input files into data/inputs/ (same
 relative paths; their sha256 in data/inputs_provenance.json): read them. You write code, never
 tables. For each file the spec reads that is not a staged input (the units table, calibration
 targets, cost tables), write one script under data/derive/ and declare it in data/derivations.yaml
@@ -213,7 +214,8 @@ Task: build the agent-built engine `{engine_id}` into `{work_dir}` from the sign
 and `engine_build/request.json`. You have no shell; use `mcp__engine__try` (runs static checks S1-S4
 and public cases of checks A1-A8) and `mcp__engine__run` (one sandboxed evaluation within request domains)
 to test your working copy (shared 30-call cap). You may read `{repo}/toolkit/engines/contract.py` (always
-use that full repo path, not a relative path inside the run directory). Write ONLY inside `{work_dir}`:
+use that full repo path, not a relative path inside the run directory). Write ONLY these files inside `{work_dir}`
+(NEVER create scratch `.txt`/`.tmp` files there — you have no delete tool and static check S1 rejects any stray file):
 - `engine.py` defining `class Model` implementing the signed contract (and optional sibling `.py` helpers)
 - `card.yaml` matching `describe()` with `benchmarks: []`, `assumptions`, and `limitations`
 - `ENGINE_NOTES.md` documenting equations, assumptions, and limitations in plain language
@@ -232,8 +234,10 @@ Rules:
 - The engine carries trial effects over to the setting (principle 3); its own burden is a validation
   check, not the basis of the decision.
 - It must declare and use EXACTLY the parameters the signed request names (name, kind, value, lo, hi,
-  units, source). Every non-inert input must move its declared `expected_effects` outputs with the
-  declared sign inside the dynamics (never via post-hoc formulas or tiny epsilon terms).
+  units, source; omit `lo`/`hi` when omitted in the request). Read the resolved `params` mapping directly
+  (do not `dict(params)` copy it) so A6 parameter-read tracking records every read. Every non-inert input
+  must move its declared `expected_effects` outputs with the declared sign inside the dynamics (never via
+  post-hoc formulas or tiny epsilon terms).
 - Obey static checks S1-S4 in {out_in}: module top level may contain ONLY imports, simple constant
   assignments, `def`, and `class` (NO module-level `try/except`, `if`, `for`, or bare expression calls);
   no dynamic `getattr(obj, var_name)` with non-literal attribute names; no file/process/network/interpreter

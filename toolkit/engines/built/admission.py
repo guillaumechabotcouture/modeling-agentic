@@ -1624,7 +1624,7 @@ def run_public_checks(cand: BCAND.CandidateEngine, build_decl: Mapping, spec_raw
         out_checks["A5"] = check_a5(cand, build_decl, pub_units, pub_pkgs, hor, th=th)
     if "A6" in want or "A7" in want:
         a6, a7 = check_a6_a7(cand, build_decl, spec_raw, _rng_from(PUBLIC_SEED_BYTES, "a6"),
-                             n_bases=1, min_moving=1, th=th)
+                             n_bases=int(th["a6_base_points"]), min_moving=int(th["a6_min_moving_bases"]), th=th)
         if "A6" in want:
             out_checks["A6"] = a6
         if "A7" in want:
