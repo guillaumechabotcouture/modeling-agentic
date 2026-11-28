@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import contextlib
 import io
 import json
 import os
@@ -37,6 +38,35 @@ from compute import (
 )
 
 
+def _self_test_iso_repo(root: str, *, with_costs: bool = False) -> str:
+    """Minimal isolated REPO tree inside a temp dir so self-test bundle/worker calls never touch live REPO."""
+    repo = os.path.realpath(root)
+    os.makedirs(os.path.join(repo, "scripts"), exist_ok=True)
+    shutil.copy2(os.path.join(SCRIPTS_DIR, "compute.py"), os.path.join(repo, "scripts", "compute.py"))
+    shutil.copy2(os.path.join(SCRIPTS_DIR, "compute_worker.py"), os.path.join(repo, "scripts", "compute_worker.py"))
+    shutil.copytree(os.path.join(SCRIPTS_DIR, "lib"), os.path.join(repo, "scripts", "lib"),
+                    ignore=shutil.ignore_patterns("__pycache__"))
+    os.makedirs(os.path.join(repo, "cloud"), exist_ok=True)
+    shutil.copy2(os.path.join(REPO, "cloud", "worker_side.py"), os.path.join(repo, "cloud", "worker_side.py"))
+    if with_costs:
+        os.makedirs(os.path.join(repo, "toolkit", "alloc"), exist_ok=True)
+        open(os.path.join(repo, "toolkit", "alloc", "costs.py"), "w").close()
+    return repo
+
+
+@contextlib.contextmanager
+def _self_test_patched_repo(iso_repo: str):
+    """Patch C.REPO/CW.REPO to `iso_repo` while preventing `sys.modules['ma_compute_worker_side']` from leaking."""
+    prev = sys.modules.pop("ma_compute_worker_side", None)
+    try:
+        with mock.patch.object(C, "REPO", iso_repo), mock.patch.object(CW, "REPO", iso_repo):
+            yield
+    finally:
+        sys.modules.pop("ma_compute_worker_side", None)
+        if prev is not None:
+            sys.modules["ma_compute_worker_side"] = prev
+
+
 def _self_test() -> int:
     import shutil
     import subprocess as _sp
@@ -47,7 +77,8 @@ def _self_test() -> int:
         if not c:
             fails.append(m)
 
-    with tempfile.TemporaryDirectory() as d:
+    with tempfile.TemporaryDirectory() as d, tempfile.TemporaryDirectory() as _iso_td:
+        iso_repo = _self_test_iso_repo(_iso_td, with_costs=True)
         os.makedirs(os.path.join(d, "models"))
         os.makedirs(os.path.join(d, "data"))
         open(os.path.join(d, "data", "scale.txt"), "w").write("3\n")
@@ -80,7 +111,8 @@ def _self_test() -> int:
         except ValueError:
             pass
         os.symlink(os.path.join(d, "data", "scale.txt"), os.path.join(d, "data", "link.txt"))
-        b, info = make_bundle(d)
+        with _self_test_patched_repo(iso_repo):
+            b, info = make_bundle(d)
         lk = [m for m in tarfile.open(fileobj=io.BytesIO(b)).getmembers() if m.name.endswith("data/link.txt")]
         ok(lk and lk[0].isfile(), "C7b a symlinked input is bundled as a file")
         os.remove(os.path.join(d, "data", "link.txt"))
@@ -179,33 +211,34 @@ def _self_test() -> int:
             ok(False, "C15b a truncated ledger must refuse, not reset the budget")
         except RuntimeError:
             pass
-        vd = os.path.realpath(os.path.join(d, "ver")); os.makedirs(os.path.join(vd, "models"))
-        vfile, hfile = os.path.join(vd, "models", "v.py"), os.path.join(vd, "models", "oldhelper.py")
+        with _self_test_patched_repo(iso_repo):
+            vd = os.path.realpath(os.path.join(d, "ver")); os.makedirs(os.path.join(vd, "models"))
+            vfile, hfile = os.path.join(vd, "models", "v.py"), os.path.join(vd, "models", "oldhelper.py")
 
-        def stage(body, helper):
-            # same length, same mtime: only a fresh compile tells A from B
-            open(vfile, "w").write(body); os.utime(vfile, (1_700_000_000, 1_700_000_000))
-            if helper:
-                open(hfile, "w").write("X = 73\n")
-            elif os.path.exists(hfile):
-                os.remove(hfile)
-            return make_bundle(vd)
-        ba, ia = stage("def v(p):\n    return 'A'\n", True)
-        bb, ib = stage("def v(p):\n    return 'B'\n", False)
-        bc, ic = stage("def v(p):\n    import oldhelper\n    return oldhelper.X\n", False)
+            def stage(body, helper):
+                # same length, same mtime: only a fresh compile tells A from B
+                open(vfile, "w").write(body); os.utime(vfile, (1_700_000_000, 1_700_000_000))
+                if helper:
+                    open(hfile, "w").write("X = 73\n")
+                elif os.path.exists(hfile):
+                    os.remove(hfile)
+                return make_bundle(vd)
+            ba, ia = stage("def v(p):\n    return 'A'\n", True)
+            bb, ib = stage("def v(p):\n    return 'B'\n", False)
+            bc, ic = stage("def v(p):\n    import oldhelper\n    return oldhelper.X\n", False)
 
-        def remote(b_, i_):
-            return _remote_task(b_, i_["sha256"], vd, "models/v.py::v", [(0, {})], procs=1)
-        got = [remote(b_, i_)["rows"][0].get("result") for b_, i_ in ((ba, ia), (bb, ib), (ba, ia), (bb, ib))]
-        ok(got == ["A", "B", "A", "B"], f"C16 a chunk runs its own bundle's code (same size+mtime): {got}")
-        remote(ba, ia)
-        r = remote(bc, ic)["rows"][0]
-        ok(not r["ok"] and "oldhelper" in r.get("error", ""),
-           f"C16b a file absent from the bundle is gone, not left over from an earlier one: {r}")
-        open(vfile, "w").write("import os\ndef v(p):\n    os._exit(3)\n")
-        bd, id_ = make_bundle(vd)
-        r = remote(bd, id_)
-        ok(not r["rows"][0]["ok"] and r["core_s"] > 0, f"C21 a remote chunk whose process crashed is charged: {r}")
+            def remote(b_, i_):
+                return _remote_task(b_, i_["sha256"], vd, "models/v.py::v", [(0, {})], procs=1)
+            got = [remote(b_, i_)["rows"][0].get("result") for b_, i_ in ((ba, ia), (bb, ib), (ba, ia), (bb, ib))]
+            ok(got == ["A", "B", "A", "B"], f"C16 a chunk runs its own bundle's code (same size+mtime): {got}")
+            remote(ba, ia)
+            r = remote(bc, ic)["rows"][0]
+            ok(not r["ok"] and "oldhelper" in r.get("error", ""),
+               f"C16b a file absent from the bundle is gone, not left over from an earlier one: {r}")
+            open(vfile, "w").write("import os\ndef v(p):\n    os._exit(3)\n")
+            bd, id_ = make_bundle(vd)
+            r = remote(bd, id_)
+            ok(not r["rows"][0]["ok"] and r["core_s"] > 0, f"C21 a remote chunk whose process crashed is charged: {r}")
         open(os.path.join(d, "models", "stubborn.py"), "w").write(
             "import signal, time\ndef f(p):\n    signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
             "    t = time.time()\n    while time.time() - t < 60: pass\n")
@@ -269,99 +302,100 @@ def _self_test() -> int:
         except ProcessLookupError:
             alive = False
         ok(rows[0]["ok"] and not alive, f"C23 a process the model left running is killed with the batch: {rows[0]}")
-        sd = os.path.realpath(os.path.join(d, "stage")); os.makedirs(os.path.join(sd, "models")); os.makedirs(os.path.join(sd, "data"))
-        open(os.path.join(sd, "models", "v.py"), "w").write("def v(p):\n    return 1\n")
-        open(os.path.join(sd, "data", "source.csv"), "w").write("a\n")
-        b1, i1 = make_bundle(sd)
-        os.remove(os.path.join(sd, "data", "source.csv"))
-        b2, i2 = make_bundle(sd)
-        _remote_task(b1, i1["sha256"], sd, "models/v.py::v", [(0, {})], procs=1)
-        livedir = os.path.join(d, "live_run"); os.makedirs(os.path.join(livedir, "data"))
-        open(os.path.join(livedir, "metadata.json"), "w").write("{}")
-        open(os.path.join(livedir, "data", "source.csv"), "w").write("live\n")
-        shutil.rmtree(os.path.join(sd, "data")); os.symlink(os.path.join(livedir, "data"), os.path.join(sd, "data"))
-        r = _remote_task(b2, i2["sha256"], sd, "models/v.py::v", [(0, {})], procs=1)
-        ok(os.path.exists(os.path.join(livedir, "data", "source.csv")),
-           f"C24 staging never deletes through a symlink: {r['rows'][0]}")
-        bl, il = make_bundle(livedir)   # a bundle whose target dirs run through the symlink
-        os.makedirs(os.path.join(sd, "data", "x"), exist_ok=True)
-        open(os.path.join(sd, "data", "x", "f.txt"), "w").write("1")
-        b3, i3 = make_bundle(sd)
-        r = _remote_task(b3, i3["sha256"], sd, "models/v.py::v", [(0, {})], procs=1)
-        ok(not r["rows"][0]["ok"] and "symlink" in r["rows"][0]["error"],
-           f"C24b staging refuses to write through a symlinked directory: {r['rows'][0]}")
-        cdir = os.path.realpath(os.path.join(d, "cap")); os.makedirs(os.path.join(cdir, "models"))
-        open(os.path.join(cdir, "models", "slow.py"), "w").write(open(os.path.join(d, "models", "slow.py")).read())
-        bc_, ic_ = make_bundle(cdir)
-        t0 = time.time()
-        r = _remote_task(bc_, ic_["sha256"], cdir, "models/slow.py::burn", [(k, {"s": 0.4}) for k in range(20)],
-                         procs=1, chunk_allowance_s=1.0)
-        # core_s and the cap-stopped rows show the share is enforced; the wall-clock
-        # limit only catches a hang (it was 8 s and failed on a loaded machine).
-        ok(time.time() - t0 < 30 and any(x.get("error") == CAP_STOP for x in r["rows"]) and r["core_s"] < 3,
-           f"C25 a remote chunk enforces its allowance share: core_s={r['core_s']}")
-        import threading as _th
-        import uuid as _uuid
-        res, cid = {}, "selftest-" + _uuid.uuid4().hex
-        th = _th.Thread(target=lambda: res.update(r=_remote_task(bc_, ic_["sha256"], cdir, "models/slow.py::sleep",
-                                                                 [(0, {"s": 60})], procs=1, call_id=cid)))
-        th.start()
-        # Readiness, not a fixed sleep (a loaded machine registered the chunk after 1.5 s):
-        # wait until the chunk has registered its pid for this call.
-        cdir_ = os.path.join(tempfile.gettempdir(), _CALLS_DIR, cid)
-        end = time.time() + 60
-        while time.time() < end and not any(n.isdigit() for n in (os.listdir(cdir_) if os.path.isdir(cdir_) else [])):
-            time.sleep(0.02)
-        t0 = time.time(); n_stopped = _cancel_call(cid); th.join(15)
-        later = _remote_task(bc_, ic_["sha256"], cdir, "models/slow.py::sleep", [(0, {"s": 60})], procs=1, call_id=cid)
-        ok(n_stopped == 1 and not th.is_alive() and not res["r"]["rows"][0]["ok"]
-           and later["rows"][0]["error"] == "cancelled", f"C26 cancel stops running and queued chunks: {n_stopped}, {res}")
-        open(os.path.join(d, "models", "heavy.py"), "w").write("import time\ntime.sleep(1.0)\ndef f(p):\n    return 1\n")
-        rows, s = map_fn(d, "models/heavy.py::f", [{}] * 2, backend="local", max_workers=1)
-        ok(rows[0]["ok"] and s["task_core_s"] >= 0.9, f"C28 model load time is charged: {s}")
-        rows, s = map_fn(d, "models/heavy.py::f", [{}] * 3, backend="local", max_workers=3)
-        ok(s["task_core_s"] >= 2.7, f"C28b every process's model load is charged, chunk or not: {s}")
-        ev = os.path.realpath(os.path.join(d, "envf")); os.makedirs(os.path.join(ev, "models"))
-        open(os.path.join(ev, "models", "e.py"), "w").write(
-            "import os\ndef f(p):\n    return [os.environ.get(k) for k in ('AZURE_SELFTEST', 'ANTHROPIC_API_KEY', 'OK_VAR')]\n")
-        be_, ie_ = make_bundle(ev)
-        saved = {k: os.environ.get(k) for k in ("AZURE_SELFTEST", "ANTHROPIC_API_KEY", "OK_VAR")}
-        os.environ.update(AZURE_SELFTEST="secret-a", ANTHROPIC_API_KEY="secret-b", OK_VAR="kept")
-        try:
-            r = _remote_task(be_, ie_["sha256"], ev, "models/e.py::f", [(0, {})], procs=1)["rows"][0]
-        finally:
-            for k, v in saved.items():
-                if v is None:
-                    os.environ.pop(k, None)
-                else:
-                    os.environ[k] = v
-        ok(r.get("result") == [None, None, "kept"], f"C32 model code on a worker gets no credentials: {r}")
-        dl = os.path.join(d, "dlink"); os.makedirs(os.path.join(dl, "models"))
-        ext = os.path.join(d, "ext_data"); os.makedirs(ext); open(os.path.join(ext, "t.csv"), "w").write("1\n")
-        os.symlink(ext, os.path.join(dl, "data"))
-        os.symlink(os.path.join(dl, "data"), os.path.join(ext, "loop"))      # a cycle
-        bd_, idd = make_bundle(dl)
-        names_ = tarfile.open(fileobj=io.BytesIO(bd_)).getnames()
-        ok(any(n.endswith("dlink/data/t.csv") for n in names_), f"C7c a symlinked data dir is bundled (cycle-safe): {idd}")
-        al = os.path.join(d, "alias"); os.makedirs(os.path.join(al, "data", "real")); os.makedirs(os.path.join(al, "models"))
-        open(os.path.join(al, "data", "real", "value.txt"), "w").write("73\n")
-        os.symlink(os.path.join(al, "data", "real"), os.path.join(al, "data", "a_alias"))
-        na = tarfile.open(fileobj=io.BytesIO(make_bundle(al)[0])).getnames()
-        ok(any(n.endswith("data/real/value.txt") for n in na) and any(n.endswith("data/a_alias/value.txt") for n in na),
-           f"C7d both names of an aliased dir are bundled: {[n for n in na if 'value' in n]}")
-        ld = os.path.realpath(os.path.join(d, "leaf")); os.makedirs(os.path.join(ld, "models")); os.makedirs(os.path.join(ld, "data"))
-        open(os.path.join(ld, "models", "v.py"), "w").write("def v(p):\n    return 1\n")
-        open(os.path.join(ld, "data", "input.csv"), "w").write("bundle\n")
-        bl_, il_ = make_bundle(ld)
-        victim = os.path.join(d, "victim_run"); os.makedirs(os.path.join(victim, "data"))
-        open(os.path.join(victim, "metadata.json"), "w").write("{}")
-        open(os.path.join(victim, "data", "input.csv"), "w").write("live\n")
-        os.remove(os.path.join(ld, "data", "input.csv"))
-        os.symlink(os.path.join(victim, "data", "input.csv"), os.path.join(ld, "data", "input.csv"))
-        _remote_task(bl_, il_["sha256"], ld, "models/v.py::v", [(0, {})], procs=1)
-        ok(open(os.path.join(victim, "data", "input.csv")).read() == "live\n"
-           and not os.path.islink(os.path.join(ld, "data", "input.csv")),
-           "C30 staging never writes through a symlinked file")
+        with _self_test_patched_repo(iso_repo):
+            sd = os.path.realpath(os.path.join(d, "stage")); os.makedirs(os.path.join(sd, "models")); os.makedirs(os.path.join(sd, "data"))
+            open(os.path.join(sd, "models", "v.py"), "w").write("def v(p):\n    return 1\n")
+            open(os.path.join(sd, "data", "source.csv"), "w").write("a\n")
+            b1, i1 = make_bundle(sd)
+            os.remove(os.path.join(sd, "data", "source.csv"))
+            b2, i2 = make_bundle(sd)
+            _remote_task(b1, i1["sha256"], sd, "models/v.py::v", [(0, {})], procs=1)
+            livedir = os.path.join(d, "live_run"); os.makedirs(os.path.join(livedir, "data"))
+            open(os.path.join(livedir, "metadata.json"), "w").write("{}")
+            open(os.path.join(livedir, "data", "source.csv"), "w").write("live\n")
+            shutil.rmtree(os.path.join(sd, "data")); os.symlink(os.path.join(livedir, "data"), os.path.join(sd, "data"))
+            r = _remote_task(b2, i2["sha256"], sd, "models/v.py::v", [(0, {})], procs=1)
+            ok(os.path.exists(os.path.join(livedir, "data", "source.csv")),
+               f"C24 staging never deletes through a symlink: {r['rows'][0]}")
+            bl, il = make_bundle(livedir)   # a bundle whose target dirs run through the symlink
+            os.makedirs(os.path.join(sd, "data", "x"), exist_ok=True)
+            open(os.path.join(sd, "data", "x", "f.txt"), "w").write("1")
+            b3, i3 = make_bundle(sd)
+            r = _remote_task(b3, i3["sha256"], sd, "models/v.py::v", [(0, {})], procs=1)
+            ok(not r["rows"][0]["ok"] and "symlink" in r["rows"][0]["error"],
+               f"C24b staging refuses to write through a symlinked directory: {r['rows'][0]}")
+            cdir = os.path.realpath(os.path.join(d, "cap")); os.makedirs(os.path.join(cdir, "models"))
+            open(os.path.join(cdir, "models", "slow.py"), "w").write(open(os.path.join(d, "models", "slow.py")).read())
+            bc_, ic_ = make_bundle(cdir)
+            t0 = time.time()
+            r = _remote_task(bc_, ic_["sha256"], cdir, "models/slow.py::burn", [(k, {"s": 0.4}) for k in range(20)],
+                             procs=1, chunk_allowance_s=1.0)
+            # core_s and the cap-stopped rows show the share is enforced; the wall-clock
+            # limit only catches a hang (it was 8 s and failed on a loaded machine).
+            ok(time.time() - t0 < 30 and any(x.get("error") == CAP_STOP for x in r["rows"]) and r["core_s"] < 3,
+               f"C25 a remote chunk enforces its allowance share: core_s={r['core_s']}")
+            import threading as _th
+            import uuid as _uuid
+            res, cid = {}, "selftest-" + _uuid.uuid4().hex
+            th = _th.Thread(target=lambda: res.update(r=_remote_task(bc_, ic_["sha256"], cdir, "models/slow.py::sleep",
+                                                                     [(0, {"s": 60})], procs=1, call_id=cid)))
+            th.start()
+            # Readiness, not a fixed sleep (a loaded machine registered the chunk after 1.5 s):
+            # wait until the chunk has registered its pid for this call.
+            cdir_ = os.path.join(tempfile.gettempdir(), _CALLS_DIR, cid)
+            end = time.time() + 60
+            while time.time() < end and not any(n.isdigit() for n in (os.listdir(cdir_) if os.path.isdir(cdir_) else [])):
+                time.sleep(0.02)
+            t0 = time.time(); n_stopped = _cancel_call(cid); th.join(15)
+            later = _remote_task(bc_, ic_["sha256"], cdir, "models/slow.py::sleep", [(0, {"s": 60})], procs=1, call_id=cid)
+            ok(n_stopped == 1 and not th.is_alive() and not res["r"]["rows"][0]["ok"]
+               and later["rows"][0]["error"] == "cancelled", f"C26 cancel stops running and queued chunks: {n_stopped}, {res}")
+            open(os.path.join(d, "models", "heavy.py"), "w").write("import time\ntime.sleep(1.0)\ndef f(p):\n    return 1\n")
+            rows, s = map_fn(d, "models/heavy.py::f", [{}] * 2, backend="local", max_workers=1)
+            ok(rows[0]["ok"] and s["task_core_s"] >= 0.9, f"C28 model load time is charged: {s}")
+            rows, s = map_fn(d, "models/heavy.py::f", [{}] * 3, backend="local", max_workers=3)
+            ok(s["task_core_s"] >= 2.7, f"C28b every process's model load is charged, chunk or not: {s}")
+            ev = os.path.realpath(os.path.join(d, "envf")); os.makedirs(os.path.join(ev, "models"))
+            open(os.path.join(ev, "models", "e.py"), "w").write(
+                "import os\ndef f(p):\n    return [os.environ.get(k) for k in ('AZURE_SELFTEST', 'ANTHROPIC_API_KEY', 'OK_VAR')]\n")
+            be_, ie_ = make_bundle(ev)
+            saved = {k: os.environ.get(k) for k in ("AZURE_SELFTEST", "ANTHROPIC_API_KEY", "OK_VAR")}
+            os.environ.update(AZURE_SELFTEST="secret-a", ANTHROPIC_API_KEY="secret-b", OK_VAR="kept")
+            try:
+                r = _remote_task(be_, ie_["sha256"], ev, "models/e.py::f", [(0, {})], procs=1)["rows"][0]
+            finally:
+                for k, v in saved.items():
+                    if v is None:
+                        os.environ.pop(k, None)
+                    else:
+                        os.environ[k] = v
+            ok(r.get("result") == [None, None, "kept"], f"C32 model code on a worker gets no credentials: {r}")
+            dl = os.path.join(d, "dlink"); os.makedirs(os.path.join(dl, "models"))
+            ext = os.path.join(d, "ext_data"); os.makedirs(ext); open(os.path.join(ext, "t.csv"), "w").write("1\n")
+            os.symlink(ext, os.path.join(dl, "data"))
+            os.symlink(os.path.join(dl, "data"), os.path.join(ext, "loop"))      # a cycle
+            bd_, idd = make_bundle(dl)
+            names_ = tarfile.open(fileobj=io.BytesIO(bd_)).getnames()
+            ok(any(n.endswith("dlink/data/t.csv") for n in names_), f"C7c a symlinked data dir is bundled (cycle-safe): {idd}")
+            al = os.path.join(d, "alias"); os.makedirs(os.path.join(al, "data", "real")); os.makedirs(os.path.join(al, "models"))
+            open(os.path.join(al, "data", "real", "value.txt"), "w").write("73\n")
+            os.symlink(os.path.join(al, "data", "real"), os.path.join(al, "data", "a_alias"))
+            na = tarfile.open(fileobj=io.BytesIO(make_bundle(al)[0])).getnames()
+            ok(any(n.endswith("data/real/value.txt") for n in na) and any(n.endswith("data/a_alias/value.txt") for n in na),
+               f"C7d both names of an aliased dir are bundled: {[n for n in na if 'value' in n]}")
+            ld = os.path.realpath(os.path.join(d, "leaf")); os.makedirs(os.path.join(ld, "models")); os.makedirs(os.path.join(ld, "data"))
+            open(os.path.join(ld, "models", "v.py"), "w").write("def v(p):\n    return 1\n")
+            open(os.path.join(ld, "data", "input.csv"), "w").write("bundle\n")
+            bl_, il_ = make_bundle(ld)
+            victim = os.path.join(d, "victim_run"); os.makedirs(os.path.join(victim, "data"))
+            open(os.path.join(victim, "metadata.json"), "w").write("{}")
+            open(os.path.join(victim, "data", "input.csv"), "w").write("live\n")
+            os.remove(os.path.join(ld, "data", "input.csv"))
+            os.symlink(os.path.join(victim, "data", "input.csv"), os.path.join(ld, "data", "input.csv"))
+            _remote_task(bl_, il_["sha256"], ld, "models/v.py::v", [(0, {})], procs=1)
+            ok(open(os.path.join(victim, "data", "input.csv")).read() == "live\n"
+               and not os.path.islink(os.path.join(ld, "data", "input.csv")),
+               "C30 staging never writes through a symlinked file")
         open(os.path.join(d, "models", "envq.py"), "w").write(
             "import os\ndef f(p):\n    return [os.environ.get('MA_COMPUTE_GATE'), os.environ.get('MA_COMPUTE_CANCEL')]\n")
         ed = os.path.join(d, "envgate"); os.makedirs(ed)

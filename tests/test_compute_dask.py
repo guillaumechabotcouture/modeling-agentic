@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import concurrent.futures as cf
+import contextlib
 import io
 import json
 import os
+import shutil
 import subprocess as _sp
 import sys
 import tarfile
@@ -30,6 +32,35 @@ from compute import (
     _stop_orphans, _worker_side, code_fingerprint, make_bundle, map_fn, register_compute_tags,
     _cancel_remote, _gone_workers, SCHED_ATTEMPTS,
 )
+
+
+def _self_test_iso_repo(root: str, *, with_costs: bool = False) -> str:
+    """Minimal isolated REPO tree inside a temp dir so self-test bundle/worker calls never touch live REPO."""
+    repo = os.path.realpath(root)
+    os.makedirs(os.path.join(repo, "scripts"), exist_ok=True)
+    shutil.copy2(os.path.join(SCRIPTS_DIR, "compute.py"), os.path.join(repo, "scripts", "compute.py"))
+    shutil.copy2(os.path.join(SCRIPTS_DIR, "compute_worker.py"), os.path.join(repo, "scripts", "compute_worker.py"))
+    shutil.copytree(os.path.join(SCRIPTS_DIR, "lib"), os.path.join(repo, "scripts", "lib"),
+                    ignore=shutil.ignore_patterns("__pycache__"))
+    os.makedirs(os.path.join(repo, "cloud"), exist_ok=True)
+    shutil.copy2(os.path.join(REPO, "cloud", "worker_side.py"), os.path.join(repo, "cloud", "worker_side.py"))
+    if with_costs:
+        os.makedirs(os.path.join(repo, "toolkit", "alloc"), exist_ok=True)
+        open(os.path.join(repo, "toolkit", "alloc", "costs.py"), "w").close()
+    return repo
+
+
+@contextlib.contextmanager
+def _self_test_patched_repo(iso_repo: str):
+    """Patch C.REPO/CW.REPO to `iso_repo` while preventing `sys.modules['ma_compute_worker_side']` from leaking."""
+    prev = sys.modules.pop("ma_compute_worker_side", None)
+    try:
+        with mock.patch.object(C, "REPO", iso_repo), mock.patch.object(CW, "REPO", iso_repo):
+            yield
+    finally:
+        sys.modules.pop("ma_compute_worker_side", None)
+        if prev is not None:
+            sys.modules["ma_compute_worker_side"] = prev
 
 
 def _self_test_durable(ok) -> None:
@@ -580,8 +611,9 @@ def _self_test_infra(ok, lc, cc, tmpb) -> None:
             "MA_COMPUTE_EXCLUDE_WORKERS", "MA_COMPUTE_DISPATCH_S", "MA_COMPUTE_NO_WORKER_WAIT_S",
             "MA_COMPUTE_INFRA_BACKOFF_S")
     saved = {k: os.environ.get(k) for k in keys}
-    with tempfile.TemporaryDirectory() as rd:
+    with tempfile.TemporaryDirectory() as rd, tempfile.TemporaryDirectory() as _iso_td:
         rd = os.path.realpath(rd)
+        iso_repo = _self_test_iso_repo(_iso_td)
         os.makedirs(os.path.join(rd, "models"))
         open(os.path.join(rd, "metadata.json"), "w").write("{}")      # live run dir: no bundle staging
         open(os.path.join(rd, "models", "ir.py"), "w").write(
@@ -596,7 +628,7 @@ def _self_test_infra(ok, lc, cc, tmpb) -> None:
             "        while not os.path.exists(os.path.join(d, p['wait'])):\n"
             "            time.sleep(0.02)\n"
             "    return p['k']\n")
-        if True:
+        with _self_test_patched_repo(iso_repo):
             try:
                 cc.register_plugin(ComputeTagPlugin("compute"))
                 os.environ.update(MA_COMPUTE_SCHEDULER=lc.scheduler_address, MA_COMPUTE_RESOURCE="compute",
@@ -730,7 +762,8 @@ def _self_test_infra(ok, lc, cc, tmpb) -> None:
 
 
 def _self_test_dask_core(ok, lc) -> None:
-    with tempfile.TemporaryDirectory() as d:
+    with tempfile.TemporaryDirectory() as d, tempfile.TemporaryDirectory() as _iso_td:
+        iso_repo = _self_test_iso_repo(_iso_td)
         os.makedirs(os.path.join(d, "models"))
         os.makedirs(os.path.join(d, "data"))
         open(os.path.join(d, "data", "scale.txt"), "w").write("3\n")
@@ -742,58 +775,59 @@ def _self_test_dask_core(ok, lc) -> None:
         inputs = [{"x": k} for k in range(40)] + [{"x": 0, "boom": True}]
         os.environ["MA_COMPUTE_SCHEDULER"] = lc.scheduler_address
         try:
-            rows, s = map_fn(d, "models/fn.py::f", inputs)
-            ok(s["backend"] == "dask" and rows[7]["result"] == {"y": 21.0} and s["n_failed"] == 1
-               and [r["i"] for r in rows] == list(range(41)), f"C8 dask backend: {s}")
-            w0 = list(lc.scheduler_info["workers"])[0]
-            os.environ["MA_COMPUTE_EXCLUDE_WORKERS"] = w0
-            rows, s = map_fn(d, "models/fn.py::f", inputs[:8])
-            used = {r.get("worker") for r in rows}
-            ok(s["workers"] == 1 and all(r["ok"] for r in rows) and w0 not in used and None not in used,
-               f"C9 no task ran on the excluded run worker: {used}")
-            os.environ["MA_COMPUTE_PROCS_PER_WORKER"] = "1"
-            rows, s = map_fn(d, "models/slow.py::sleep", [{"s": 1.5}] * 4, max_core_hours=2.0 / 3600)
-            # Not "exactly 1 done": model load time is charged too (Phase 29), so
-            # timing varies; the property is that the batch stops at the cap.
-            ok(s["n_ok"] < 4 and s["task_core_s"] <= 2.6 and s["stopped"] == CAP_STOP,
-               f"C27 later chunks get only what is left of the allowance: {s}")
-            # C35 (Phase 30): a timed-out batch is charged what actually ran, not the pool.
-            os.environ["MA_COMPUTE_PROCS_PER_WORKER"] = "1"
-            os.environ["MA_COMPUTE_EXCLUDE_WORKERS"] = w0
-            t0c = time.time()
-            rows3, s3 = map_fn(d, "models/slow.py::sleep", [{"s": 1.0}] * 40, timeout_s=2.5, ledger=False)
-            wall3 = time.time() - t0c
-            ok(s3["stopped"] == "timed out" and s3["estimated_core_s"] == 0
-               and s3["task_core_s"] <= 1 * wall3 + 1.0 and sum(r["ok"] for r in rows3) < 40,
-               f"C35 stopped chunks report their real use, queued ones nothing (no whole-pool estimate): {s3} wall {wall3:.1f}")
-            os.environ.pop("MA_COMPUTE_EXCLUDE_WORKERS", None)
-            # C34 (Phase 30): autoscaling pool. Untagged run worker; a worker
-            # added mid-batch must get work through the resource tag.
-            os.environ.pop("MA_COMPUTE_EXCLUDE_WORKERS", None)
-            from distributed import Client as _C2
-            import threading as _th2
-            with _C2(lc.scheduler_address) as _cc:
-                _cc.register_plugin(ComputeTagPlugin("compute", exclude=[w0]))
-            os.environ.update(MA_COMPUTE_RESOURCE="compute", MA_COMPUTE_TARGET_WORKERS="3",
-                              MA_COMPUTE_PROCS_PER_WORKER="1")
-            open(os.path.join(d, "models", "slowf.py"), "w").write(
-                "import time\ndef f(p):\n    time.sleep(0.2)\n    return p['x']\n")
-            box = {}
-            th = _th2.Thread(target=lambda: box.update(r=map_fn(d, "models/slowf.py::f",
-                                                                 [{"x": k} for k in range(30)], ledger=False)))
-            th.start()
-            time.sleep(0.5)
-            lc.scale(3)                       # a new worker joins mid-batch
-            th.join(120)
-            rows2, s2 = box.get("r", ([], {}))
-            used2 = {r.get("worker") for r in rows2}
-            new_ws = set(lc.scheduler_info["workers"]) - {w0} - set(list(lc.scheduler_info["workers"])[:2])
-            ok(len(rows2) == 30 and all(r["ok"] for r in rows2) and w0 not in used2,
-               f"C34 tagged pool: every task done, none on the untagged run worker: {used2} {s2}")
-            ok(len(used2) >= 2 and s2.get("pool_target") == 3,
-               f"C34 a worker that joined mid-batch got work (pool target 3): {used2} {s2.get('pool_target')}")
-            for k in ("MA_COMPUTE_RESOURCE", "MA_COMPUTE_TARGET_WORKERS"):
-                os.environ.pop(k, None)
+            with _self_test_patched_repo(iso_repo):
+                rows, s = map_fn(d, "models/fn.py::f", inputs)
+                ok(s["backend"] == "dask" and rows[7]["result"] == {"y": 21.0} and s["n_failed"] == 1
+                   and [r["i"] for r in rows] == list(range(41)), f"C8 dask backend: {s}")
+                w0 = list(lc.scheduler_info["workers"])[0]
+                os.environ["MA_COMPUTE_EXCLUDE_WORKERS"] = w0
+                rows, s = map_fn(d, "models/fn.py::f", inputs[:8])
+                used = {r.get("worker") for r in rows}
+                ok(s["workers"] == 1 and all(r["ok"] for r in rows) and w0 not in used and None not in used,
+                   f"C9 no task ran on the excluded run worker: {used}")
+                os.environ["MA_COMPUTE_PROCS_PER_WORKER"] = "1"
+                rows, s = map_fn(d, "models/slow.py::sleep", [{"s": 1.5}] * 4, max_core_hours=2.0 / 3600)
+                # Not "exactly 1 done": model load time is charged too (Phase 29), so
+                # timing varies; the property is that the batch stops at the cap.
+                ok(s["n_ok"] < 4 and s["task_core_s"] <= 2.6 and s["stopped"] == CAP_STOP,
+                   f"C27 later chunks get only what is left of the allowance: {s}")
+                # C35 (Phase 30): a timed-out batch is charged what actually ran, not the pool.
+                os.environ["MA_COMPUTE_PROCS_PER_WORKER"] = "1"
+                os.environ["MA_COMPUTE_EXCLUDE_WORKERS"] = w0
+                t0c = time.time()
+                rows3, s3 = map_fn(d, "models/slow.py::sleep", [{"s": 1.0}] * 40, timeout_s=2.5, ledger=False)
+                wall3 = time.time() - t0c
+                ok(s3["stopped"] == "timed out" and s3["estimated_core_s"] == 0
+                   and s3["task_core_s"] <= 1 * wall3 + 1.0 and sum(r["ok"] for r in rows3) < 40,
+                   f"C35 stopped chunks report their real use, queued ones nothing (no whole-pool estimate): {s3} wall {wall3:.1f}")
+                os.environ.pop("MA_COMPUTE_EXCLUDE_WORKERS", None)
+                # C34 (Phase 30): autoscaling pool. Untagged run worker; a worker
+                # added mid-batch must get work through the resource tag.
+                os.environ.pop("MA_COMPUTE_EXCLUDE_WORKERS", None)
+                from distributed import Client as _C2
+                import threading as _th2
+                with _C2(lc.scheduler_address) as _cc:
+                    _cc.register_plugin(ComputeTagPlugin("compute", exclude=[w0]))
+                os.environ.update(MA_COMPUTE_RESOURCE="compute", MA_COMPUTE_TARGET_WORKERS="3",
+                                  MA_COMPUTE_PROCS_PER_WORKER="1")
+                open(os.path.join(d, "models", "slowf.py"), "w").write(
+                    "import time\ndef f(p):\n    time.sleep(0.2)\n    return p['x']\n")
+                box = {}
+                th = _th2.Thread(target=lambda: box.update(r=map_fn(d, "models/slowf.py::f",
+                                                                     [{"x": k} for k in range(30)], ledger=False)))
+                th.start()
+                time.sleep(0.5)
+                lc.scale(3)                       # a new worker joins mid-batch
+                th.join(120)
+                rows2, s2 = box.get("r", ([], {}))
+                used2 = {r.get("worker") for r in rows2}
+                new_ws = set(lc.scheduler_info["workers"]) - {w0} - set(list(lc.scheduler_info["workers"])[:2])
+                ok(len(rows2) == 30 and all(r["ok"] for r in rows2) and w0 not in used2,
+                   f"C34 tagged pool: every task done, none on the untagged run worker: {used2} {s2}")
+                ok(len(used2) >= 2 and s2.get("pool_target") == 3,
+                   f"C34 a worker that joined mid-batch got work (pool target 3): {used2} {s2.get('pool_target')}")
+                for k in ("MA_COMPUTE_RESOURCE", "MA_COMPUTE_TARGET_WORKERS"):
+                    os.environ.pop(k, None)
         finally:
             os.environ.pop("MA_COMPUTE_SCHEDULER", None)
             os.environ.pop("MA_COMPUTE_EXCLUDE_WORKERS", None)
@@ -822,7 +856,8 @@ def _self_test_p42_dask(ok, lc) -> None:
             time.sleep(0.01)
         return False, last
 
-    with tempfile.TemporaryDirectory() as d:
+    with tempfile.TemporaryDirectory() as d, tempfile.TemporaryDirectory() as _iso_td:
+        iso_scripts = os.path.join(_self_test_iso_repo(_iso_td), "scripts")
         os.makedirs(os.path.join(d, "models"))
         open(os.path.join(d, "models", "slow.py"), "w").write(
             "import time\ndef sleep(p):\n    time.sleep(p['s']); return {'k': p['k']}\n")
@@ -831,7 +866,7 @@ def _self_test_p42_dask(ok, lc) -> None:
                 "from distributed import Client; c = Client(os.environ['MA_COMPUTE_SCHEDULER']); "
                 "compute.register_compute_tags(c, exclude=[]); c.close(); "
                 "compute.map_fn(%r, 'models/slow.py::sleep', [{'s': 1.0, 'k': k} for k in range(80)], "
-                "max_core_hours=1.0, purpose='P42-8')") % (SCRIPTS_DIR, d)
+                "max_core_hours=1.0, purpose='P42-8')") % (iso_scripts, d)
         envd = dict(env, MA_COMPUTE_SCHEDULER=lc.scheduler_address, MA_COMPUTE_RESOURCE="compute",
                     MA_COMPUTE_TARGET_WORKERS="6", MA_COMPUTE_PROCS_PER_WORKER="1", MA_COMPUTE_SETTLE_S="30")
         t0 = time.time()
@@ -919,8 +954,9 @@ def _self_test_p45d(ok, lc, cc, tmpb) -> None:
             "MA_COMPUTE_EXCLUDE_WORKERS", "MA_COMPUTE_DISPATCH_S")
     saved = {k: os.environ.get(k) for k in keys}
     import threading
-    with tempfile.TemporaryDirectory() as rd:
+    with tempfile.TemporaryDirectory() as rd, tempfile.TemporaryDirectory() as _iso_td:
         rd = os.path.realpath(rd)
+        iso_repo = _self_test_iso_repo(_iso_td)
         os.makedirs(os.path.join(rd, "models"))
         # A live run directory (metadata.json): chunks run against its files, so
         # the local "VMs" never stage one bundle into one shared path at once.
@@ -938,7 +974,7 @@ def _self_test_p45d(ok, lc, cc, tmpb) -> None:
             "    open(os.path.join(d, 'span_%s_%d' % (p['tag'], p['k'])), 'w').write('%f %f' % (t0, time.time()))\n"
             "    return p['k']\n")
         w_run = list(lc.scheduler_info["workers"])[0]
-        if True:
+        with _self_test_patched_repo(iso_repo):
             try:
                 hog = cc.submit(time.sleep, 600, key=f"hog-{os.urandom(8).hex()}", workers=[w_run], pure=False)
                 cc.register_plugin(ComputeTagPlugin("compute", exclude=[w_run]))
@@ -1274,57 +1310,59 @@ def _self_test_isolated_dask(ok) -> None:
             from distributed import Client as _C
             with _C(os.environ["MA_COMPUTE_SCHEDULER"]) as cc:
                 cc.wait_for_workers(1, timeout=60)
-            # Imported as a module, as propagate_uncertainty.py does (run as
-            # __main__, dask would ship the functions by value and hide this).
-            code = ("import json, sys; sys.path.insert(0, %r); import compute; "
-                    "rows, s = compute.map_fn(%r, 'models/fn.py::f', [{'x': 0}, {'x': 1}, {'x': 2}], ledger=False); "
-                    "print(json.dumps([r.get('result') or r.get('error') for r in rows]))") % (SCRIPTS_DIR, d)
-            code_tag = ("import json, os, sys; sys.path.insert(0, %r); import compute; "
-                        "from distributed import Client; "
-                        "c = Client(os.environ['MA_COMPUTE_SCHEDULER']); compute.register_compute_tags(c, exclude=[]); "
-                        "os.environ.update(MA_COMPUTE_RESOURCE='compute', MA_COMPUTE_TARGET_WORKERS='1'); "
-                        "rows, s = compute.map_fn(%r, 'models/fn.py::f', [{'x': 0}, {'x': 1}], ledger=False); "
-                        "print(json.dumps([r.get('result') or r.get('error') for r in rows]))") % (SCRIPTS_DIR, d)
-            # C33b first, on a worker that has never received this module
-            r2 = _sp.run([sys.executable, "-c", code_tag], capture_output=True, text=True, timeout=300,
-                         env=dict(os.environ, PYTHONPATH=""))
-            got2 = r2.stdout.strip().splitlines()[-1] if r2.stdout.strip() else r2.stderr[-400:]
-            ok(got2 == json.dumps([{"y": 0.0}, {"y": 3.0}]),
-               f"C33b the compute-tag plugin works on a cluster that cannot import this module: {got2}")
-            r = _sp.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=300,
-                        env=dict(os.environ, PYTHONPATH=""))
-            got = r.stdout.strip().splitlines()[-1] if r.stdout.strip() else r.stderr[-500:]
-            ok(got == json.dumps([{"y": 0.0}, {"y": 3.0}, {"y": 6.0}]),
-               f"C33 runs on a cluster that cannot import this module: {got}")
-            # P35-D: on the dask path a pool broken inside a chunk heals there, and
-            # a repeated model error stops the whole call.
-            open(os.path.join(d, "models", "p35d.py"), "w").write(
-                "import os, time\n"
-                "def f(p):\n"
-                "    if p.get('crash') and os.environ.get('MA_COMPUTE_SELFTEST_ONCE') is None:\n"
-                "        flag = os.path.join(p['dir'], str(p['x']))\n"
-                "        if not os.path.exists(flag):\n"
-                "            open(flag, 'w').close(); os._exit(9)\n"
-                "    time.sleep(0.2)\n"
-                "    return {'x': p['x']}\n"
-                "def raises(p):\n    raise ValueError('diverged')\n")
-            flags = tempfile.mkdtemp(prefix="ma_p35d_")
-            code_d = ("import json, sys; sys.path.insert(0, %r); import compute; "
-                      "ins = [{'x': k, 'dir': %r, 'crash': k in (2, 9)} for k in range(12)]; "
-                      "rows, s = compute.map_fn(%r, 'models/p35d.py::f', ins, ledger=False, max_workers=1); "
-                      "r2, s2 = compute.map_fn(%r, 'models/p35d.py::raises', [{}] * 40, ledger=False, max_workers=1); "
-                      "print(json.dumps([s['n_failed'], [r['result']['x'] for r in rows if r['ok']], "
-                      "s2['stopped'] or '', s2['failed_by_kind']]))") % (SCRIPTS_DIR, flags, d, d)
-            r3 = _sp.run([sys.executable, "-c", code_d], capture_output=True, text=True, timeout=300,
-                         env=dict(os.environ, PYTHONPATH="", MA_COMPUTE_PROCS_PER_WORKER="2"))
-            try:
-                nf, xs, stop2, kinds2 = json.loads(r3.stdout.strip().splitlines()[-1])
-            except (ValueError, IndexError):
-                nf, xs, stop2, kinds2 = None, None, "", {}
-            ok(nf == 0 and xs == list(range(12)),
-               f"P35-D1 a process death inside a dask chunk is healed in the chunk: {r3.stdout[-300:]} {r3.stderr[-300:]}")
-            ok("same model error" in stop2 and kinds2.get("stopped", 0) > 0,
-               f"P35-D2 a repeated model error stops a dask call: {stop2} {kinds2}")
+            with tempfile.TemporaryDirectory() as _iso_td:
+                iso_scripts = os.path.join(_self_test_iso_repo(_iso_td), "scripts")
+                # Imported as a module, as propagate_uncertainty.py does (run as
+                # __main__, dask would ship the functions by value and hide this).
+                code = ("import json, sys; sys.path.insert(0, %r); import compute; "
+                        "rows, s = compute.map_fn(%r, 'models/fn.py::f', [{'x': 0}, {'x': 1}, {'x': 2}], ledger=False); "
+                        "print(json.dumps([r.get('result') or r.get('error') for r in rows]))") % (iso_scripts, d)
+                code_tag = ("import json, os, sys; sys.path.insert(0, %r); import compute; "
+                            "from distributed import Client; "
+                            "c = Client(os.environ['MA_COMPUTE_SCHEDULER']); compute.register_compute_tags(c, exclude=[]); "
+                            "os.environ.update(MA_COMPUTE_RESOURCE='compute', MA_COMPUTE_TARGET_WORKERS='1'); "
+                            "rows, s = compute.map_fn(%r, 'models/fn.py::f', [{'x': 0}, {'x': 1}], ledger=False); "
+                            "print(json.dumps([r.get('result') or r.get('error') for r in rows]))") % (iso_scripts, d)
+                # C33b first, on a worker that has never received this module
+                r2 = _sp.run([sys.executable, "-c", code_tag], capture_output=True, text=True, timeout=300,
+                             env=dict(os.environ, PYTHONPATH=""))
+                got2 = r2.stdout.strip().splitlines()[-1] if r2.stdout.strip() else r2.stderr[-400:]
+                ok(got2 == json.dumps([{"y": 0.0}, {"y": 3.0}]),
+                   f"C33b the compute-tag plugin works on a cluster that cannot import this module: {got2}")
+                r = _sp.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=300,
+                            env=dict(os.environ, PYTHONPATH=""))
+                got = r.stdout.strip().splitlines()[-1] if r.stdout.strip() else r.stderr[-500:]
+                ok(got == json.dumps([{"y": 0.0}, {"y": 3.0}, {"y": 6.0}]),
+                   f"C33 runs on a cluster that cannot import this module: {got}")
+                # P35-D: on the dask path a pool broken inside a chunk heals there, and
+                # a repeated model error stops the whole call.
+                open(os.path.join(d, "models", "p35d.py"), "w").write(
+                    "import os, time\n"
+                    "def f(p):\n"
+                    "    if p.get('crash') and os.environ.get('MA_COMPUTE_SELFTEST_ONCE') is None:\n"
+                    "        flag = os.path.join(p['dir'], str(p['x']))\n"
+                    "        if not os.path.exists(flag):\n"
+                    "            open(flag, 'w').close(); os._exit(9)\n"
+                    "    time.sleep(0.2)\n"
+                    "    return {'x': p['x']}\n"
+                    "def raises(p):\n    raise ValueError('diverged')\n")
+                flags = tempfile.mkdtemp(prefix="ma_p35d_")
+                code_d = ("import json, sys; sys.path.insert(0, %r); import compute; "
+                          "ins = [{'x': k, 'dir': %r, 'crash': k in (2, 9)} for k in range(12)]; "
+                          "rows, s = compute.map_fn(%r, 'models/p35d.py::f', ins, ledger=False, max_workers=1); "
+                          "r2, s2 = compute.map_fn(%r, 'models/p35d.py::raises', [{}] * 40, ledger=False, max_workers=1); "
+                          "print(json.dumps([s['n_failed'], [r['result']['x'] for r in rows if r['ok']], "
+                          "s2['stopped'] or '', s2['failed_by_kind']]))") % (iso_scripts, flags, d, d)
+                r3 = _sp.run([sys.executable, "-c", code_d], capture_output=True, text=True, timeout=300,
+                             env=dict(os.environ, PYTHONPATH="", MA_COMPUTE_PROCS_PER_WORKER="2"))
+                try:
+                    nf, xs, stop2, kinds2 = json.loads(r3.stdout.strip().splitlines()[-1])
+                except (ValueError, IndexError):
+                    nf, xs, stop2, kinds2 = None, None, "", {}
+                ok(nf == 0 and xs == list(range(12)),
+                   f"P35-D1 a process death inside a dask chunk is healed in the chunk: {r3.stdout[-300:]} {r3.stderr[-300:]}")
+                ok("same model error" in stop2 and kinds2.get("stopped", 0) > 0,
+                   f"P35-D2 a repeated model error stops a dask call: {stop2} {kinds2}")
 
         except Exception:
             print(open(os.path.join(iso, "sched.err")).read()[-3000:])

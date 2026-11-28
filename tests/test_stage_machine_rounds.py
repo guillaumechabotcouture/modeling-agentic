@@ -2246,6 +2246,71 @@ def _self_test() -> int:
     fails = []
     toolkit = AB.backend("toolkit")
 
+    class _FastToyBackend:
+        """Delegates spec/sign-off/choice/validate/headline to `toolkit`, using a fast deterministic
+        toy `analyze` step so `signoff='none'` state-machine self-tests exercise orchestration without
+        hitting `toolkit/analysis/run.py`'s production sign-off refusal."""
+        settings_paths = getattr(toolkit, "settings_paths", AB.SETTINGS_PATHS)
+
+        def __getattr__(self, name):
+            return getattr(toolkit, name)
+
+        def pipeline_steps(self, spec_path, run_dir):
+            deps = ["decision_spec.yaml", "units.csv"]
+            for rel in ("analysis_settings.yaml", "engine_choice.json"):
+                if os.path.exists(os.path.join(run_dir, rel)):
+                    deps.append(rel)
+            code = (
+                "import csv, json, os, yaml\n"
+                "os.makedirs('analysis', exist_ok=True)\n"
+                "spec = yaml.safe_load(open('decision_spec.yaml', encoding='utf-8')) or {}\n"
+                "sett = (yaml.safe_load(open('analysis_settings.yaml', encoding='utf-8')) or {}) "
+                "if os.path.exists('analysis_settings.yaml') else {}\n"
+                "draws = int((sett.get('uncertainty') or {}).get('draws') "
+                "or (spec.get('uncertainty') or {}).get('draws') or 24)\n"
+                "outcome = (spec.get('objective') or {}).get('outcome') or 'dalys'\n"
+                "ucsv = (spec.get('decision_units') or {}).get('csv') or 'units.csv'\n"
+                "rows = list(csv.DictReader(open(ucsv, encoding='utf-8')))\n"
+                "plan = {str(r['id']): ('a' if i % 2 == 0 else 'b') for i, r in enumerate(rows)}\n"
+                "pt = {'schema': 'analysis.point/1', 'data': {\n"
+                "    'plan': plan, 'averted': {outcome: 1000.0 + draws}, 'cost_allocated': 5000.0,\n"
+                "    'mix': {'a': sum(v == 'a' for v in plan.values()), 'b': sum(v == 'b' for v in plan.values())},\n"
+                "    'solver': {'status': 'optimal'}}}\n"
+                "yaml.safe_dump(pt, open('analysis/point.yaml', 'w', encoding='utf-8'), sort_keys=False)\n"
+                "uq = {'schema': 'analysis.uncertainty/1', 'data': {\n"
+                "    'draws': draws, 'covers': ['engine_parameters'], 'excludes': [], 'label': '95% CI',\n"
+                "    'fixed_plan': {outcome: {'ci_low': 800.0 + draws, 'median': 1000.0 + draws, 'ci_high': 1200.0 + draws}}}}\n"
+                "yaml.safe_dump(uq, open('analysis/uncertainty.yaml', 'w', encoding='utf-8'), sort_keys=False)\n"
+                "with open('analysis/allocation.csv', 'w', encoding='utf-8', newline='') as f:\n"
+                "    w = csv.writer(f)\n"
+                "    w.writerow(['id', 'package', f'{outcome}_averted'])\n"
+                "    for u, pkg in plan.items():\n"
+                "        w.writerow([u, pkg, 100.0 + draws])\n"
+                "with open('allocation_optimized.csv', 'w', encoding='utf-8', newline='') as f:\n"
+                "    w = csv.writer(f)\n"
+                "    w.writerow(['unit', 'package', f'{outcome}_averted'])\n"
+                "    for u, pkg in plan.items():\n"
+                "        w.writerow([u, pkg, 100.0 + draws])\n"
+                "open('results.md', 'w', encoding='utf-8').write(f'# Toy analysis\\n\\nDraws: {draws}\\n')\n"
+                "man = {'status': 'complete', 'complete': True, "
+                "'spec_signed': os.path.exists('decision_spec.signoff.json')}\n"
+                "open('analysis/manifest.json', 'w', encoding='utf-8').write(json.dumps(man, sort_keys=True))\n"
+            )
+            return [{
+                "id": "analyze",
+                "run": f"{shlex.quote(sys.executable)} -c {shlex.quote(code)}",
+                "inputs": deps,
+                "outputs": ["analysis/manifest.json", "analysis/point.yaml", "analysis/uncertainty.yaml",
+                            "analysis/allocation.csv", "allocation_optimized.csv", "results.md"],
+            }]
+
+        def gate_findings(self, rd):
+            return [] if os.path.exists(os.path.join(rd, "analysis", "manifest.json")) else [
+                {"kind": "analysis_contract_missing", "severity": "HIGH", "stage": "ANALYZE",
+                 "claim": "missing manifest", "key": "", "scope_declarable": False}]
+
+    fast_toy = _FastToyBackend()
+
     def ok(c, m):
         print(("PASS " if c else "FAIL ") + m)
         if not c:
@@ -2270,19 +2335,19 @@ def _self_test() -> int:
             return d, StubTasks(script), st
 
         try:
-            _self_test_resume(ok, td, toolkit, new_run)
+            _self_test_resume(ok, td, fast_toy, new_run)
         except Exception as e:  # noqa: BLE001
             traceback.print_exc()
             ok(False, f"T58-T60 analysis timeout and resume: {type(e).__name__}: {e}")
-        _self_test_auto1a(ok, td, toolkit, new_run)
-        _self_test_writeup_rounds(ok, td, toolkit, new_run)
-        _self_test_claim_refs(ok, td, toolkit, new_run)
+        _self_test_auto1a(ok, td, fast_toy, new_run)
+        _self_test_writeup_rounds(ok, td, fast_toy, new_run)
+        _self_test_claim_refs(ok, td, fast_toy, new_run)
         try:
-            _self_test_hb2_spec(ok, td, toolkit, new_run)
+            _self_test_hb2_spec(ok, td, fast_toy, new_run)
         except Exception as e:  # noqa: BLE001
             ok(False, f"HS: {type(e).__name__}: {e}")
         try:
-            _self_test_spec_p1s(ok, td, toolkit, new_run)
+            _self_test_spec_p1s(ok, td, fast_toy, new_run)
         except Exception as e:  # noqa: BLE001
             ok(False, f"SP: {type(e).__name__}: {e}")
         try:
