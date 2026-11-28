@@ -839,7 +839,7 @@ def _built_engine_bundle_extras(run_dir: str) -> list[str]:
 
 def make_bundle(run_dir: str, max_file_mb: float = DEFAULT_MAX_FILE_MB) -> tuple[bytes, dict]:
     """tar.gz of the run's models/ and data/, the repo's scripts/ and toolkit/, and the declared data set
-    (FP_DATA_SET: repo data/, .claude/orchestration/, and the non-Python files of scripts/ and toolkit/), with
+    (FP_DATA_SET: repo data/ excluding eval/trial dirs, and non-Python files of toolkit/), with
     ABSOLUTE member paths so workers recreate the same layout. The data set is exactly the files the reuse key's
     data_set part hashes (_data_set_files), shipped whatever their size: a worker that reads one computes with
     the launcher's copy, the one the key names (BD1-BD4). Logs and the records this module keeps beside a batch
@@ -898,7 +898,7 @@ def make_bundle(run_dir: str, max_file_mb: float = DEFAULT_MAX_FILE_MB) -> tuple
                 continue
             added.add(p)
             n += 1
-        for p in sorted(data_set - added):     # repo data/ and .claude/orchestration/ (scripts/, toolkit/ are above)
+        for p in sorted(data_set - added):     # repo data/ (toolkit/ is above)
             try:
                 t.add(p, arcname=p.lstrip("/"))
             except OSError:                    # a dangling link: the key hashes it as unreadable; no worker has it
@@ -2881,7 +2881,8 @@ def code_fingerprint(run_dir: str, fn_spec: str, exclude=(), confined: bool = Fa
 FP_KEY_VERSION = 3
 # W0-A: the repo data a batch can read by path, hashed whole into every key (the one list). "all": every file;
 # "data": every file but code and docs (.py, .pyc, .md); the Python a job imports is its observed closure.
-FP_DATA_SET = {".claude/orchestration": "all", "data": "all", "scripts": "data", "toolkit": "data"}
+FP_DATA_SET = {"data": "all", "toolkit": "data"}
+_FP_DATA_EXCLUDES = ("data/evals", "data/world_model_trials")
 _FP_CODE_EXT = (".py", ".pyc", ".md")
 
 
@@ -2897,23 +2898,26 @@ def _files_digest(spec: dict, skip: str | None = None) -> str:
 
 
 def _data_set_files(spec: dict, skip: str | None = None) -> list[str]:
-    """The repo-relative paths of the files `spec` names ({dir: "all" | "data"}), sorted; __pycache__, .git and any
-    `_truth*` component (eval_paths' hidden-material rule, also where a link leads) left out, linked directories
-    followed (a loop stops), the launch stamp (_FP_REPO_SKIP) and the directory `skip` (the run dir, when it lies
-    under one of them) skipped. The key hashes these files and make_bundle ships them."""
+    """The repo-relative paths of the files `spec` names ({dir: "all" | "data"}), sorted; __pycache__, .git,
+    _FP_DATA_EXCLUDES, and any `_truth*` component (eval_paths' hidden-material rule, also where a link leads)
+    left out, linked directories followed (a loop stops), the launch stamp (_FP_REPO_SKIP) and the directory
+    `skip` (the run dir, when it lies under one of them) skipped. The key hashes these files and make_bundle ships them."""
     got = []
     for root, kind in sorted(spec.items()):
         top = os.path.join(REPO, root)
         anc = {top: {os.path.realpath(top)}}
         for dp, dirs, fns in os.walk(top, followlinks=True):
-            dirs[:] = sorted(d for d in dirs if d not in ("__pycache__", ".git") and not _hidden_path(os.path.join(dp, d))
-                             and os.path.realpath(os.path.join(dp, d)) not in anc[dp]
-                             and os.path.realpath(os.path.join(dp, d)) != (skip and os.path.realpath(skip)))
+            dirs[:] = sorted(
+                d for d in dirs if d not in ("__pycache__", ".git") and not _hidden_path(os.path.join(dp, d))
+                and os.path.relpath(os.path.join(dp, d), REPO).replace(os.sep, "/") not in _FP_DATA_EXCLUDES
+                and os.path.realpath(os.path.join(dp, d)) not in anc[dp]
+                and os.path.realpath(os.path.join(dp, d)) != (skip and os.path.realpath(skip)))
             for d in dirs:
                 anc[os.path.join(dp, d)] = anc[dp] | {os.path.realpath(os.path.join(dp, d))}
             for f in fns:
                 rel = os.path.relpath(os.path.join(dp, f), REPO).replace(os.sep, "/")
                 if rel in _FP_REPO_SKIP or (kind == "data" and f.endswith(_FP_CODE_EXT)) \
+                        or any(rel == ex or rel.startswith(ex + "/") for ex in _FP_DATA_EXCLUDES) \
                         or _hidden_path(os.path.join(dp, f)):
                     continue
                 got.append(rel)
@@ -4814,7 +4818,7 @@ def _self_test_w0a(ok) -> None:
         w("toolkit/eng/card.yaml", "version: 1\n")
         w("toolkit/analysis/__init__.py", "")
         w("toolkit/analysis/figures.py", "def draw():\n    return 0\n")
-        w(".claude/orchestration/priors.yaml", "a: 1\n")
+        w("data/priors.yaml", "a: 1\n")
         w("job.py", "from toolkit.eng import m\n\n\ndef f(p):\n    return {'y': m.g(p)}\n")
         w("kid.py", "import subprocess, sys\n\n\ndef f(p):\n"
                     "    subprocess.run([sys.executable, '-c', 'pass'], check=True)\n    return {'y': p['x']}\n")
@@ -4859,7 +4863,7 @@ def _self_test_w0a(ok) -> None:
             s5 = go(inputs=ins[:2] + [{"x": 9}], extra=e2)
             ok(s5.get("computed") == 1 and s5.get("reused") == 2,
                f"FP_INPUT_EDIT a changed input recomputes that row only ({s5.get('computed')} computed)")
-            w(".claude/orchestration/priors.yaml", "a: 2\n")
+            w("data/priors.yaml", "a: 2\n")
             s6 = go(inputs=ins[:2] + [{"x": 9}], extra=e2)
             ok(s6.get("computed") == 3 and any("data_set" in x for x in s6.get("reuse_refused") or []),
                f"FP_DATA_SET_EDIT a changed declared data file recomputes ({s6.get('computed')}, "
@@ -4950,7 +4954,9 @@ def _self_test_bundle_data_set(ok) -> None:
             f = os.path.join(root or repo, rel)
             os.makedirs(os.path.dirname(f), exist_ok=True)
             open(f, "w").write(txt)
-        for rel in ("data/pop.csv", "data/sub/costs.yaml", "data/_truth/key.csv", ".claude/orchestration/priors.yaml",
+        for rel in ("data/pop.csv", "data/sub/costs.yaml", "data/_truth/key.csv",
+                    "data/evals/q1.yaml", "data/world_model_trials/t1.yaml",
+                    ".claude/orchestration/priors.yaml",
                     "scripts/compute.py", "scripts/table.json", "scripts/README.md", "toolkit/eng/card.yaml",
                     "toolkit/eng/model.py", "scripts/lib/code_commit.txt", "docs/notes.md"):
             w(rel)
@@ -4965,24 +4971,26 @@ def _self_test_bundle_data_set(ok) -> None:
         listed = ["/" + n for n in tarfile.open(fileobj=io.BytesIO(b)).getnames()]
         names = set(listed)
         manifest = {"data/pop.csv", "data/sub/costs.yaml", "data/big.csv", "data/dangling.csv",
-                    ".claude/orchestration/priors.yaml", "scripts/table.json", "toolkit/eng/card.yaml"}
-        ok(want == manifest, f"BD0 the declared data set is these files, no hidden ones ({sorted(want ^ manifest)})")
+                    "toolkit/eng/card.yaml"}
+        ok(want == manifest, f"BD0 the declared data set is these files, no hidden/excluded ones ({sorted(want ^ manifest)})")
         ok(len(listed) == len(names) and not any("_truth" in n or n.endswith("alias.csv") for n in names)
            and info.get("data_set_unreadable") == ["data/dangling.csv"],
            f"BD5 (Codex r1) no member twice; no _truth* path or link into one; a dangling link is recorded, not fatal "
            f"({info.get('data_set_unreadable')})")
         want.discard("data/dangling.csv")
-        data_like = {n for n in names if os.path.relpath(n, repo).split("/")[0] in ("data", ".claude")}
+        data_like = {n for n in names if os.path.relpath(n, repo).split("/")[0] == "data"}
         need = {os.path.join(repo, r) for r in want}
-        ok(os.path.join(repo, "data/pop.csv") in need and os.path.join(repo, ".claude/orchestration/priors.yaml") in need
-           and os.path.join(repo, "scripts/table.json") in need and need <= names,
+        ok(os.path.join(repo, "data/pop.csv") in need and os.path.join(repo, "toolkit/eng/card.yaml") in need
+           and need <= names,
            f"BD1 the bundle ships every file of the declared data set ({sorted(need - names)})")
-        ok(data_like == {os.path.join(repo, r) for r in want if r.split("/")[0] in ("data", ".claude")},
-           f"BD2 the bundle's repo data/ and .claude/ are exactly the data set ({sorted(data_like)})")
+        ok(data_like == {os.path.join(repo, r) for r in want if r.split("/")[0] == "data"},
+           f"BD2 the bundle's repo data/ is exactly the data set ({sorted(data_like)})")
         ok(os.path.join(repo, "data/big.csv") in names and not any("/_truth/" in n for n in names)
-           and os.path.join(repo, "docs/notes.md") not in names,
-           f"BD3 a large data-set file ships (the key hashes it), _truth and undeclared dirs do not ({info})")
-        ok(info.get("data_set_files") == len(want) == 6,
+           and os.path.join(repo, "docs/notes.md") not in names
+           and os.path.join(repo, "data/evals/q1.yaml") not in names
+           and os.path.join(repo, "data/world_model_trials/t1.yaml") not in names,
+           f"BD3 a large data-set file ships (the key hashes it), _truth, excludes and undeclared dirs do not ({info})")
+        ok(info.get("data_set_files") == len(want) == 4,
            f"BD4 the bundle reports the data-set files it ships ({info})")
         # BE34 (docs/design/agent-built-engines.md §5.1): make_bundle ships ONLY the production subset of engine_build/
         # (admission.json, signoff.json, request.json, signed snapshot, bench/) and NEVER .hidden/, reference/, try/,

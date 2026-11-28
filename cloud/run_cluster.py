@@ -162,7 +162,7 @@ class RunConfig:
     keeper_hours: float = 48.0
     idle_timeout: str = "1 hour"               # backstop only: a running or holding task keeps it busy
     require_main: bool = True                  # ship exactly origin/main (False for smoke tests of a branch)
-    required_files: tuple = ("scripts/results_store.py", "scripts/compute.py", "scripts/decision_brief.py")
+    required_files: tuple = ("scripts/results_store.py", "scripts/compute.py")
     # Phase 42 β (A5): VM reuse. Attempt 8 created 734 compute VMs in 18 h (each lived
     # minutes: up per batch, down 2 min after it) and billed ~6.5 credits per useful
     # core-hour. An idle compute VM now stays `scale_down_after` before the pool retires

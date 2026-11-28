@@ -20,7 +20,7 @@ jobs:
     strategy:
       fail-fast: false     # one failing shard must not hide another's failures
       matrix:
-        shard: [1, 2, 3, 4]
+        shard: [1, 2, 3, 4, 5, 6, 7, 8]
     # A guard against a hung job, not a duration budget: a shard takes about 10 min (the whole
     # suite took 25-40 min unsharded; 40 cancelled healthy runs on 2026-11-03).
     timeout-minutes: 60
@@ -50,11 +50,11 @@ jobs:
       # One discovery rule, shared with CLAUDE.md: every tracked module under scripts/, toolkit/
       # and cloud/, main.py and the v2 harness modules named in scripts/self_tests.py. A module in
       # scope with no --self-test fails this step unless it has an EXEMPT entry with a reason.
-      # --shard: each self-test runs in exactly one of the 4 shards, balanced by measured CI time.
-      - name: Self-tests, shard ${{ matrix.shard }} of 4 (every module with --self-test, found by scripts/self_tests.py)
+      # --shard: each self-test runs in exactly one of the 8 shards, balanced by measured CI time.
+      - name: Self-tests, shard ${{ matrix.shard }} of 8 (every module with --self-test, found by scripts/self_tests.py)
         # --per-test-timeout: a hung self-test is killed with its process group, named, and failed;
         # the others still run (the job timeout above would cancel the whole step with no name).
-        run: .venv/bin/python scripts/self_tests.py --python .venv/bin/python --jobs 2 --per-test-timeout 1800 --shard ${{ matrix.shard }}/4
+        run: .venv/bin/python scripts/self_tests.py --python .venv/bin/python --jobs 2 --per-test-timeout 1800 --shard ${{ matrix.shard }}/8
         env:
           OPENBLAS_NUM_THREADS: "2"
           OMP_NUM_THREADS: "2"

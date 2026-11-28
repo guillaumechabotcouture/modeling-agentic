@@ -326,17 +326,9 @@ REVIEWED: dict = {
     "tools/run_console/run_console.py": {"open-write": (2, "the console's temporary answers file (mkstemp)"),
                                          "os-remove": (2, "the console's temporary answers file (mkstemp)")},
 }
-_V1 = ("v1 pipeline (main.py without --v2, its hooks and gates): writes in its run dir with plain opens, attacker-"
-       "reachable under the hostile-artifact model; removed at v1 retirement (the owner deletes v1 once v2 is shown "
-       "superior), not migrated")
-# OPEN_ITEMS: attacker-reachable write sites not yet on lib.safe_io. Counted exactly, so none is added; each migration
-# lowers a count. These are known gaps, not exemptions.
 OPEN_ITEMS: dict = {
     "agents/run_finish.py": {"open-write": (1, "store_run_results (shared with v2): metadata.json's stored/store_error "
                                               "fields, a plain open in the run dir")},
-    "scripts/identifiability.py": {"open-write": (1, _V1)},
-    "scripts/propagate_uncertainty.py": {"open-write": (1, _V1)},
-    "scripts/writer_qa.py": {"open-write": (1, _V1)},
 }
 
 

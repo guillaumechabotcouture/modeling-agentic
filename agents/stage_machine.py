@@ -1156,9 +1156,58 @@ def report_claim_findings(run_dir: str) -> list[dict]:
     return out
 
 
+ACCEPTANCE_MANIFEST = os.path.join(REPO, ".claude", "orchestration", "acceptance_language.yaml")
+
+
+def load_acceptance_language(path: str = ACCEPTANCE_MANIFEST) -> dict:
+    """The acceptance-language manifest. Raises on a missing or malformed file (callers fail closed)."""
+    import yaml
+    with open(path, encoding="utf-8") as f:
+        doc = yaml.safe_load(f) or {}
+    if not isinstance(doc.get("terms"), list) or not doc["terms"] or not isinstance(doc.get("status_lines"), dict):
+        raise ValueError(f"{os.path.basename(path)}: needs a non-empty `terms` list and `status_lines`")
+    for t in doc["terms"]:
+        if not (isinstance(t, dict) and isinstance(t.get("id"), str) and isinstance(t.get("pattern"), str)):
+            raise ValueError(f"{os.path.basename(path)}: each term needs a string id and pattern")
+        re.compile(t["pattern"])
+    for k in ("negations", "allowed", "attributions"):
+        v = doc.get(k) or []
+        if not isinstance(v, list) or not all(isinstance(x, str) and x for x in v):
+            raise ValueError(f"{os.path.basename(path)}: `{k}` must be a list of quoted strings "
+                             "(YAML reads an unquoted no as false)")
+    return doc
+
+
+def acceptance_language_hits(text: str, status: str | None, manifest: dict | None = None) -> list[str]:
+    """Each use of an acceptance term ("<term id>: <context>") in a report whose status is not an accepted one."""
+    m = manifest or load_acceptance_language()
+    if status in (m.get("accepted_statuses") or []):
+        return []
+    for a, b in (("\u2018", "'"), ("\u2019", "'"), ("\u201c", '"'), ("\u201d", '"')):
+        text = text.replace(a, b)
+    for a in m.get("allowed") or []:
+        text = re.sub(a, " ", text, flags=re.I)
+    att = "|".join(re.escape(a) for a in m.get("attributions") or [])
+    if att:
+        text = re.sub(r'(\b(?:%s)\w*\b[^"\n.]{0,60})"[^"\n]{0,400}"' % att, r"\1 ", text, flags=re.I)
+    text = re.sub(r"\n(?![ \t]*(?:[\n#>|*+-]|\d+[.)]\s))", " ", text)
+    negs = {n.lower() for n in m.get("negations") or []}
+    win = int(m.get("negation_window", 3))
+    out = []
+    for t in m["terms"]:
+        for hit in re.finditer(t["pattern"], text, re.I):
+            clause = re.split(r"[.;:!?,()\n]|\bbut\b", text[max(0, hit.start() - 120):hit.start()], flags=re.I)[-1]
+            before = re.findall(r"[a-z']+", clause.lower())[-win:]
+            if any(w in negs or w.endswith("n't") for w in before):
+                continue
+            ctx = " ".join(text[max(0, hit.start() - 60):hit.end() + 60].split())
+            out.append(f"{t['id']}: ...{ctx}...")
+    return out
+
+
 def report_acceptance_findings(run_dir: str, write_mode: str | None) -> list[dict]:
     """F6 S1-7: a declared-scope or not-accepted write-up uses no acceptance language (the terms are in
-    .claude/orchestration/acceptance_language.yaml; the check is scripts/writer_qa.py's). MEDIUM: a
+    .claude/orchestration/acceptance_language.yaml). MEDIUM: a
     write-up fix the loop can make, declared when it cannot."""
     if write_mode not in ("declared", "not_accepted"):
         return []
@@ -1167,8 +1216,7 @@ def report_acceptance_findings(run_dir: str, write_mode: str | None) -> list[dic
     except OSError:
         return []
     try:
-        import writer_qa as WQ
-        hits = WQ.acceptance_language_hits(text, "completed_scope_declared" if write_mode == "declared" else "not_accepted")
+        hits = acceptance_language_hits(text, "completed_scope_declared" if write_mode == "declared" else "not_accepted")
     except Exception as e:  # noqa: BLE001 -- fail closed
         hits = [f"the check could not run ({type(e).__name__}: {e})"]
     if not hits:
@@ -4787,8 +4835,7 @@ def _status_line(run_dir: str, status: str | None) -> str:
         status = (st.status or {"declared": "completed_scope_declared", "not_accepted": "not_accepted"}.get(
             st.write_mode or "", "pending")) if st else "pending"
     try:
-        import writer_qa as WQ
-        lines = WQ.load_acceptance_language()["status_lines"]
+        lines = load_acceptance_language()["status_lines"]
     except Exception:  # noqa: BLE001 -- fail closed: never reads as accepted
         lines = {}
     text = lines.get(status) or (lines.get("pending") if status == "pending" else lines.get("other")) or "not accepted"

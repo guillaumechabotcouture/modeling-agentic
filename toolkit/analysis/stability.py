@@ -38,10 +38,46 @@ def thresholds() -> dict:
         return yaml.safe_load(f)["stability"]
 
 
-def _ar():
-    sys.path.insert(0, os.path.join(ROOT, "scripts"))
-    import allocation_robustness
-    return allocation_robustness
+VALID_HOLDOUT_METHODS = {
+    "leave-one-archetype-out",
+    "leave-one-state-out",
+    "leave-one-zone-out",
+    "5-fold-by-archetype",
+    "10-fold-by-archetype",
+    "spatial-block-cv",
+    "leave-one-out",
+    "k-fold",
+}
+
+ROBUST_RANK_CORR_MIN = 0.70
+ROBUST_CASES_GAP_MAX = 15.0
+ROBUST_RULE_CONCORDANCE_MIN = 80.0
+
+FRAGILE_RANK_CORR_MIN = 0.40
+FRAGILE_CASES_GAP_MAX = 30.0
+FRAGILE_RULE_CONCORDANCE_MIN = 60.0
+
+
+def compute_verdict(metrics: dict) -> str:
+    """Recompute verdict from worst-fold metrics. Returns ROBUST, FRAGILE, or UNSTABLE."""
+    rank_worst = metrics.get("rank_correlation_worst_fold")
+    gap_worst = metrics.get("cases_averted_gap_pct_worst_fold")
+    rule_worst = metrics.get("rule_classification_concordance_pct_worst_fold")
+
+    if rank_worst is not None and rank_worst < FRAGILE_RANK_CORR_MIN:
+        return "UNSTABLE"
+    if gap_worst is not None and gap_worst > FRAGILE_CASES_GAP_MAX:
+        return "UNSTABLE"
+    if rule_worst is not None and rule_worst < FRAGILE_RULE_CONCORDANCE_MIN:
+        return "UNSTABLE"
+
+    rank_ok = rank_worst is None or rank_worst >= ROBUST_RANK_CORR_MIN
+    gap_ok = gap_worst is None or gap_worst <= ROBUST_CASES_GAP_MAX
+    rule_ok = rule_worst is None or rule_worst >= ROBUST_RULE_CONCORDANCE_MIN
+    if rank_ok and gap_ok and rule_ok:
+        return "ROBUST"
+
+    return "FRAGILE"
 
 
 def _spearman(a, b):
@@ -165,10 +201,10 @@ def run(A, z0, out0, ben0, cost0, plan) -> dict:
                                         default=None),
            "dollars_moved_worst_fold": max((f["dollars_moved"] for f in folds), default=None),
            "population_changed_worst_fold": max((f["population_changed"] for f in folds), default=None)}
-    verdict = _ar().compute_verdict({"rank_correlation_worst_fold": met["rank_correlation_worst_fold"],
-                                     "cases_averted_gap_pct_worst_fold": met["benefit_gap_pct_worst_fold"],
-                                     "rule_classification_concordance_pct_worst_fold":
-                                         met["package_concordance_pct_worst_fold"]})
+    verdict = compute_verdict({"rank_correlation_worst_fold": met["rank_correlation_worst_fold"],
+                               "cases_averted_gap_pct_worst_fold": met["benefit_gap_pct_worst_fold"],
+                               "rule_classification_concordance_pct_worst_fold":
+                                   met["package_concordance_pct_worst_fold"]})
     if not folds:       # Codex r7 P2: no fold ran; no verdict from all-None metrics
         verdict = "NOT_RUN"
     th = thresholds()
@@ -189,7 +225,7 @@ def robustness_yaml(stab: dict) -> dict:
     """models/allocation_robustness.yaml in the schema scripts/allocation_robustness.py validates."""
     m = stab["metrics"]
     meth = stab["method"]
-    return {"holdout_method": meth if meth in _ar().VALID_HOLDOUT_METHODS else "leave-one-out",
+    return {"holdout_method": meth if meth in VALID_HOLDOUT_METHODS else "leave-one-out",
             "n_folds": stab.get("n_folds", 0),
             "metrics": {"rank_correlation_mean": m.get("rank_correlation_mean"),
                         "rank_correlation_worst_fold": m.get("rank_correlation_worst_fold"),
