@@ -122,10 +122,11 @@ def _net_effect_posterior(run_dir, spec, signer) -> list:
     if getattr(spec, "engine_pending", False):
         return ["net_effect_posterior: engine: auto is still pending; the posterior is bound to one engine's fit and "
                 "is checked once the engine is chosen"]
-    from toolkit.analysis import batch as BA, joint_calibration as JC, uncertainty as UQ
+    from toolkit.analysis import batch as BA, joint_calibration as JC
+    from toolkit.engines import hooks as _hooks
     try:
         eng = spec.engine()
-        ne = UQ.net_effect_sample(spec, eng)
+        ne = _hooks.external_posterior_sample(spec, eng)
         box = BA.design_box(spec, eng)[0]
         point = JC.theta0(spec)             # the run's point values (as core.Analysis.theta0)
     except (ValueError, OSError) as e:          # PosteriorRefused is a ValueError
@@ -226,18 +227,6 @@ def _acquired_inventory(run_dir, spec, signer, spec_bytes=None, mode=None, recor
             capture["evidence_status"] = "changed"
         return [f"artifact_tampered: {e}"]
     probs += ACQ.unlisted_acquired_citations(run_dir, getattr(spec, "raw", None))
-    if mode == "sign" and cur_inv is not None:
-        from toolkit.spec import signoff as SO
-        from lib.safe_io import read_nofollow
-        try:
-            sb = read_nofollow(run_dir, SO.SHEET)[0]
-            src = SO.sheet_sources(sb.decode("utf-8", "replace"))
-            if src is not None and src.get("acquired_inventory_sha256") != cur_inv:
-                probs.append("acquired_inventory_changed: sign-off sheet acquired_inventory_sha256 is stale; regenerate sheet")
-        except FileNotFoundError:
-            pass
-        except (LinkRefused, OSError) as e:
-            probs.append(f"artifact_tampered: {e}")
     if mode in ("status", "launch", "resume") and isinstance(rec, dict):
         if rec_inv != cur_inv:
             if isinstance(capture, dict) and capture.get("evidence_status") in (None, "ok"):
@@ -322,8 +311,7 @@ def chosen_range_test_runs(spec: dict, test_id: str, effect: str, drawn: dict | 
                            "or excluded by uncertainty.excluded)"), []
         return True, "", list(drawn[name])
     an = spec.get("analysis") if isinstance(spec, dict) and isinstance(spec.get("analysis"), dict) else {}
-    from toolkit.spec import perturb as PT       # W0-B: a perturb test in its per-target form
-    tests = {str(t.get("id")): t for t in PT.tests(an)}
+    tests = {str(t.get("id")): t for t in (an.get("decision_tests") or []) if isinstance(t, dict)}
     t = tests.get(str(test_id))
     if t is None:
         return False, "is not an analysis.decision_tests id", []
@@ -342,13 +330,12 @@ def chosen_range_test_runs(spec: dict, test_id: str, effect: str, drawn: dict | 
 
 
 def _declared_range(spec, eng, p):
-    """The parameter's declared range: a net-effect posterior column's posterior range (its sample's hull within its
-    hard bounds, uncertainty.net_effect_sample; the card prior may be narrower than the fit's, F6 refit b), else its
-    drawn prior's, else the engine's (lo, hi); None when it has none, or when the spec's posterior cannot be loaded
-    (fail closed)."""
-    from toolkit.analysis import uncertainty as UQ
+    """The parameter's declared range: a posterior column's range (hooks.external_posterior_sample; the card prior may be
+    narrower than the fit's, F6 refit b), else its drawn prior's, else the engine's (lo, hi); None when it has none,
+    or when the spec's posterior cannot be loaded (fail closed)."""
+    from toolkit.engines import hooks as _hooks
     try:
-        ne = UQ.net_effect_sample(spec, eng)
+        ne = _hooks.external_posterior_sample(spec, eng)
     except Exception:  # noqa: BLE001 -- a posterior that is refused gives no range to span
         return None
     if ne is not None and p in (ne.get("ranges") or {}):
@@ -376,8 +363,8 @@ def decision_test_runs(spec, test_id, effect: dict) -> tuple[bool, str]:
     benchmark's component pair given the other. `effect`: {parameters, components, benchmark, estimand, pair,
     range_fraction}."""
     raw = spec.raw
-    from toolkit.spec import perturb as PT       # W0-B: a perturb test in its per-target form
-    t = next((x for x in PT.tests(raw.get("analysis")) if str(x.get("id")) == str(test_id)), None)
+    an = raw.get("analysis") if isinstance(raw.get("analysis"), dict) else {}
+    t = next((x for x in (an.get("decision_tests") or []) if isinstance(x, dict) and str(x.get("id")) == str(test_id)), None)
 
     if t is None:
         return False, "is not an analysis.decision_tests id"
@@ -483,7 +470,6 @@ def _self_test_posterior(ok) -> None:
 
     def sign(d):
         try:
-            SO.write_sheet(d)
             SO.sign(d, "owner", note="n")
             return SO.status(d)
         except ValueError as e:
@@ -574,29 +560,29 @@ def _self_test_posterior(ok) -> None:
 
 def _self_test_declared_range(ok) -> None:
     """PC11 (F6 option A refit b): a posterior column's declared range is the posterior's (its hull within its hard
-    bounds, uncertainty.net_effect_sample), not the card prior the posterior was fitted past; without a posterior the
+    bounds, hooks.external_posterior_sample), not the card prior the posterior was fitted past; without a posterior the
     prior or the engine's range as before; a posterior that cannot be loaded gives no range (fail closed)."""
-    from toolkit.analysis import uncertainty as UQ
+    from toolkit.engines import hooks as _hooks
 
     class Eng:
         def parameters(self):
             from types import SimpleNamespace as N
             return [N(name="pad", lo=0.0, hi=1.895), N(name="k", lo=1.0, hi=2.0)]
-    orig = UQ.net_effect_sample
+    orig = _hooks.external_posterior_sample
     got = {}
     try:
-        UQ.net_effect_sample = lambda spec, eng, *a, **k: {"ranges": {"pad": (0.9, 2.2)}}
+        _hooks.external_posterior_sample = lambda spec, eng, *a, **k: {"ranges": {"pad": (0.9, 2.2)}}
         got["posterior column"] = _declared_range(object(), Eng(), "pad")
         got["other column"] = _declared_range(object(), Eng(), "k")
-        UQ.net_effect_sample = lambda spec, eng, *a, **k: None
+        _hooks.external_posterior_sample = lambda spec, eng, *a, **k: None
         got["no posterior"] = _declared_range(object(), Eng(), "pad")
 
         def boom(spec, eng, *a, **k):
             raise ValueError("refused")
-        UQ.net_effect_sample = boom
+        _hooks.external_posterior_sample = boom
         got["posterior refused"] = _declared_range(object(), Eng(), "pad")
     finally:
-        UQ.net_effect_sample = orig
+        _hooks.external_posterior_sample = orig
     ok(got == {"posterior column": (0.9, 2.2), "other column": (1.0, 2.0), "no posterior": (0.0, 1.895),
                "posterior refused": None},
        f"PC11 a posterior column's declared range is the posterior's; others as before; a refused posterior gives none "

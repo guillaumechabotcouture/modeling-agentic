@@ -951,14 +951,11 @@ def _dispatch_action(model, kind: str, action: str, payload: Mapping, id_salt: s
         return {
             "card": _serialize_card(model.describe()),
             "parameters": [_serialize_param(p) for p in model.parameters()],
-            "has_batch": bool(callable(getattr(model, "run_batch_state", None))),
         }
     if action == "describe":
         return _serialize_card(model.describe())
     if action == "parameters":
         return [_serialize_param(p) for p in model.parameters()]
-    if action == "has_batch":
-        return bool(callable(getattr(model, "run_batch_state", None)))
     if action == "run":
         return _run_one(
             model, kind, payload.get("params") or {}, payload["unit"], payload["package"],
@@ -967,48 +964,6 @@ def _dispatch_action(model, kind: str, action: str, payload: Mapping, id_salt: s
         )
     if action == "run_many":
         items = payload["items"]
-        return [
-            _run_one(
-                model, kind, item.get("params") or {}, item["unit"], item["package"],
-                item["horizon"], int(item.get("seed", 0)), id_salt,
-                item.get("age_shares"),
-            )
-            for item in items
-        ]
-    if action == "run_batch":
-        items = payload["items"]
-        if callable(getattr(model, "run_batch_state", None)) and items:
-            from toolkit.engines.contract import Horizon, Outcomes, Package, UnitSpec, resolve_params
-            card = model.describe()
-            first = items[0]
-            raw_attrs = copy.deepcopy(first["unit"].get("attributes") or {})
-            auth_shares = _compute_age_shares(list(card.age_groups), raw_attrs, first.get("age_shares"))
-            opaque_u = UnitSpec(_opaque_id(id_salt, str(first["unit"]["id"])), copy.deepcopy(raw_attrs))
-            hor_d = first["horizon"]
-            hor = Horizon(float(hor_d["start"]), float(hor_d["stop"]), tuple(hor_d["window"]),
-                          {str(k): list(v) for k, v in (hor_d.get("windows") or {}).items()})
-            p_list = [TrackedParams(resolve_params(model, it.get("params") or {})) for it in items]
-            pk_list = [Package(_opaque_id(id_salt, str(it["package"]["id"])),
-                               copy.deepcopy(it["package"].get("components") or {})) for it in items]
-            seed0 = int(first.get("seed", 0))
-            outs = model.run_batch_state(p_list, opaque_u, pk_list, hor, seed0)
-            if not isinstance(outs, list) or len(outs) != len(items):
-                raise WorkerError("run_batch_state must return one Outcomes per batch item")
-            results = []
-            for out, tp in zip(outs, p_list):
-                if not isinstance(out, Outcomes):
-                    raise WorkerError(f"run_batch_state item is not Outcomes (got {type(out).__name__})")
-                meta = dict(out.meta or {})
-                meta.pop("balance", None)
-                meta.pop("param_reads", None)
-                meta.pop("age_shares", None)
-                meta["age_shares"] = auth_shares
-                meta["param_reads"] = {"build": sorted(tp.reads_by_phase["build"]), "read_outcomes": []}
-                results.append(_serialize_outcomes(
-                    Outcomes(per_capita=out.per_capita, windows=out.windows,
-                             cost_drivers=out.cost_drivers, meta=meta)
-                ))
-            return results
         return [
             _run_one(
                 model, kind, item.get("params") or {}, item["unit"], item["package"],

@@ -185,8 +185,8 @@ def _run(run_dir, spec_rel, draws, unsigned, log, compute_kw, holder) -> dict:
         raise PermissionError(f"decision spec is not signed (status: {st}); sign it (toolkit/spec/signoff.py) or pass "
                               "--unsigned for a test run")
     eng = spec.engine()
-    from toolkit.analysis import uncertainty as UQ_
-    post = UQ_.posterior_input(spec)        # uncertainty.net_effect_posterior: read once, its signed sha256 checked
+    from toolkit.engines import hooks as _hooks_
+    post = _hooks_.external_posterior_input(spec)        # uncertainty.net_effect_posterior: read once, its signed sha256 checked
     info = dict(_engine_info(eng), **({"net_effect_posterior_sha256": post["sha256"]} if post else {}))
     S = Store(run_dir, spec.sha256, st == "signed", info, spec.settings_sha256, spec.engine_choice_sha256)
     holder["S"] = S
@@ -197,11 +197,11 @@ def _run(run_dir, spec_rel, draws, unsigned, log, compute_kw, holder) -> dict:
     stale = load_evidence(eng).problems          # S1-2b: never an analysis on evidence the snapshot does not back
     if stale:
         raise AnalysisBlocked("fitted_values", [], reason="; ".join(stale))
-    ne = UQ_.net_effect_sample(spec, eng)   # f6-posterior-ranges: loaded, verified; its hull sets its columns' ranges
+    ne = _hooks_.external_posterior_sample(spec, eng)   # f6-posterior-ranges: loaded, verified; its hull sets its columns' ranges
     if ne is not None:                      # before any artifact: the manifest and every artifact record where from
-        info["net_effect_posterior_ranges"] = UQ_.posterior_range_record(ne)
+        info["net_effect_posterior_ranges"] = _hooks_.external_posterior_range_record(ne)
         # v2-posterior-point: each posterior column's point value is the fit's verified chosen point
-        info["point_source"], info["posterior_point"] = UQ_.point_source(ne), dict(ne["point"])
+        info["point_source"], info["posterior_point"] = _hooks_.external_posterior_point_source(ne), dict(ne["point"])
     card = eng.describe()
     arts = {}
     # Codex r2 P1-7: the files the engine reads (benchmark results, fitted values) are inputs of what uses them
@@ -473,7 +473,7 @@ def _run(run_dir, spec_rel, draws, unsigned, log, compute_kw, holder) -> dict:
                                                         "tests": [
         {"test_id": x["test_id"], "path": x["path"], "status": x["status"],
          "verdict": ("NOT_RUN" if x["status"] == "not_run" else "CHANGES_PLAN" if x["decision_changes"] else "NO_CHANGE"),
-         # 1C-c follow-up: the verdict words are unchanged (tools/workbench and tools/run_console read exactly these
+         # 1C-c follow-up: the verdict words are unchanged (tools/run_console reads exactly these
          # three); a verdict that cannot be settled within the solver's accepted gap is marked beside it
          "within_solver_gap": bool(x.get("within_solver_gap")),
          "can_move_plan": x["can_move_plan"], "threshold_pct": 100.0 * x["share_threshold"],
@@ -771,7 +771,7 @@ def _self_test() -> int:
                 A5.set_reserve(None)
             A5.plan_budget = None
         _self_test_cost_structure(ok, A5, R)
-        _self_test_perturb(ok, A5, R)
+        _self_test_direct_decision_tests(ok, A5, R)
         stb = R["stability"]
         ok(stb["n_folds"] == 4 and stb["value_verdict"] in ("ROBUST", "FRAGILE", "UNSTABLE")
            and "total_benefit_loss_pct_worst_fold" in stb["metrics"],
@@ -2244,10 +2244,10 @@ def _self_test_posterior_point(ok):
            f"is not run without them or on arms from another point: {before} | {after.get('src')} | {other}")
     # Codex r1 P1-5: the conflict tolerance is the fit's 6-decimal rounding, whatever the value's magnitude
     import types
-    from toolkit.analysis import uncertainty as UQ
+    from toolkit.engines import hooks as _hooks
     big = types.SimpleNamespace(raw={"engine_parameters": {"h": {"value": 1000.0004}}})
     try:
-        UQ.posterior_point(big, {"point": {"h": 1000.0}}, {})
+        _hooks.external_posterior_point(big, {"point": {"h": 1000.0}}, {})
         w7 = "accepted"
     except ValueError as e:
         w7 = str(e)
@@ -2612,14 +2612,9 @@ def _self_test_cost_structure(ok, A, R):
        "R5r the results state the floored increments, with the count as a claim")
 
 
-def _perturb_view(rec: dict) -> dict:
-    ignored = ("type", "perturb", "path", "producer", "produced_by")
-    return {k: v for k, v in rec.items() if k not in ignored}
-
-
-def _self_test_perturb(ok, A, R):
-    """W0-B: a native perturb test runs through the same machinery as the older type it replaces and gives the same
-    record (decision, detail, words, plans); a joint test holds its companions and carries no departure."""
+def _self_test_direct_decision_tests(ok, A, R):
+    """Canonical per-type decision tests execute directly; a joint parameter_value test with `with` holds its
+    companions and carries no departure."""
     plan = R["point"]["plan"]
     z0 = {i: v["z"] for i, v in R["point"]["per_unit"].items()}
     out0, ben0, cost0 = A.evaluate(A.theta0, z0)
@@ -2627,35 +2622,25 @@ def _self_test_perturb(ok, A, R):
     box = DT.runtime_evidence(A)["box"] or {}
     nm = sorted(box)
     mid = {n: 0.5 * (box[n][0] + box[n][1]) for n in nm}
-    pairs = [({"id": "DTk", "type": "cost_items", "text": "t", "multipliers": {its["a"]: 1e9, its["b"]: 0.5}},
-              {"id": "DTk", "type": "perturb", "text": "t", "set": [
-                  {"target": "cost_item", "name": its["a"], "scale": 1e9},
-                  {"target": "cost_item", "name": its["b"], "scale": 0.5}]}),
-             ({"id": "DTe", "type": "envelope", "text": "t", "values": [0.5 * A.budget, A.budget]},
-              {"id": "DTe", "type": "perturb", "text": "t", "set": [{"target": "envelope",
-                                                                       "values": [0.5 * A.budget, A.budget]}]})]
+    tests = [
+        {"id": "DTk", "type": "cost_items", "text": "t", "multipliers": {its["a"]: 1e9, its["b"]: 0.5}},
+        {"id": "DTe", "type": "envelope", "text": "t", "values": [0.5 * A.budget, A.budget]},
+    ]
     if len(nm) >= 2:
-        pairs.append(({"id": "DTj", "type": "parameter_value", "text": "t", "parameter": nm[0],
-                       "values": [box[nm[0]][0], mid[nm[0]]], "with": {nm[1]: box[nm[1]][1]}},
-                      {"id": "DTj", "type": "perturb", "text": "t", "set": [
-                          {"target": "parameter", "name": nm[0], "values": [box[nm[0]][0], mid[nm[0]]]},
-                          {"target": "parameter", "name": nm[1], "value": box[nm[1]][1]}]}))
-    ok(len(pairs) == 3, f"RPT0 the toy emulator has two parameter inputs for the joint test: {nm}")
-    for old, new in pairs:
-        r_old = DT.run_one(A, old, z0, ben0, cost0, plan, R["uncertainty"], out0)
-        r_new = DT.run_one(A, new, z0, ben0, cost0, plan, R["uncertainty"], out0)
-        ok(r_new["status"] == "run" and _perturb_view(r_new) == _perturb_view(r_old) and r_new["type"] == "perturb"
-           and r_old["type"] == old["type"] and r_old["perturb"]["alias"] == old["type"],
-           f"RPT1 a perturb test gives the record of its alias {old['type']} ({old['id']})")
-        lay = r_new["perturb"]["layer"]
-        ok(lay["layer"] == ("post_emulator" if old["type"] == "envelope" else "emulator_design")
-           and lay["engine_rows"] == 0, f"RPT2 the record names the layer the test acts on: {lay}")
-    if len(nm) >= 2:
+        tests.append({"id": "DTj", "type": "parameter_value", "text": "t", "parameter": nm[0],
+                      "values": [box[nm[0]][0], mid[nm[0]]], "with": {nm[1]: box[nm[1]][1]}})
+    ok(len(tests) == 3, f"RPT0 the toy emulator has two parameter inputs for the joint test: {nm}")
+    last = None
+    for dt in tests:
+        rec = DT.run_one(A, dt, z0, ben0, cost0, plan, R["uncertainty"], out0)
+        ok(rec["status"] == "run" and rec["type"] == dt["type"],
+           f"RPT1 direct decision test {dt['type']} ({dt['id']}) runs cleanly")
+        last = rec
+    if len(nm) >= 2 and last is not None:
         dv = DT.departure_verdicts([{"engine": "e", "benchmark": "B", "decision_test": "DTj"}],
-                                   {"B": {"components": ["a"]}}, {"DTj": r_new})
-        ok(r_new.get("with") == {nm[1]: box[nm[1]][1]} and not dv[0]["effective"] and "companion" in dv[0]["why"],
-           f"RPT3 DT_CONDITIONAL_NO_DEPARTURE: a joint perturb test holds its companion and carries no departure: "
-           f"{dv}")
+                                   {"B": {"components": ["a"]}}, {"DTj": last})
+        ok(last.get("with") == {nm[1]: box[nm[1]][1]} and not dv[0]["effective"] and "companion" in dv[0]["why"],
+           f"RPT3 DT_CONDITIONAL_NO_DEPARTURE: a joint test holds its companion and carries no departure: {dv}")
 
 
 def _floor_q(theta, theta0, at_point):

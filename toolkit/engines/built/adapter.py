@@ -97,9 +97,8 @@ def _signer_allowed(by: str | None, mode: str) -> bool:
 def _verify_spec_signoff(run_dir: str, spec_sha: str, mode: str) -> dict:
     """Verify `decision_spec.yaml` is signed by an allowed signer for `mode` and unchanged since sign-off."""
     rec = None
-    for cand in ("decision_brief.signoff.json", "decision_spec.signoff.json"):
-        if not os.path.lexists(os.path.join(run_dir, cand)):
-            continue
+    cand = "decision_spec.signoff.json"
+    if os.path.lexists(os.path.join(run_dir, cand)):
         raw = _read_single_link(run_dir, cand)
         try:
             doc = json.loads(raw.decode("utf-8"))
@@ -107,7 +106,6 @@ def _verify_spec_signoff(run_dir: str, spec_sha: str, mode: str) -> dict:
             raise BuiltEngineRefused(f"{cand} invalid JSON: {e}") from None
         if isinstance(doc, dict) and (doc.get("sha256") or {}).get("decision_spec.yaml") is not None:
             rec = doc
-            break
     if rec is None:
         raise BuiltEngineRefused("decision_spec.yaml has no valid sign-off record")
     if (rec.get("sha256") or {}).get("decision_spec.yaml") != spec_sha:
@@ -181,89 +179,89 @@ class BuiltEngine:
         self.id = self._req_engine.id
         self.kind = self._req_engine.kind
 
-        # 3. Read engine_build/signoff.json and verify signer against the run's recorded sign-off mode
-        so_bytes = _read_single_link(self.run_dir, "engine_build/signoff.json")
-        try:
-            so = json.loads(so_bytes.decode("utf-8"))
-        except (UnicodeDecodeError, ValueError) as e:
-            raise BuiltEngineRefused(f"engine_build/signoff.json invalid JSON: {e}") from None
-        if not isinstance(so, dict) or not isinstance(so.get("sha256"), dict):
-            raise BuiltEngineRefused("engine_build/signoff.json malformed")
-        by = so.get("by")
-        if not _signer_allowed(by, mode):
-            raise BuiltEngineRefused(f"engine sign-off signer {by!r} is refused in a run with signoff mode {mode!r}")
-        self._signoff = so
-
-        # 4. Read engine_build/admission.json, verify sha256 against signoff and status == admitted
-        adm_bytes = _read_single_link(self.run_dir, "engine_build/admission.json")
-        adm_sha = _sha256_bytes(adm_bytes)
-        if so["sha256"].get("admission.json") != adm_sha:
-            raise BuiltEngineRefused("engine_build/admission.json sha256 does not match engine_build/signoff.json")
-        try:
-            adm = json.loads(adm_bytes.decode("utf-8"))
-        except (UnicodeDecodeError, ValueError) as e:
-            raise BuiltEngineRefused(f"engine_build/admission.json invalid JSON: {e}") from None
-        if not isinstance(adm, dict) or adm.get("status") != "admitted":
-            raise BuiltEngineRefused(f"built engine is not admitted (status={adm.get('status') if isinstance(adm, dict) else None!r})")
-        if adm.get("engine_id") != self.id:
-            raise BuiltEngineRefused(f"admission engine_id {adm.get('engine_id')!r} != spec engine.build.id {self.id!r}")
-        if adm.get("request_sha256") != self._request_sha:
-            raise BuiltEngineRefused("admission request_sha256 does not match signed decision_spec.yaml engine.build")
-        self._admission = adm
-
-        # Verify mandatory bench/* and optional bench/fitted.yaml digests against BOTH admission.json and signoff.json
-        adm_digests = adm.get("digests") if isinstance(adm.get("digests"), Mapping) else {}
-        self._signed_bench_digests: dict[str, str] = {}
-        for rel in BENCH_FILES:
-            want_so = so["sha256"].get(rel)
-            want_adm = adm_digests.get(rel)
-            if not want_so or not want_adm or want_so != want_adm:
-                raise BuiltEngineRefused(f"{rel} digest missing or inconsistent between admission.json and signoff.json")
-            got = _sha256_bytes(_read_single_link(self.run_dir, f"engine_build/{rel}"))
-            if got != want_so:
-                raise BuiltEngineRefused(f"engine_build/{rel} digest mismatch (tampered after admission/signoff)")
-            self._signed_bench_digests[rel] = want_so
-
-        self.fitted_path: str | None = None
-        for rel in OPTIONAL_BENCH_FILES:
-            want_so = so["sha256"].get(rel)
-            want_adm = adm_digests.get(rel)
-            on_disk = os.path.lexists(os.path.join(self.run_dir, "engine_build", rel))
-            if want_so is None and want_adm is None and not on_disk:
-                continue
-            if not want_so or not want_adm or want_so != want_adm:
-                raise BuiltEngineRefused(f"{rel} digest missing or inconsistent between admission.json and signoff.json")
-            got = _sha256_bytes(_read_single_link(self.run_dir, f"engine_build/{rel}"))
-            if got != want_so:
-                raise BuiltEngineRefused(f"engine_build/{rel} digest mismatch (tampered after admission/signoff)")
-            self._signed_bench_digests[rel] = want_so
-            if rel == "bench/fitted.yaml":
-                self.fitted_path = os.path.join(self.run_dir, "engine_build", "bench", "fitted.yaml")
-
-        # 5. Verify snapshot_sha256 and effective config_sha256 match admitted record
-        snap_sha = adm.get("snapshot_sha256")
-        if not isinstance(snap_sha, str) or so.get("snapshot_sha256") != snap_sha or so["sha256"].get("snapshot") != snap_sha:
-            raise BuiltEngineRefused("snapshot_sha256 missing or inconsistent between admission.json and signoff.json")
-        if adm.get("config_sha256") != self._config_sha:
-            raise BuiltEngineRefused(f"constructor config sha256 {self._config_sha[:12]} does not match admitted "
-                                     f"{str(adm.get('config_sha256'))[:12]}")
-        self.snapshot_sha256 = snap_sha
+        # 3-6. Verify signoff, admission, bench digests, and content-addressed snapshot via unified verifier
+        allowed = ("owner",) if mode == "owner" else ("owner", "lead")
+        info, probs = BSNAP.verify_admitted_engine(
+            self.run_dir,
+            require_signoff=True,
+            request_sha256=self._request_sha,
+            engine_id=self.id,
+            config_sha256=self._config_sha,
+            allowed_signers=allowed,
+        )
+        if probs:
+            raise BuiltEngineRefused(probs[0])
+        self._signoff = info["signoff"]
+        self._admission = info["adm"]
+        self._signed_bench_digests = dict(info["signed_bench_digests"])
+        self.fitted_path = (
+            os.path.join(self.run_dir, "engine_build", "bench", "fitted.yaml")
+            if "bench/fitted.yaml" in self._signed_bench_digests
+            else None
+        )
+        self.snapshot_sha256 = info["snapshot_sha256"]
         self._snapshots_dir = os.path.join(self.run_dir, "engine_build", "snapshots")
-
-        # 6. Verify snapshot bytes ONCE before any compile (BE19), and cache immutable code fingerprint from them
-        try:
-            self._files = BSNAP.read_verified_snapshot(self._snapshots_dir, self.snapshot_sha256)
-        except BSNAP.SnapshotError as e:
-            raise BuiltEngineRefused(f"snapshot verification failed: {e}") from None
+        self._files = info["verified_files"]
         self._code_sha256 = _compute_code_sha256(self._files)
 
         # Authoritative single bench/ set (§5.1)
         self.results_path = os.path.join(self.run_dir, "engine_build", "bench", "results.yaml")
         self.pack_path = os.path.join(self.run_dir, "engine_build", "bench", "pack.yaml")
         self.coverage_path = os.path.join(self.run_dir, "engine_build", "bench", "benchmark_coverage.yaml")
+        self._limits: dict | None = None
+        self._hash_seed: str = "0"
+        self._id_salt: str = "s0"
+        self._use_session: bool = True
         self.used_unsandboxed = False
         self._card_cache: EngineCard | None = None
         self._params_cache: list[ParamSpec] | None = None
+
+    @classmethod
+    def from_verified(
+        cls,
+        verified_files: Mapping[str, bytes],
+        build_decl: Mapping,
+        config: Mapping | None = None,
+        *,
+        run_dir: str | None = None,
+        unsandboxed_ok: bool = False,
+        limits: Mapping | None = None,
+        hash_seed: str = "0",
+        id_salt: str = "s0",
+        fitted_path: str | None = None,
+        results_path: str | None = None,
+        pack_path: str | None = None,
+        coverage_path: str | None = None,
+        use_session: bool = False,
+    ) -> "BuiltEngine":
+        """Construct an unadmitted BuiltEngine wrapper directly from verified snapshot bytes (admission & try_tool)."""
+        self = object.__new__(cls)
+        self._direct_runner = True
+        self._files = {str(k): bytes(v) for k, v in verified_files.items()}
+        self._build = dict(build_decl)
+        self._req_engine = BREQ.RequestedEngine(self._build)
+        self._request_sha = BREQ.request_sha256(self._build)
+        self.id = self._req_engine.id
+        self.kind = self._req_engine.kind
+        self._config = dict(config or {})
+        self._config_sha = effective_config_sha256(self._config)
+        self._code_sha256 = _compute_code_sha256(self._files)
+        self.run_dir = os.path.abspath(run_dir) if run_dir else None
+        self._unsandboxed_ok = bool(unsandboxed_ok)
+        self._limits = dict(limits) if limits else None
+        self._hash_seed = str(hash_seed)
+        self._id_salt = str(id_salt)
+        self._force_sandbox = "auto"
+        self._use_session = bool(use_session)
+        self.used_unsandboxed = False
+        self.fitted_path = fitted_path
+        self.results_path = results_path
+        self.pack_path = pack_path
+        self.coverage_path = coverage_path
+        self._signed_bench_digests = {}
+        self._card_cache = None
+        self._params_cache = None
+        return self
 
     def config(self) -> dict:
         return dict(self._config)
@@ -302,7 +300,8 @@ class BuiltEngine:
     def validate_unit_values(self, units: list[dict], engine_attributes: Mapping) -> list[str]:
         return self._req_engine.validate_unit_values(units, engine_attributes)
 
-    def _call_worker(self, action: str, payload: Mapping | None = None) -> dict:
+    def _call_worker(self, action: str, payload: Mapping | None = None, *, hash_seed: str | None = None,
+                     id_salt: str | None = None, use_session: bool | None = None) -> dict:
         res = BWORK.run_in_worker(
             self._files,
             kind=self.kind,
@@ -310,12 +309,16 @@ class BuiltEngine:
             config=self._config,
             payload=payload,
             unsandboxed_ok=self._unsandboxed_ok,
+            limits=self._limits,
+            hash_seed=self._hash_seed if hash_seed is None else str(hash_seed),
+            id_salt=self._id_salt if id_salt is None else str(id_salt),
             _force_sandbox=self._force_sandbox,
-            use_session=True,
+            use_session=self._use_session if use_session is None else bool(use_session),
         )
         if res.get("unsandboxed"):
             self.used_unsandboxed = True
-            BWORK.record_unsandboxed(self.run_dir, action=action, engine_id=self.id)
+            if self.run_dir:
+                BWORK.record_unsandboxed(self.run_dir, action=action, engine_id=self.id)
         return res
 
     def describe(self) -> EngineCard:
@@ -331,8 +334,9 @@ class BuiltEngine:
             self._params_cache = [ParamSpec(**p) for p in res["result"]]
         return list(self._params_cache)
 
-    def _item_payload(self, params: dict, unit: UnitSpec, package: Package, horizon: Horizon, seed: int) -> dict:
-        return {
+    def _item_payload(self, params: dict, unit: UnitSpec, package: Package, horizon: Horizon, seed: int,
+                      age_shares: Mapping | None = None) -> dict:
+        p = {
             "params": dict(params or {}),
             "unit": {"id": unit.id, "attributes": dict(unit.attributes or {})},
             "package": {"id": package.id, "components": dict(package.components or {})},
@@ -341,16 +345,22 @@ class BuiltEngine:
                         "windows": {str(k): list(v) for k, v in (horizon.windows or {}).items()}},
             "seed": int(seed),
         }
+        if age_shares:
+            p["age_shares"] = dict(age_shares)
+        return p
 
-    def run(self, params: dict, unit: UnitSpec, package: Package, horizon: Horizon, seed: int) -> Outcomes:
-        payload = self._item_payload(params, unit, package, horizon, seed)
-        res = self._call_worker("run", payload=payload)
+    def run(self, params: dict, unit: UnitSpec, package: Package, horizon: Horizon, seed: int,
+            *, hash_seed: str | None = None, id_salt: str | None = None,
+            age_shares: Mapping | None = None) -> Outcomes:
+        payload = self._item_payload(params, unit, package, horizon, seed, age_shares=age_shares)
+        res = self._call_worker("run", payload=payload, hash_seed=hash_seed, id_salt=id_salt)
         r = res["result"]
         return Outcomes(per_capita=r["per_capita"], windows=r["windows"],
                         cost_drivers=r["cost_drivers"], meta=r["meta"])
 
     def run_batch(self, param_sets: list[dict], unit_or_units, packages,
-                  horizon: Horizon, seed: int) -> list[Outcomes]:
+                  horizon: Horizon, seed: int, *, hash_seed: str | None = None,
+                  id_salt: str | None = None, age_shares: Mapping | None = None) -> list[Outcomes]:
         """Run a batch of `(params, unit, package)` evaluations inside chunked sandboxed workers (`run_many`).
         Accepts either a single `UnitSpec`/`Package` (broadcast across items) or per-item sequences."""
         n = len(param_sets)
@@ -364,10 +374,11 @@ class BuiltEngine:
         out: list[Outcomes] = []
         for a in range(0, n, chunk_sz):
             items = [
-                self._item_payload(p, u, pk, horizon, seed)
+                self._item_payload(p, u, pk, horizon, seed, age_shares=age_shares)
                 for p, u, pk in zip(param_sets[a:a + chunk_sz], units[a:a + chunk_sz], pkgs[a:a + chunk_sz])
             ]
-            res_list = self._call_worker("run_many", payload={"items": items})["result"]
+            res_list = self._call_worker("run_many", payload={"items": items},
+                                         hash_seed=hash_seed, id_salt=id_salt)["result"]
             out.extend(
                 Outcomes(per_capita=r["per_capita"], windows=r["windows"],
                          cost_drivers=r["cost_drivers"], meta=r["meta"])
@@ -375,7 +386,8 @@ class BuiltEngine:
             )
         return out
 
-    def run_many(self, cases: list[tuple[dict, UnitSpec, Package, Horizon, int]]) -> list[Outcomes]:
+    def run_many(self, cases: list[tuple[dict, UnitSpec, Package, Horizon, int]], *,
+                 hash_seed: str | None = None, id_salt: str | None = None) -> list[Outcomes]:
         """Run heterogeneous `(params, unit, package, horizon, seed)` tuples in chunked sandboxed worker calls."""
         if not cases:
             return []
@@ -383,7 +395,8 @@ class BuiltEngine:
         out: list[Outcomes] = []
         for a in range(0, len(cases), chunk_sz):
             items = [self._item_payload(prm, u, pkg, hor, s) for prm, u, pkg, hor, s in cases[a:a + chunk_sz]]
-            res_list = self._call_worker("run_many", payload={"items": items})["result"]
+            res_list = self._call_worker("run_many", payload={"items": items},
+                                         hash_seed=hash_seed, id_salt=id_salt)["result"]
             out.extend(
                 Outcomes(per_capita=r["per_capita"], windows=r["windows"],
                          cost_drivers=r["cost_drivers"], meta=r["meta"])

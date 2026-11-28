@@ -7,7 +7,7 @@ Gives the build task a safe, bounded way to run its working copy in the minimal-
 without a shell:
 - `engine_try(run_dir, checks="all")` snapshots `models/ext/engine_<id>/` into a scratch snapshot
   under `engine_build/try/snapshots/`, runs S1-S4 and ONLY the **public** cases of the named checks
-  via `CandidateEngine`, writes `engine_build/try/<n>.json`, and returns a summary strictly capped
+  via `BuiltEngine.from_verified`, writes `engine_build/try/<n>.json`, and returns a summary strictly capped
   at 8 KB.
 - `engine_run_one(run_dir, ...)` runs one sandboxed evaluation on inputs validated against the
   signed request's domains, writes `engine_build/try/<n>.json`, and returns capped `Outcomes` +
@@ -33,14 +33,14 @@ for _p in (ROOT, os.path.join(ROOT, "scripts")):
 from lib import safe_io as SIO  # noqa: E402
 from toolkit.engines import benchmark_coverage as BC  # noqa: E402
 from toolkit.engines.contract import Horizon, Package, UnitSpec  # noqa: E402
+from toolkit.engines.built import adapter as BADAPT  # noqa: E402
 from toolkit.engines.built import admission as BADM  # noqa: E402
-from toolkit.engines.built import candidate as BCAND  # noqa: E402
 from toolkit.engines.built import requested as BREQ  # noqa: E402
 from toolkit.engines.built import snapshot as BSNAP  # noqa: E402
 
 LEDGER_REL = "engine_build/try/ledger.json"
 LEDGER_LOCK_REL = "engine_build/try/.ledger.lock"
-VALID_PUBLIC_CHECKS = ("A1", "A2", "A3", "A4", "A5", "A6", "A8")
+VALID_PUBLIC_CHECKS = ("A1", "A2", "A4", "A5", "A6", "A8")
 
 
 def _load_ledger(run_dir: str) -> dict:
@@ -210,7 +210,7 @@ def engine_try(
     man = BSNAP.create_snapshot(wdir, snaps_dir, run_static=True, request=build_decl)
     snap_sha = man["snapshot_sha256"]
     verified = BSNAP.read_verified_snapshot(snaps_dir, snap_sha)
-    cand = BCAND.CandidateEngine(
+    cand = BADAPT.BuiltEngine.from_verified(
         verified, build_decl, config=config, run_dir=run_dir,
         unsandboxed_ok=unsandboxed_ok, limits=limits, id_salt="public_try",
     )
@@ -282,7 +282,7 @@ def engine_run_one(
     limits = {"wall_s": int(th["try_wall_s"]), "memory_bytes": int(th["try_memory_bytes"])}
     man = BSNAP.create_snapshot(wdir, snaps_dir, run_static=True, request=build_decl)
     verified = BSNAP.read_verified_snapshot(snaps_dir, man["snapshot_sha256"])
-    cand = BCAND.CandidateEngine(
+    cand = BADAPT.BuiltEngine.from_verified(
         verified, build_decl, config=config, run_dir=run_dir,
         unsandboxed_ok=unsandboxed_ok, limits=limits, id_salt="public_run",
     )

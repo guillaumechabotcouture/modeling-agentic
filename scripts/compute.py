@@ -830,7 +830,7 @@ def _built_engine_bundle_extras(run_dir: str) -> list[str]:
     when `engine_build/` production files exist; never hashed into `_run_files_digest` so RS1 holds."""
     out: list[str] = []
     for name in ("run_state.json", "decision_spec.yaml", "engine_choice.json",
-                 "decision_brief.signoff.json", "decision_spec.signoff.json"):
+                 "decision_spec.signoff.json"):
         p = os.path.join(run_dir, name)
         if os.path.isfile(p) and not os.path.islink(p):
             out.append(p)
@@ -2804,10 +2804,6 @@ FP_HARNESS_OUTPUTS = ("models/allocation_robustness.yaml", "models/claims_spec.y
 # every stored batch. Everything a batch reads is still hashed; the self-test (RS4) fails if an engine-batch job
 # module (toolkit/engines/**, toolkit/analysis/batch.py, trajectories.py) names one of them.
 FP_SIGNOFF_RECORDS = (
-    # toolkit/spec/geometry.py SIGNOFF_FILE, written by freeze() at sign-off and `approve`: who signed, when, the
-    # owner's approvals, and a copy of the geometry declaration with sha256 hashes of the boundary, crosswalk and
-    # units files. Those files themselves stay hashed under data/, and only the gate (geometry.check) reads the record.
-    "data/geometry_signoff.json",
     # toolkit/spec/geometry.py ARTIFACT, written by geometry.run() (stage_machine SIGN refreshes it): the geometry
     # check report, which copies the sign-off's signed_by / at and the owner's approvals (Codex r1 P2-1). Its other
     # content derives from the boundary, crosswalk and units files, which stay hashed; only the gate and the sign-off
@@ -5123,7 +5119,7 @@ def _self_test_signoff_reuse(ok) -> None:
     from unittest import mock
     g = globals()
     recs = tuple(g.get("FP_SIGNOFF_RECORDS", ()))
-    ok(recs == ("data/geometry_signoff.json", "data/input_checks.json") and all("*" not in r and "?" not in r for r in recs),
+    ok(recs == ("data/input_checks.json",) and all("*" not in r and "?" not in r for r in recs),
        f"RS0 the sign-off exclusion is an exact, named list (no wildcard): {recs}")
     with tempfile.TemporaryDirectory() as td:
         td = os.path.realpath(td)
@@ -5143,17 +5139,18 @@ def _self_test_signoff_reuse(ok) -> None:
             w(rd, "models/fn.py", "def f(p):\n    return p\n")
             w(rd, "data/inputs/units.csv", "u,a\n1,2\n")
             w(rd, "data/derived/rates.csv", "u,r\n1,0.5\n")
-            w(rd, "data/geometry_signoff.json", json.dumps(
-                {"signed_by": who, "at": f"2026-11-1{len(who)}T00:00:00Z", "declaration": {"enabled": False},
-                 "approvals": {"x": {"approved_by": "owner"}} if who == "owner" else {}}))
+            w(rd, "decision_spec.signoff.json", json.dumps(
+                {"signed_by": who, "geometry": {
+                    "signed_by": who, "at": f"2026-11-1{len(who)}T00:00:00Z", "declaration": {"enabled": False},
+                    "approvals": {"x": {"approved_by": "owner"}} if who == "owner" else {}}}))
             runs[who] = rd
         with mock.patch.dict(g, {"REPO": repo}):
             fl, fo = (code_fingerprint(runs[k], "models/fn.py::f") for k in ("lead", "owner"))
-            ok(fl == fo, "RS1 lead- and owner-signed geometry records: same reuse fingerprint")
+            ok(fl == fo, "RS1 lead- and owner-signed sign-off records: same reuse fingerprint")
             ok(code_fingerprint(runs["owner"], "models/fn.py::f", confined=True) == fo,
                "RS1b the confined fingerprint ignores the same record")
             for rel in ("data/derived/rates.csv", "data/inputs/units.csv", "data/derivations_record.json",
-                        "data/geometry_signoff.json.extra"):
+                        "data/input_checks.json.extra"):
                 w(runs["owner"], rel, "changed\n")
                 fx = code_fingerprint(runs["owner"], "models/fn.py::f")
                 ok(fx != fo, f"RS2 any other file under data/ ({rel}) still changes the fingerprint")
@@ -5161,18 +5158,18 @@ def _self_test_signoff_reuse(ok) -> None:
             # Codex r1 P2-2: a spec alone is not a v2 run; metadata.json must record pipeline v2
             w(runs["lead"], "metadata.json", json.dumps({"pipeline": "v1"}))
             f0 = code_fingerprint(runs["lead"], "models/fn.py::f")
-            w(runs["lead"], "data/geometry_signoff.json", '{"signed_by": "someone else"}')
+            w(runs["lead"], "data/input_checks.json", '{"signed_by": "someone else"}')
             ok(code_fingerprint(runs["lead"], "models/fn.py::f") != f0,
                "RS3b a run whose metadata records pipeline v1 hashes the record even with a decision_spec.yaml")
             w(runs["lead"], "metadata.json", json.dumps({"pipeline": "v2"}))
             os.remove(os.path.join(runs["lead"], "decision_spec.yaml"))     # a v1 run hashes everything
             f1 = code_fingerprint(runs["lead"], "models/fn.py::f")
-            w(runs["lead"], "data/geometry_signoff.json", '{"signed_by": "owner"}')
+            w(runs["lead"], "data/input_checks.json", '{"signed_by": "owner"}')
             ok(code_fingerprint(runs["lead"], "models/fn.py::f") != f1,
                "RS3 a v1 run (no decision_spec.yaml): its own model may read the record, so it is hashed")
     hits = _engine_batch_reads(recs)
     ok(recs and not hits, f"RS4 no engine-batch job module reads an excluded sign-off record: {hits}")
-    ok(bool(_engine_batch_reads(recs, {"planted.py": "json.load(open('data/geometry_signoff.json'))"})),
+    ok(bool(_engine_batch_reads(recs, {"planted.py": "json.load(open('data/input_checks.json'))"})),
        "RS5 the RS4 scan finds a planted read of an excluded record (it is not vacuous)")
 
 

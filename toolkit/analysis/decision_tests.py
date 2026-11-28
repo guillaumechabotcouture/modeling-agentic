@@ -1,9 +1,5 @@
 """Decision tests (spike lesson 8): does the plan change when a quantity is varied?
 
-W0-B: a spec declares one generic type, `perturb` (what is moved, how, to what: toolkit/spec/perturb.py). Every type
-below is an alias that compiles to it; run_one executes each test in its per-target form (perturb.view), the branches
-below, and records the compiled test with the layer it acts on (`perturb`).
-
 Types (spec `analysis.decision_tests`):
   interaction_rescale  the spike's DT1: the increment of `components` on top of any of `with_any`
                        is rescaled so the engine's interaction odds ratio in the benchmark setting
@@ -161,8 +157,7 @@ def check_departures(A, recs) -> list[dict]:
     from toolkit.engines import benchmark_coverage as BC
     name = A.eng.describe().name
     ref = f"{type(A.eng).__module__}:{type(A.eng).__name__}"
-    from toolkit.spec import perturb as PT
-    tests = {str(t.get("id")): t for t in PT.tests(A.spec["analysis"])}
+    tests = {str(t.get("id")): t for t in (A.spec["analysis"].get("decision_tests") or []) if isinstance(t, dict)}
     recs2 = {}
     for r in recs:
         tid = str(r.get("test_id"))
@@ -258,8 +253,9 @@ def prerun_evidence(spec) -> dict:
     dr = {k: fr[k] for k in names + pnames}
     box = {k: (float(v[0]), float(v[1])) for k, v in fr.items()} if kind == "emulator" else None
     fbox = design_features_box(spec) if kind == "emulator" else None
-    from toolkit.analysis import uncertainty as UQ       # v2-posterior-point: posterior columns at the chosen point
-    point = UQ.posterior_point(spec, UQ.net_effect_sample(spec, eng), PV.params(spec, {k: v[2] for k, v in dr.items()}))
+    from toolkit.engines import hooks as _hooks        # v2-posterior-point: posterior columns at the chosen point
+    point = _hooks.external_posterior_point(spec, _hooks.external_posterior_sample(spec, eng),
+                                           PV.params(spec, {k: v[2] for k, v in dr.items()}))
     return {"kind": kind, "box": box, "features_box": fbox, "point": point, "packages": spec.packages(), "engine": eng}
 
 
@@ -572,10 +568,9 @@ def constraints_of(A) -> tuple:
 def arm_tables(spec) -> list[list[dict]]:
     """Every units table a unit_attribute test of the spec evaluates (Spec.packages prunes over these too, so the
     headline and every arm share one package set)."""
-    from toolkit.spec import perturb as PT
     out = []
-    for dt in PT.tests(spec.raw.get("analysis")):
-        if dt.get("type") == "unit_attribute":
+    for dt in ((spec.raw.get("analysis") or {}).get("decision_tests") or []):
+        if isinstance(dt, dict) and dt.get("type") == "unit_attribute":
             c = unit_attribute_cases(spec, dt)
             out += [] if "why" in c else [_arm_rows(c, new) for _lbl, new in c["cases"]]
     return out
@@ -961,21 +956,8 @@ def _calibration_target(A, dt, z0) -> dict:
 
 
 def run_one(A, dt, z0, ben0, cost0, plan, uq_data, out0=None) -> dict:
-    """W0-B: every test runs as a `perturb` test (toolkit/spec/perturb.py). An older type is an alias compiled to one;
-    the executor below takes the per-target form (perturb.view). The record keeps the test's own type ("perturb" for a
-    native one), and `perturb` holds the compiled test with the layer it acts on and its engine rows."""
-    from toolkit.spec import perturb as PT
-    p = PT.compile(dt)
-    rec = _run_one(A, PT.view(p), z0, ben0, cost0, plan, uq_data, out0)
-    if dt.get("type") == PT.TYPE:
-        rec["type"] = PT.TYPE
-    # the cases evaluated, not requested; a test not run may have evaluated some before stopping: unknown (None)
-    n = len(rec.get("results") or []) if rec.get("status") == "run" else None
-    lay = PT.layer(p, getattr(A.model, "kind", None), len(A.ids), len(A.pk), n_cases=n)
-    if n is None:
-        lay.update(cases=None, engine_rows=None if lay["layer"] == "engine" else 0)
-    rec["perturb"] = dict(p, layer=lay)
-    return rec
+    """Execute a decision test in its canonical per-type form."""
+    return _run_one(A, dt, z0, ben0, cost0, plan, uq_data, out0)
 
 
 def _run_one(A, dt, z0, ben0, cost0, plan, uq_data, out0=None) -> dict:

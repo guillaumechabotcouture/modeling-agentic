@@ -69,7 +69,8 @@ def _is_int(x) -> bool:
 
 
 def _is_num(x) -> bool:
-    return isinstance(x, (int, float)) and not isinstance(x, bool) and math.isfinite(float(x))
+    from toolkit.spec import schema as _SCH
+    return _SCH._isnum(x) and math.isfinite(float(x))
 
 
 def _val_in(val, choices: list) -> bool:
@@ -958,7 +959,7 @@ class RequestedEngine:
 
 
 def sheet_lines(build: Mapping, full_registry_rows: list[dict] | None = None) -> list[str]:
-    """Render the 'Engine to be built' section of decision_spec.signoff_sheet.md."""
+    """Render the 'Engine to be built' section of the sign-off sheet."""
     if not isinstance(build, Mapping):
         return []
     lines = ["## Engine to be built", ""]

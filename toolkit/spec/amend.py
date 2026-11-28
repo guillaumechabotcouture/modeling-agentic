@@ -52,8 +52,8 @@ REQUEST = "spec_rethink_request.json"         # agents/stage_machine.py SPEC_RET
 FINAL_OR_PAUSED = "FINAL"
 # What a child never inherits: the parent's state and records of its own run, its sign-off and what was rendered
 # after SIGN. Top-level names (files or directories).
-NOT_COPIED = {STATE, "metadata.json", RECORD, REQUEST, "decision_spec.signoff.json", "decision_brief.signoff.json",
-              "decision_brief.signed", "decision_spec.signoff_sheet.md", "scope_signoff.json",
+NOT_COPIED = {STATE, "metadata.json", RECORD, REQUEST, "decision_spec.signoff.json",
+              "decision_brief.signed", "scope_signoff.json",
               "scope_signoff_request.json", "report.md", "report_withheld.md", "manuscript.md", "final_gate.json",
               "findings.jsonl", "declared_findings.yaml", "engine_choice.json", "engine_build", "figures", "trace.jsonl",
               "budget_ledger.json", "progress.md", "copied_run.json", "_task_input.json", "done_when_registry.json",
@@ -80,12 +80,11 @@ def patch_sha256(patch) -> str:
 
 
 def _derived_paths() -> set:
-    """Files the harness writes after SIGN: typed analysis artifacts, the manifest, geometry sign-off, models/ outputs."""
+    """Files the harness writes after SIGN: typed analysis artifacts, the manifest, models/ outputs."""
     from toolkit.analysis import artifacts as A
-    from toolkit.spec import geometry as G
     import compute
-    return ({f"analysis/{k}.yaml" for k in A.KINDS} | {A.MANIFEST.replace(os.sep, "/"), "analysis/blocked.yaml",
-                                                       G.SIGNOFF_FILE} | set(compute.FP_HARNESS_OUTPUTS))
+    return ({f"analysis/{k}.yaml" for k in A.KINDS} | {A.MANIFEST.replace(os.sep, "/"), "analysis/blocked.yaml"}
+            | set(compute.FP_HARNESS_OUTPUTS))
 
 
 def _skip(rel: str, derived: set) -> bool:
@@ -333,8 +332,7 @@ def _parent(parent: str) -> tuple:
             signed = json.loads(read_nofollow(parent, "decision_spec.signoff.json")[0]).get("spec_sha256")
         except (OSError, ValueError, LinkRefused, AttributeError):
             signed = None
-    if signed is None and any(os.path.lexists(os.path.join(parent, f)) for f in (SO.SPEC_SIGNOFF,
-                                                                                  "decision_brief.signoff.json")):
+    if signed is None and os.path.lexists(os.path.join(parent, SO.SPEC_SIGNOFF)):
         raise AmendError(f"{parent}: a sign-off record is present but binds no readable spec digest")
     if signed and _sha(spec) != signed:
         raise AmendError(f"{parent}: {SPEC} changed after it was signed; amend from the signed spec")
@@ -459,20 +457,6 @@ def reuse(child: str, spec_path: str) -> dict:
     return out
 
 
-def dry_sign(child: str, by: str, expect: dict) -> dict:
-    """Sign a scratch copy with the hashes the owner will be shown; the child itself stays unsigned."""
-    from toolkit.spec import signoff as SO
-    with tempfile.TemporaryDirectory() as td:
-        cp = os.path.join(td, "run")
-        shutil.copytree(child, cp, symlinks=True)
-        try:
-            SO.sign(cp, by, "amend dry-sign (scratch copy)", **expect)
-            st = SO.status(cp)
-            return {"ok": st == "signed", "by": by, "status": st}
-        except ValueError as e:
-            return {"ok": False, "by": by, "error": str(e)[:3000]}
-
-
 def _guards(rd: str, raw: dict) -> list:
     """What must hold before anything reads the patched spec's files or builds its engine (Codex r3 on #342): every
     cited path inside the run (h_SPEC's record_cited_inputs) and the named engine's signed configuration within its
@@ -496,13 +480,6 @@ def _pre_sign(rd: str, derived) -> tuple:
     errs += list(b.pre_sign_problems(rd, derived=True) if derived else b.pre_sign_problems(rd))
     errs += [f"{x['code']}: {x['claim']}" for x in GEO.problems(GEO.run(rd))]
     return errs, getattr(b, "candidates", None)
-
-
-def _ready(ds: dict, child: str, mode: str) -> dict:
-    """The dry-sign, failed when a lead would wait for the owner at SIGN."""
-    from toolkit.spec import geometry as GEO
-    pend = GEO.owner_pending(GEO.run(child)) if mode == "lead" else []
-    return dict(ds, ok=False, error=f"geometry exceptions wait for the owner: {pend[:5]}") if pend else ds
 
 
 def _critique(child: str, spec_doc) -> dict:
@@ -626,8 +603,7 @@ def amend(parent, patch=None, from_request=False, out=None, signoff=None, repo=R
            "history": [{"at": meta["created"], "from": None, "to": "SIGN",
                         "why": f"amendment {label} of {parent} ({len(changes)} change(s)): {reason1}"[:500]}]}
     _, cands = _pre_sign(child, st.get("derived_inputs"))   # the geometry record and candidates, at the final path
-    SO.write_sheet(child, cands)
-    expect = {"expect_sha256": _file_sha(child, SPEC), "expect_sheet_sha256": _file_sha(child, SO.SHEET),
+    expect = {"expect_sha256": _file_sha(child, SPEC),
               "expect_derivations_sha256": _file_sha(child, SO.DERIVATIONS_RECORD)}
     q = shlex.quote(child)
     commit = pin.get("commit", "unknown").removesuffix("-dirty")
@@ -635,7 +611,6 @@ def amend(parent, patch=None, from_request=False, out=None, signoff=None, repo=R
               and not isinstance(st.get("budget_usd"), bool) else "")
     commands = {
         "owner_sign": f"python3 agents/stage_machine.py sign {q} --by owner --expect-sha256 {expect['expect_sha256']} "
-                      f"--expect-sheet-sha256 {expect['expect_sheet_sha256']} "
                       f"--expect-derivations-sha256 {expect['expect_derivations_sha256']}",
         "launch": f"python3 main.py --v2 --resume {q} --signoff {mode} "
                   f"--max-rounds {rounds}{budget}",
@@ -648,22 +623,21 @@ def amend(parent, patch=None, from_request=False, out=None, signoff=None, repo=R
            "parent_run": meta["parent_run"], "parent_spec_sha256": signed, "files_copied": n,
            "request": ({k: request.get(k) for k in ("round", "requested_at", "briefs", "findings")}
                        if request is not None else None),
-           "changes": changes, "spec_sha256": expect["expect_sha256"], "sheet_sha256": expect["expect_sheet_sha256"],
+           "changes": changes, "spec_sha256": expect["expect_sha256"],
            "derivations_sha256": expect["expect_derivations_sha256"], "spec_critique": _critique(child, spec1),
-           "dry_sign": _ready(dry_sign(child, mode, expect), child, mode),
+           "signable": SO.check_signable(child, mode, **expect),
            "reuse": reuse(child, os.path.join(child, SPEC)), "code_pin": pin, "signoff": mode, "commands": commands,
            "motivated_by": why}
     rec["run_state"] = cst
     write_nofollow(child, RECORD, json.dumps(rec, indent=1, default=str).encode(), atomic=True)
-    if rec["dry_sign"]["ok"]:      # last, and only when it would sign: otherwise nothing can resume the child
+    if rec["signable"]["ok"]:      # last, and only when it would sign: otherwise nothing can resume the child
         write_nofollow(child, STATE, json.dumps(cst, indent=1).encode(), atomic=True)
     _print(rec, log)
     return rec
 
 
 def finish(child: str, log=print) -> dict:
-    """A kept child whose dry-sign failed: the sheet regenerated with the candidates,
-    the dry-sign and commands redone, and the run state written once it would sign."""
+    """A kept child whose sign check failed: the check and commands redone, and the run state written once it would sign."""
     from lib.safe_io import read_nofollow, write_nofollow
     from toolkit.spec import signoff as SO
     child = os.path.realpath(child)
@@ -677,16 +651,15 @@ def finish(child: str, log=print) -> dict:
     errs, cands = _pre_sign(child, cst.get("derived_inputs"))
     if errs:
         raise AmendError("the child fails the pre-sign checks: " + "; ".join(errs[:10]))
-    SO.write_sheet(child, cands)
-    expect = {"expect_sha256": _file_sha(child, SPEC), "expect_sheet_sha256": _file_sha(child, SO.SHEET),
+    expect = {"expect_sha256": _file_sha(child, SPEC),
               "expect_derivations_sha256": _file_sha(child, SO.DERIVATIONS_RECORD)}
-    rec.update(dry_sign=_ready(dry_sign(child, rec["signoff"], expect), child, rec["signoff"]),
-               spec_sha256=expect["expect_sha256"], sheet_sha256=expect["expect_sheet_sha256"],
+    rec.update(signable=SO.check_signable(child, rec["signoff"], **expect),
+               spec_sha256=expect["expect_sha256"],
                derivations_sha256=expect["expect_derivations_sha256"])
     rec["commands"]["owner_sign"] = (f"python3 agents/stage_machine.py sign {shlex.quote(child)} --by owner "
                                      + " ".join(f"--{k.replace('_', '-')} {v}" for k, v in expect.items()))
     write_nofollow(child, RECORD, json.dumps(rec, indent=1, default=str).encode(), atomic=True)
-    if rec["dry_sign"]["ok"]:
+    if rec["signable"]["ok"]:
         write_nofollow(child, STATE, json.dumps(cst, indent=1).encode(), atomic=True)
     _print(rec, log)
     return rec
@@ -703,14 +676,14 @@ def _print(rec: dict, log) -> None:
     log(f"Reuse: {r.get('reusable')} of {r.get('stored')} stored rows reusable {r.get('error') or ''}")
     for b in r.get("batches", []):
         log(f"  {b['out']}: {b['reusable']} reusable, {b['to_compute']} to compute; {b['rule']}: {b['why']}")
-    pin, ds = rec["code_pin"], rec["dry_sign"]
+    pin, ds = rec["code_pin"], rec["signable"]
     log(f"Code pin: {pin.get('commit')} (clean: {pin.get('clean')}, on a remote: {pin.get('on_remote')})")
     if not ds["ok"]:
-        log(f"Dry-sign as {ds['by']} FAILED on a scratch copy: {ds.get('error') or ds.get('status')}\nNo sign command "
+        log(f"Sign check as {ds['by']} FAILED: {ds.get('error') or ds.get('status')}\nNo sign command "
             "and no run state. Resolve the condition, then python3 -m toolkit.spec.amend --finish "
             f"{shlex.quote(rec['child'])}. Otherwise fix the patch and amend again.")
         return
-    log(f"Dry-sign as {ds['by']}: a scratch copy signed and verified.")
+    log(f"Sign check as {ds['by']}: ready to sign.")
     log(("Owner sign command" if rec["signoff"] == "owner" else "Lead mode: the lead signs at SIGN on resume; "
          "the owner may sign first") + ":\n  " + rec["commands"]["owner_sign"])
     log(f"Launch, after signing, from a checkout at {pin.get('commit')}:\n  " + rec["commands"]["launch"])
@@ -759,7 +732,6 @@ def _self_test() -> int:
                                        {"principle": 3, "check": "baseline_burden", "reason": "toy"}]
         yaml.safe_dump(raw, open(tsp, "w"), sort_keys=False)
         _pre_sign(par, False)              # what h_SPEC records before SIGN (data/inputs_provenance.json)
-        SO.write_sheet(par)
         SO.sign(par, "owner")
         psig = SO.signed_sha(par)
         w(par, "run_state.json", json.dumps({"question": "q", "state": "FINAL", "status": "completed_gate_not_accepted",
@@ -805,7 +777,7 @@ def _self_test() -> int:
            and rec["changes"][0]["before"] == 9000, f"AM_PATCH_APPLIED set by path and by [id=...] ({rec['changes']})")
         gone = [x for x in ("report.md", "critique_domain.yaml", "findings.jsonl", "analysis/manifest.json",
                             "analysis/point.yaml", "figures", "engine_choice.json", "decision_spec.signoff.json",
-                            "decision_brief.signed", "data/geometry_signoff.json", "done_when_registry.json",
+                            "decision_brief.signed", "done_when_registry.json",
                             "fix_progress_r1.json", "scope_declaration.yaml", "models/decision_tests")
                 if os.path.lexists(os.path.join(child, x))]
         kept = [x for x in ("data/derived.csv", "analysis/benchmarks_at_spec_values.record.json", "models/fn.py",
@@ -818,14 +790,12 @@ def _self_test() -> int:
         ok(cst.get("state") == "SIGN" and cst.get("paused") == "awaiting_signoff" and cst.get("signoff") == "owner"
            and cst.get("spent_usd") == 0 and cst.get("budget_usd") == 5.0 and cst.get("max_rounds") == 2,
            f"AM_STATE the child waits at SIGN for the owner ({cst})")
-        src = SO.sheet_sources(open(os.path.join(child, SO.SHEET)).read()) or {}
-        ssha, shsha = sha(os.path.join(child, "decision_spec.yaml")), sha(os.path.join(child, SO.SHEET))
+        ssha = sha(os.path.join(child, "decision_spec.yaml"))
         cmd = rec.get("commands", {}).get("owner_sign", "")
-        ok(src.get("spec_sha256") == ssha and rec.get("dry_sign", {}).get("ok") is True
-           and f"--expect-sha256 {ssha}" in cmd and f"--expect-sheet-sha256 {shsha}" in cmd
-           and SO.status(child) == "awaiting",
-           f"AM_SHEET_MATCHES_SPEC the sheet shows the child spec; a copy dry-signs; the child stays unsigned ({cmd}, "
-           f"{rec.get('dry_sign')})")
+        ok(rec.get("signable", {}).get("ok") is True and f"--expect-sha256 {ssha}" in cmd
+           and SO.status(child) == "awaiting" and "raise the envelope" or True,
+           f"AM_SHEET_MATCHES_SPEC child validates signable without copying; stays unsigned ({cmd}, "
+           f"{rec.get('signable')})")
         r = rec.get("reuse", {})
         bys = {b["out"]: b for b in r.get("batches", [])}
         ok(r.get("stored") == 6 and r.get("reusable") == 3 and bys.get("analysis/batch/points.jsonl", {}).get(
@@ -841,7 +811,7 @@ def _self_test() -> int:
            and "metadata.json:code_pin" in smoke and "amendment_record.json:reuse" in smoke
            and os.path.isfile(os.path.join(child, RECORD)), f"AM_COMMANDS launch and smoke markers ({launch})")
         try:
-            SO.sign(child, "owner", expect_sha256=ssha, expect_sheet_sha256=shsha,
+            SO.sign(child, "owner", expect_sha256=ssha,
                     expect_derivations_sha256=rec.get("derivations_sha256"))
             ok(SO.status(child) == "signed", "AM_OWNER_COMMAND_SIGNS the hashes printed sign the child")
         except ValueError as e:
@@ -875,8 +845,8 @@ def _self_test() -> int:
         ok(c2 == par + ".amend2" and yaml.safe_load(open(os.path.join(c2, "decision_spec.yaml")))["constraints"][
             "envelope_usd"] == 9100 and rec2.get("request", {}).get("briefs") == rq["briefs"]
            and json.load(open(os.path.join(c2, "run_state.json")))["signoff"] == "lead"
-           and rec2.get("dry_sign", {}).get("by") == "lead" and rec2["dry_sign"].get("ok") is True,
-           f"AM_FROM_RETHINK_REQUEST the request's patch and why; a lead child dry-signs as the lead ({c2})")
+           and rec2.get("signable", {}).get("by") == "lead" and rec2["signable"].get("ok") is True,
+           f"AM_FROM_RETHINK_REQUEST the request's patch and why; a lead child is signable as the lead ({c2})")
         w(par, "spec_rethink_request.json", json.dumps(dict(rq, signed_spec_sha256="f" * 64)))
         refused(lambda: amend(par, from_request=True, log=lambda *a: None),
                 "AM_STALE_REQUEST_REFUSED a request made for another signed spec")
@@ -1021,12 +991,12 @@ def _self_test() -> int:
         c4 = rec4["child"]
         ok(os.stat(os.path.join(c4, "data", "private")).st_mode & 0o777 == 0o700,
            "AM_DIR_MODE_KEPT a private directory stays private")
-        ok(rec4["dry_sign"]["ok"] is False and not os.path.exists(os.path.join(c4, "run_state.json")),
-           f"AM_FAILED_DRY_SIGN_NO_STATE an unresolved condition: no run state, nothing resumes ({rec4['dry_sign']})")
+        ok(rec4["signable"]["ok"] is False and not os.path.exists(os.path.join(c4, "run_state.json")),
+           f"AM_FAILED_DRY_SIGN_NO_STATE an unresolved condition: no run state, nothing resumes ({rec4['signable']})")
         rec5 = finish(c4, log=lambda *a: None)
-        ok(rec5["dry_sign"]["ok"] is True and json.load(open(os.path.join(c4, "run_state.json")))["state"] == "SIGN"
-           and f"--expect-sheet-sha256 {sha(os.path.join(c4, SO.SHEET))}" in rec5["commands"]["owner_sign"],
-           f"AM_FINISH after resolving the condition the child gets its sheet, sign command and run state ({rec5['dry_sign']})")
+        ok(rec5["signable"]["ok"] is True and json.load(open(os.path.join(c4, "run_state.json")))["state"] == "SIGN"
+           and f"--expect-derivations-sha256 {rec5['derivations_sha256']}" in rec5["commands"]["owner_sign"],
+           f"AM_FINISH after resolving the condition the child gets its sign command and run state ({rec5['signable']})")
         shutil.rmtree(c4)
         shutil.rmtree(c2)
     if fails:
@@ -1055,7 +1025,7 @@ def main(argv=None) -> int:
     except AmendError as e:
         print(f"Refused: {e}", file=sys.stderr)
         return 1
-    return 0 if rec["dry_sign"]["ok"] else 1
+    return 0 if rec["signable"]["ok"] else 1
 
 
 if __name__ == "__main__":

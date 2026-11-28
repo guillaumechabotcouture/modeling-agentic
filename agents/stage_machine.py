@@ -49,12 +49,10 @@ from agents.engine_build_stage import (  # noqa: E402
     ENGINE_ADMIT_COMPUTE_CAP_USD,
     ENGINE_DECLINED,
     ENGINE_NOT_ADMITTED,
-    ENGINE_REFERENCE_CAP_USD,
     ENGINE_REVIEW_CAP_USD,
     EngineBuildMixin,
     MAX_CRITIQUE_ROUNDS,
     MAX_ENGINE_BUILD_TRIES,
-    MAX_ENGINE_REFERENCE_TRIES,
     MAX_ENGINE_REPAIRS,
     MIN_TASK_ALLOWANCE_USD,
     POST_CHOICE_STATES,
@@ -73,7 +71,6 @@ from agents.report_render import (  # noqa: E402
     PROTECTED_BY_FIX,
     SCOPE_SIGNOFF,
     SIGNOFF_FILE,
-    SIGNOFF_SHEET,
     SPEC_RETHINK_REQUEST,
     STATE_FILE,
     STATUS_MARK,
@@ -454,15 +451,6 @@ def _signoff(run_dir: str) -> dict | None:
         return None
 
 
-def sign(run_dir: str, by: str, note: str = "", expect_sha256: str | None = None,
-         expect_derivations_sha256: str | None = None, expect_sheet_sha256: str | None = None) -> dict:
-    """Sign the run's decision spec via the analysis backend (`toolkit/spec/signoff.py`)."""
-    return AB.backend("toolkit").sign(
-        run_dir, by, note, expect_sha256=expect_sha256,
-        expect_derivations_sha256=expect_derivations_sha256,
-        expect_sheet_sha256=expect_sheet_sha256)
-
-
 def evidence_gate(run_dir: str, engine: tuple | None = None, signoff: str | None = None) -> list[str]:
     """F6 (#218): the registered preconditions of a signed run, recomputed from its files (the sign-off record
     compared; the engine chosen in engine_choice.json, or `engine`): checked at ENGINE_CHOICE on the engine picked and
@@ -517,6 +505,14 @@ def rethink_request(run_dir: str, round_n: int, signoff: str = "owner") -> dict:
 
 
 OWNER_REQUEST_PRODUCER = "agents/stage_machine.py FIX_LOOP (owner amendments)"
+
+
+def sign(run_dir: str, by: str, note: str = "", expect_sha256: str | None = None,
+         expect_derivations_sha256: str | None = None) -> dict:
+    """Sign the run's decision spec via the analysis backend (`toolkit/spec/signoff.py`)."""
+    return AB.backend("toolkit").sign(
+        run_dir, by, note, expect_sha256=expect_sha256,
+        expect_derivations_sha256=expect_derivations_sha256)
 
 
 def pending_amendments(ledger: dict, resolved=()) -> list[str]:
@@ -617,7 +613,7 @@ class Machine(EngineBuildMixin):
     def _charge_interrupted_entry(self, j: dict) -> None:
         chg = self._interrupted_charge(j)
         self.st.spent_usd += chg
-        if (j.get("build_budget") or j.get("task") in ("build_engine", "build_reference", "critique_engine")) and isinstance(
+        if (j.get("build_budget") or j.get("task") in ("build_engine", "critique_engine")) and isinstance(
             self.st.engine_build, dict
         ):
             self.st.engine_build["spent_usd"] = round(
@@ -1366,8 +1362,6 @@ class Machine(EngineBuildMixin):
         if drafted:
             try:
                 errs = self._spec_checks(rd)
-                if not errs and self.st.derived_inputs:
-                    self._write_sheet(rd)
             except Exception as e:  # noqa: BLE001
                 errs = [f"spec unreadable: {e}"]
             if errs and not res.ok:
@@ -1477,17 +1471,17 @@ class Machine(EngineBuildMixin):
             return [f"the spec's cited paths could not be listed, so no check reads them: {type(e).__name__}: {e}"]
 
     def _evidence_assess(self, rd: str) -> tuple[dict, dict]:
-        """The spec and the evidence stage's assessment of it (toolkit/spec/evidence_draft.py assess), with a dossier
+        """The spec and the evidence stage's assessment of it (toolkit/spec/evidence_dossier.py assess), with a dossier
         path that the harness, the gate or a task writes added to its spec problems. SPEC and EVIDENCE share it."""
-        from toolkit.spec import evidence_draft as EDR
+        from toolkit.spec import evidence_dossier as EDR
         raw = EDR._spec(rd)
         a = EDR.assess(rd, raw)
         rel = a.get("rel")
         if rel and not a.get("draftable") and owned_path(rd, os.path.normpath(rel).replace(os.sep, "/"), tuple(
-                p for p in harness_owned() if p not in ("data/*", EDR.ED.DOSSIER_FILE))):
+                p for p in harness_owned() if p not in ("data/*", EDR.DOSSIER_FILE))):
             a["spec_problems"] = a["spec_problems"] + [   # Codex r2 P1-5: a file the harness or a task writes
                 f"evidence.dossier {rel!r} is a file the harness, the gate or a task writes: name "
-                f"{EDR.ED.DOSSIER_FILE}"]
+                f"{EDR.DOSSIER_FILE}"]
         return raw, a
 
     def _derive(self, rd: str | None = None) -> list[str]:
@@ -1498,15 +1492,9 @@ class Machine(EngineBuildMixin):
         rep = P.derive(rd or self.run_dir, unsandboxed_ok=self.st.derive_unsandboxed)
         return [f"{p['code']}: {p['claim']}" for p in rep["problems"]]
 
-    def _write_sheet(self, rd: str | None = None) -> None:
-        """The sign-off sheet, with the source hashes it was made from, published with no link followed (review
-        round 3: signoff.write_sheet)."""
-        from toolkit.spec import signoff
-        signoff.write_sheet(rd or self.run_dir, getattr(self.backend, "candidates", None))
-
     def h_SIGN(self):
         mode = self.st.signoff
-        from toolkit.spec import evidence_draft as EDR
+        from toolkit.spec import evidence_dossier as EDR
         if not self._signed_before() and EDR.read_record(self.run_dir) is None:
             # Codex r1 P2-6: an unsigned run saved at SIGN under the earlier order has had no evidence stage
             return self._go("EVIDENCE", "earlier order: the evidence stage runs before sign-off")
@@ -1569,7 +1557,7 @@ class Machine(EngineBuildMixin):
 
     def _evidence_note(self) -> str:
         """The evidence stage's declared gaps, for the lead's sign-off note (counts; the record holds the inputs)."""
-        from toolkit.spec import evidence_draft as EDR
+        from toolkit.spec import evidence_dossier as EDR
         rec = EDR.read_record(self.run_dir) or {}
         if rec.get("status") in (None, "not_required"):
             return ""
@@ -1584,11 +1572,11 @@ class Machine(EngineBuildMixin):
 
     def h_EVIDENCE(self):
         """v2 autonomy 1B-ii (D1): the evidence dossier, before SIGN. No decision inputs needed: a pass with no task.
-        Otherwise the harness scaffolds each missing entry with what execution uses (toolkit/spec/evidence_draft.py)
+        Otherwise the harness scaffolds each missing entry with what execution uses (toolkit/spec/evidence_dossier.py)
         and the bounded draft_evidence task fills the evidence, at most EDR.MAX_TRIES times in the run, each time with
-        the signer's check's problems; then the record (evidence/dossier_draft.json) and the sign-off sheet, which
-        binds the dossier's sha256. A spec signed under the earlier order (SIGN before EVIDENCE) is left as signed."""
-        from toolkit.spec import evidence_draft as EDR
+        the signer's check's problems; then the record (evidence/dossier_draft.json).
+        A spec signed under the earlier order (SIGN before EVIDENCE) is left as signed."""
+        from toolkit.spec import evidence_dossier as EDR
         rd = self.run_dir
         if self._signed_before():       # Codex r1 P1-2/3: SIGN checks the signature, its signer and the approvals
             return self._go("SIGN", "evidence: the spec was signed before this stage (earlier order); the dossier "
@@ -1616,7 +1604,7 @@ class Machine(EngineBuildMixin):
         if a["needed"]:
             a = EDR.assess(rd, raw)
             if a["problems"] and not a.get("draftable"):
-                notes.append(f"the spec names {a['rel']}: only {EDR.ED.DOSSIER_FILE} is drafted in the run")
+                notes.append(f"the spec names {a['rel']}: only {EDR.DOSSIER_FILE} is drafted in the run")
             max_ev = EDR.MAX_TRIES + (1 if self.st.tries.get("evidence_bonus") else 0)
             while a["problems"] and a.get("draftable") and drafts() < max_ev:
                 n = drafts()
@@ -1667,8 +1655,7 @@ class Machine(EngineBuildMixin):
                     # (r2 P2-7: with h_SPEC's own arguments)
                     (self.backend.pre_sign_problems(rd, derived=True) if self.st.derived_inputs
                      else self.backend.pre_sign_problems(rd))
-                self._write_sheet(rd)        # the sheet records the dossier's sha256: written after the dossier
-            except Exception as e:  # noqa: BLE001 -- SIGN refuses without a current sheet, and says so
+            except Exception as e:  # noqa: BLE001 -- SIGN checks the dossier directly
                 self.log(f"[machine] the sign-off sheet could not be written: {type(e).__name__}: {e}")
         if rec["status"] == "incomplete":
             self.log(f"[machine] the evidence dossier still has {len(a['problems'])} problem(s) after "
@@ -2860,7 +2847,7 @@ def _self_test() -> int:
         ok(hist[:5] == ["EVIDENCE", "SIGN", "ENGINE_CHOICE", "ANALYZE", "CRITIQUE"]
            and "FIX_LOOP" in hist
            and hist[-2:] == ["GATE", "FINAL"], f"T11 the path SPEC..FIX_LOOP..WRITE..FINAL {hist}")
-        from toolkit.spec import evidence_draft as EDR_
+        from toolkit.spec import evidence_dossier as EDR_
         ok("draft_evidence" not in T.calls and (EDR_.read_record(d) or {}).get("status") == "not_required",
            f"T11b a spec whose options need no decision input passes EVIDENCE with no task ({EDR_.read_record(d)})")
         rows = FX.impact_rows(d)
@@ -4253,18 +4240,6 @@ def _self_test() -> int:
                             hashlib.sha256(open(os.path.join(d70, AB.SPEC_FILE), "rb").read()).hexdigest()])
             except SystemExit as e:
                 rc2 = e.code
-        d72, o72 = os.path.join(td, "t72"), os.path.join(td, "t72out")
-        os.makedirs(d72)
-        os.makedirs(o72)
-        _S.toy_spec(d72)
-        open(os.path.join(o72, "v"), "w").write("untouched")
-        os.symlink(os.path.join(o72, "v"), os.path.join(d72, SIGNOFF_SHEET))
-        try:
-            Machine._write_sheet(type("M", (), {"run_dir": d72, "backend": None})())
-        except (ValueError, OSError):
-            pass
-        ok(open(os.path.join(o72, "v")).read() == "untouched",
-           "T72 the sign-off sheet is published without following a link (round 3, P1-2)")
         # T73 (round 4, P1-2): run_state.json and the machine's records never follow a planted .tmp link
         d73, o73 = os.path.join(td, "t73"), os.path.join(td, "t73out")
         os.makedirs(d73)
@@ -5604,7 +5579,8 @@ def _self_test_derived(ok, td: str) -> None:
         m = Machine(d, StubTasks({"spec": draft}), st,
                     backend=toolkit, log=lambda *a: None, cross_engine_check=False)
         m.run(max_steps=4)
-        sheet = open(os.path.join(d, SIGNOFF_SHEET)).read() if os.path.exists(os.path.join(d, SIGNOFF_SHEET)) else ""
+        from toolkit.spec import signoff as _SO
+        sheet = _SO.sheet(d, getattr(toolkit, "candidates", None))
         ok(m.st.state == "SIGN" and m.st.paused == "awaiting_signoff" and "NeedsGroup" in sheet
            and "engine_attribute_unbound" in sheet and "group" in sheet,
            f"DI8a engine auto: the full checks run per candidate in SPEC, before SIGN; the candidate that needs an "
@@ -5637,7 +5613,8 @@ def _self_test_evidence(ok, td: str) -> None:
     inputs (toolkit/spec/toy_engines.py ToyDossierEngine)."""
     import yaml
     from v2_tasks import StubTasks
-    from toolkit.spec import evidence_dossier as ED, evidence_draft as EDR, toy_engines as TE
+    from toolkit.spec import evidence_dossier as ED, toy_engines as TE
+    EDR = ED
     TE.enable_for_test()
     toolkit = AB.backend("toolkit")
     full = ED.toy_entries()
@@ -5685,7 +5662,7 @@ def _self_test_evidence(ok, td: str) -> None:
     class Stale(StubTasks):
         def sign_spec(self, run_dir):
             if self.calls.count("sign_spec") == 0:
-                os.remove(os.path.join(run_dir, SIGNOFF_SHEET))
+                os.remove(os.path.join(run_dir, ED.DOSSIER_FILE))
             return super().sign_spec(run_dir)
     d = os.path.join(td, "ev_repair")
     os.makedirs(d)
@@ -5708,11 +5685,11 @@ def _self_test_evidence(ok, td: str) -> None:
        and not os.path.exists(os.path.join(m.run_dir, SIGNOFF_FILE)),
        f"T_EVIDENCE_EXHAUSTED the check is never loosened: after {EDR.MAX_TRIES} drafts "
        f"the run waits for the owner, unsigned ({hist}; {T.calls})")
-    # T_EVIDENCE_OWNER: under --signoff owner the drafted dossier is on the sheet the owner signs
+    # T_EVIDENCE_OWNER: under --signoff owner the drafted dossier is on the sheet the owner views
     m, T = setup("ev_owner", "owner", {"evidence": fill})
     until(m)
-    sheet = open(os.path.join(m.run_dir, SIGNOFF_SHEET)).read() if os.path.exists(
-        os.path.join(m.run_dir, SIGNOFF_SHEET)) else ""
+    from toolkit.spec import signoff as SO
+    sheet = SO.sheet(m.run_dir)
     ok(m.st.state == "SIGN" and m.st.paused == "awaiting_signoff" and ED.SECTION in sheet, f"T_EVIDENCE_OWNER the "
        f"owner is shown the drafted dossier on the sheet ({m.st.state}, {m.st.paused})")
     toolkit.sign(m.run_dir, "owner")
@@ -5762,8 +5739,6 @@ def _self_test_evidence(ok, td: str) -> None:
     d = os.path.join(td, "ev_resume")
     os.makedirs(d)
     ED.toy_dossier_spec(d)
-    from toolkit.spec import signoff as SO
-    SO.write_sheet(d)
     toolkit.sign(d, "owner")
     before = open(os.path.join(d, ED.DOSSIER_FILE), "rb").read()
     T = StubTasks({})
@@ -5778,7 +5753,6 @@ def _self_test_evidence(ok, td: str) -> None:
     d = os.path.join(td, "ev_leadsigned")
     os.makedirs(d)
     ED.toy_dossier_spec(d)
-    SO.write_sheet(d)
     toolkit.sign(d, "lead")
     m = Machine(d, StubTasks({}), RunState(question="q", state="EVIDENCE", signoff="owner"), backend=toolkit,
                 log=lambda *a: None, cross_engine_check=False)
@@ -5789,7 +5763,6 @@ def _self_test_evidence(ok, td: str) -> None:
     d = os.path.join(td, "ev_stale")
     os.makedirs(d)
     ED.toy_dossier_spec(d)
-    SO.write_sheet(d)
     toolkit.sign(d, "owner")
     rec0 = open(os.path.join(d, SIGNOFF_FILE), "rb").read()
     open(os.path.join(d, ED.DOSSIER_FILE), "a").write("# edited after signing\n")
@@ -5838,9 +5811,9 @@ def _self_test_evidence(ok, td: str) -> None:
     m.step()
     ok(m.st.state == "FINAL" and m.st.status == "budget_exhausted",
        f"T_SIGN_BUDGET ({m.st.state}, {m.st.status}, {m.st.paused})")
-    # T_DELIVERABLE_DOSSIER (Codex r1 P1-5): the deliverable may not be the dossier or the sheet
+    # T_DELIVERABLE_DOSSIER (Codex r1 P1-5): the deliverable may not be the dossier
     raw = yaml.safe_load(open(os.path.join(d, AB.SPEC_FILE)))
-    for name in (ED.DOSSIER_FILE, SIGNOFF_SHEET, "src[1].yaml"):     # r2 P1-1: a name that is not its own glob
+    for name in (ED.DOSSIER_FILE, "src[1].yaml"):     # r2 P1-1: a name that is not its own glob
         raw["evidence"] = {"dossier": "src[1].yaml"}
         raw["deliverable_file"] = {"path": name, "columns": {"unit": "id"}}
         yaml.safe_dump(raw, open(os.path.join(d, AB.SPEC_FILE), "w"))
@@ -6036,7 +6009,7 @@ def _self_test_hb2_spec(ok, td: str, toolkit, new_run) -> None:
 
     # HS6: the evidence stage's spec problems (decision inputs with no dossier named) are heard at SPEC, in the same
     # try, not one stage later (tb R2: EVIDENCE sent the spec back for 7 missing decision inputs)
-    from toolkit.spec import evidence_draft as EDR
+    from toolkit.spec import evidence_dossier as EDR
     real = EDR.assess
     try:
         EDR.assess = lambda rd, raw=None: dict(real(rd, raw), spec_problems=["the options need 7 decision input(s)"])
@@ -6545,8 +6518,7 @@ def _self_test_acquire(ok, td: str) -> None:
         AM._pre_sign(d_sg, False)
         fk_sg = _fetch_keep(d_sg, "IND1", "csv", ["population"])
         promo_sg = ACQ.promote(d_sg, fk_sg["keep"], fk_sg["wanted_map"], allowlist_path=al_p)
-        SO.write_sheet(d_sg)
-        sheet_txt = open(os.path.join(d_sg, SIGNOFF_SHEET), encoding="utf-8").read()
+        sheet_txt = SO.sheet(d_sg)
         rec_sg = SO.sign(d_sg, "owner")
         st_sg = RunState(question="q", state="ANALYZE", signoff="owner", acquire="auto",
                          acquired={"rounds": 1, "closed": True, "inventory_sha256": promo_sg["inventory_sha256"]})
@@ -6669,9 +6641,7 @@ def main(argv=None) -> int:
     s2.add_argument("--expect-sha256", default=None,
                     help="the sha256 of the decision_spec.yaml the owner read; a different spec is not signed")
     s2.add_argument("--expect-derivations-sha256", default=None,
-                    help="the sha256 of data/derivations_record.json when the sheet was shown ('none': there was none)")
-    s2.add_argument("--expect-sheet-sha256", default=None,
-                    help="the sha256 of the sign-off sheet the owner read ('none': there was none)")
+                    help="the sha256 of data/derivations_record.json when shown ('none': there was none)")
     a = ap.parse_args(argv)
     if a.cmd == "status":
         st = load_state(a.run_dir)
@@ -6684,8 +6654,7 @@ def main(argv=None) -> int:
         return 0
     b = AB.backend()
     kw = {k: v for k, v in (("expect_sha256", a.expect_sha256),
-                            ("expect_derivations_sha256", a.expect_derivations_sha256),
-                            ("expect_sheet_sha256", a.expect_sheet_sha256)) if v}
+                            ("expect_derivations_sha256", a.expect_derivations_sha256)) if v}
     try:
         rec = b.sign(a.run_dir, a.by, a.note, **kw)
     except ValueError as e:

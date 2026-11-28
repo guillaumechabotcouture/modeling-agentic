@@ -170,7 +170,7 @@ def _self_test() -> int:
         json.dump({"state": "FINAL", "history": [{"to": "ENGINE_BUILD"}, {"to": "ENGINE_REVIEW"}]},
                   open(os.path.join(be_dir, "run_state.json"), "w"))
         json.dump({"request_sha256": "a" * 64}, open(os.path.join(be_dir, "engine_build", "request.json"), "w"))
-        json.dump({"status": "admitted", "hidden_commitment": "b" * 64, "reuse_key": "c" * 64},
+        json.dump({"status": "admitted", "hidden_commitment": "b" * 64},
                   open(os.path.join(be_dir, "engine_build", "admission.json"), "w"))
         open(os.path.join(be_dir, "engine_build", "admission_sheet.md"), "w").write("# Admission sheet\n")
         json.dump({"by": "lead", "snapshot_sha256": "d" * 64},
@@ -188,7 +188,6 @@ def _self_test() -> int:
             "engine_build/request.json:request_sha256",
             "engine_build/admission.json:status=admitted",
             "engine_build/admission.json:hidden_commitment",
-            "engine_build/admission.json:reuse_key",
             "engine_build/admission_sheet.md",
             "engine_build/signoff.json:by",
             "engine_choice.json:engine.ref=toolkit.engines.built:BuiltEngine",

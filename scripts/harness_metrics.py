@@ -102,12 +102,12 @@ def load_run(run_dir: str) -> dict:
         return run
     for key, rel in (("meta", "metadata.json"), ("st", "run_state.json"), ("signoff", "decision_spec.signoff.json"),
                      ("scope", "scope_signoff.json"), ("scope_req", "scope_signoff_request.json"),
-                     ("geometry", "data/geometry_signoff.json"), ("findings", "findings.jsonl"),
-                     ("prov", "data/inputs_provenance.json")):
+                     ("findings", "findings.jsonl"), ("prov", "data/inputs_provenance.json")):
         obj, err = _read(run_dir, rel)
         if err:
             run["errors"].append(err)
         run[key] = obj
+    run["geometry"] = _d(run.get("signoff")).get("geometry")
     for key in ("meta", "st"):
         if not isinstance(run.get(key), dict):
             run["errors"].append(f"{key}: missing or not a mapping")
@@ -712,8 +712,8 @@ def _self_test() -> int:
         r = summarise([mk("r_both", {"history": h, "status": "completed"}, None, R, inv=(0, 2))], A)
         ok(r["interventions"]["I1_pauses"] == F(1, REC) and len(r["owner_wait"]["pauses"]) == 1,
            "HM14 an explicit pause entry is the record; no inferred copy")
-        g = json.dumps({"approvals": {"G1": {"approved_by": "owner"}, "G2": {"approved_by": "lead"}}})
-        d = mk("r_geo", {**fin, "status": "run_failed"}, None, {"data/geometry_signoff.json": g})
+        g = json.dumps({"geometry": {"approvals": {"G1": {"approved_by": "owner"}, "G2": {"approved_by": "lead"}}}})
+        d = mk("r_geo", {**fin, "status": "run_failed"}, None, {"decision_spec.signoff.json": g})
         r, out = rows([d], ledger={"r_geo": {"i9": 2}}), os.path.join(root, "o.json")
         with contextlib.redirect_stdout(io.StringIO()):
             main([d, "--json", out])

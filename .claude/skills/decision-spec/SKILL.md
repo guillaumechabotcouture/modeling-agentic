@@ -127,9 +127,10 @@ draft with `python3 toolkit/spec/schema.py <run_dir>/decision_spec.yaml` until i
     hold-out group; sensitivity; and **decision tests** for each simplification,
     decision-layer feature or known engine limit the owner should see tested (an
     interaction benchmark the engine misses, a group rule, the envelope). Give each a
-    `finding:` id when it answers a gate finding. A new test is one `type: perturb` with a
-    `set:` of targets (what is moved, how, to what; format and targets in
-    `toolkit/spec/perturb.py`); the older type names still work and compile to it.
+    `finding:` id when it answers a gate finding. Declare each test directly using its
+    canonical type in `toolkit/spec/schema.py` (`DECISION_TEST_TYPES`: `parameter_value`,
+    `interaction_rescale`, `group_rule`, `envelope`, `cost_items`, `unit_attribute`,
+    `calibration_target`, `outcome_ratio`, `burden_scale`, `boundary_engine`).
 11. **Deliverable.** The allocation file and its column names, and the headline output name
     the question asks for. When the question asks for the options that maximise an *expected*
     outcome over an uncertain input, write `deliverable.plan: expected_value`: the plan with the
@@ -160,7 +161,7 @@ draft with `python3 toolkit/spec/schema.py <run_dir>/decision_spec.yaml` until i
     stale. Give observations as a list.
     In a v2 run the spec only names the dossier: the EVIDENCE stage, after the spec and
     before sign-off, scaffolds each entry with what execution uses and a bounded task fills
-    the evidence (`toolkit/spec/evidence_draft.py`); the record
+    the evidence (`toolkit/spec/evidence_dossier.py`); the record
     `evidence/dossier_draft.json` and the report declare every input with no data, every
     chosen value that differs from execution, every value left at the engine's and every
     source the harness could not locate.

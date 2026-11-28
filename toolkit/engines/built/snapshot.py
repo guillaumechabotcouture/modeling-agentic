@@ -447,71 +447,167 @@ def _is_sha64(v) -> bool:
     return isinstance(v, str) and len(v) == 64 and all(c in "0123456789abcdef" for c in v)
 
 
-def verify_engine_snapshot(run_dir: str) -> list[str]:
-    """Verify the signed built-engine snapshot and admission chain in `run_dir` (empty = intact).
-    Called on resume, at every state entry after ENGINE_SIGN, before WRITE, and in the final gate."""
+def verify_admitted_engine(
+    run_dir: str,
+    *,
+    require_signoff: bool = True,
+    request_sha256: str | None = None,
+    engine_id: str | None = None,
+    config_sha256: str | None = None,
+    allowed_signers: tuple[str, ...] = ("owner", "lead"),
+) -> tuple[dict, list[str]]:
+    """Unified verifier for an admitted (and optionally signed) agent-built engine chain in `run_dir`.
+    Verifies `admission.json`, `run_state.json` `admission_sha256` (if recorded), `signoff.json` (when
+    `require_signoff=True`), content-addressed snapshot bytes, `admission_sheet.md`, mandatory `bench/*`,
+    and optional `bench/fitted.yaml` via single-link `O_NOFOLLOW` reads. Returns `(info, problems)`."""
+    info: dict = {"adm": None, "adm_bytes": b"", "adm_sha": "", "sheet_bytes": b"", "bound": {},
+                  "signoff": None, "snapshot_sha256": None, "verified_files": {}, "signed_bench_digests": {}}
     problems: list[str] = []
+
+    so: dict | None = None
+    bound: dict = {}
+    if require_signoff:
+        try:
+            so_bytes, so_st = SIO.read_nofollow(run_dir, "engine_build/signoff.json")
+            if so_st.st_nlink > 1:
+                return info, ["artifact_tampered: engine_build/signoff.json has multiple hard links"]
+            so = json.loads(so_bytes.decode("utf-8"))
+        except FileNotFoundError:
+            return info, ["artifact_tampered: engine_build/signoff.json is missing"]
+        except (SIO.LinkRefused, OSError, UnicodeDecodeError, ValueError) as e:
+            return info, [f"artifact_tampered: engine_build/signoff.json unreadable: {e}"]
+        if not isinstance(so, dict) or not isinstance(so.get("sha256"), dict):
+            return info, ["artifact_tampered: engine_build/signoff.json malformed"]
+        if so.get("by") not in allowed_signers:
+            return info, [f"artifact_tampered: engine sign-off signer {so.get('by')!r} is not in {list(allowed_signers)}"]
+        bound = so["sha256"]
+        info["signoff"] = so
+
     try:
-        so_bytes, so_st = SIO.read_nofollow(run_dir, "engine_build/signoff.json")
-        if so_st.st_nlink > 1:
-            return ["artifact_tampered: engine_build/signoff.json has multiple hard links"]
-        so = json.loads(so_bytes.decode("utf-8"))
+        adm_bytes, adm_st = SIO.read_nofollow(run_dir, "engine_build/admission.json")
+        if adm_st.st_nlink > 1:
+            return info, ["artifact_tampered: engine_build/admission.json has multiple hard links"]
+        adm_sha = _sha256_bytes(adm_bytes)
+        adm = json.loads(adm_bytes.decode("utf-8"))
     except FileNotFoundError:
-        return ["artifact_tampered: engine_build/signoff.json is missing"]
+        return info, ["artifact_tampered: engine_build/admission.json is missing"]
     except (SIO.LinkRefused, OSError, UnicodeDecodeError, ValueError) as e:
-        return [f"artifact_tampered: engine_build/signoff.json unreadable: {e}"]
-    if not isinstance(so, dict) or not isinstance(so.get("sha256"), dict):
-        return ["artifact_tampered: engine_build/signoff.json malformed"]
-    bound = so["sha256"]
-    snap_sha = so.get("snapshot_sha256")
-    bound_snap = bound.get("snapshot")
-    if not _is_sha64(snap_sha) or bound_snap != snap_sha:
-        return ["artifact_tampered: engine_build/signoff.json missing or inconsistent snapshot sha256"]
+        return info, [f"artifact_tampered: engine_build/admission.json unreadable: {e}"]
+    if not isinstance(adm, dict) or adm.get("status") != "admitted":
+        st_val = adm.get("status") if isinstance(adm, dict) else None
+        return info, [f"artifact_tampered: built engine is not admitted (status={st_val!r})"]
+    if engine_id is not None and adm.get("engine_id") != engine_id:
+        problems.append(f"artifact_tampered: admission engine_id {adm.get('engine_id')!r} != {engine_id!r}")
+    if request_sha256 is not None and adm.get("request_sha256") != request_sha256:
+        problems.append("artifact_tampered: admission request_sha256 does not match signed request")
+    if config_sha256 is not None and adm.get("config_sha256") != config_sha256:
+        problems.append(f"artifact_tampered: admission config_sha256 {str(adm.get('config_sha256'))[:12]} "
+                        f"!= {config_sha256[:12]}")
+
+    rs_path = os.path.join(run_dir, "run_state.json")
+    if os.path.lexists(rs_path):
+        try:
+            rs_bytes, rs_st = SIO.read_nofollow(run_dir, "run_state.json")
+            if rs_st.st_nlink > 1:
+                problems.append("artifact_tampered: run_state.json has multiple hard links")
+            else:
+                rs = json.loads(rs_bytes.decode("utf-8"))
+                if isinstance(rs, dict) and isinstance(rs.get("engine_build"), dict):
+                    rec_adm_sha = rs["engine_build"].get("admission_sha256")
+                    if isinstance(rec_adm_sha, str) and len(rec_adm_sha) == 64 and rec_adm_sha != adm_sha:
+                        problems.append("artifact_tampered: admission.json changed since ENGINE_ADMIT recorded its digest")
+        except (SIO.LinkRefused, OSError, UnicodeDecodeError, ValueError) as e:
+            problems.append(f"artifact_tampered: run_state.json unreadable: {e}")
+
+    snap_sha = adm.get("snapshot_sha256")
+    if not _is_sha64(snap_sha):
+        return info, problems + ["artifact_tampered: engine_build/admission.json missing valid snapshot_sha256"]
+    if require_signoff:
+        if so.get("snapshot_sha256") != snap_sha or bound.get("snapshot") != snap_sha:
+            problems.append("artifact_tampered: engine_build/signoff.json missing or inconsistent snapshot sha256")
+        if bound.get("admission.json") != adm_sha:
+            problems.append("artifact_tampered: engine_build/admission.json sha256 does not match engine_build/signoff.json")
+
+    info.update({"adm": adm, "adm_bytes": adm_bytes, "adm_sha": adm_sha, "snapshot_sha256": snap_sha})
     snaps_dir = os.path.join(run_dir, "engine_build", "snapshots")
     try:
-        read_verified_snapshot(snaps_dir, snap_sha)
+        info["verified_files"] = read_verified_snapshot(snaps_dir, snap_sha)
     except SnapshotError as e:
         problems.append(f"artifact_tampered: {e}")
-    # Verify ALL mandatory bound files (fail closed when any digest is absent or malformed)
-    adm_doc = None
+
+    try:
+        sheet_bytes, sheet_st = SIO.read_nofollow(run_dir, "engine_build/admission_sheet.md")
+        if sheet_st.st_nlink > 1:
+            problems.append("artifact_tampered: engine_build/admission_sheet.md has multiple hard links")
+        else:
+            sheet_sha = _sha256_bytes(sheet_bytes)
+            info["sheet_bytes"] = sheet_bytes
+            if require_signoff and bound.get("admission_sheet.md") != sheet_sha:
+                problems.append("artifact_tampered: engine_build/admission_sheet.md digest mismatch")
+            info["bound"] = {"admission.json": adm_sha, "admission_sheet.md": sheet_sha, "snapshot": snap_sha}
+    except (FileNotFoundError, SIO.LinkRefused, OSError) as e:
+        problems.append(f"artifact_tampered: engine_build/admission_sheet.md unreadable: {e}")
+
+    adm_digests = adm.get("digests") if isinstance(adm.get("digests"), Mapping) else {}
     for rel_key in REQUIRED_BOUND_FILES:
-        want = bound.get(rel_key)
-        if not _is_sha64(want):
-            problems.append(f"artifact_tampered: engine_build/signoff.json missing valid digest for {rel_key}")
+        if rel_key in ("admission.json", "admission_sheet.md"):
             continue
+        want_adm = adm_digests.get(rel_key)
+        if not _is_sha64(want_adm):
+            problems.append(f"artifact_tampered: engine_build/admission.json missing valid digest for {rel_key}")
+            continue
+        if require_signoff:
+            want_so = bound.get(rel_key)
+            if not _is_sha64(want_so) or want_so != want_adm:
+                problems.append(f"artifact_tampered: {rel_key} digest missing or inconsistent between admission.json and signoff.json")
+                continue
         try:
             b, st = SIO.read_nofollow(run_dir, f"engine_build/{rel_key}")
             if st.st_nlink > 1:
                 problems.append(f"artifact_tampered: engine_build/{rel_key} has multiple hard links")
-            elif _sha256_bytes(b) != want:
+            elif _sha256_bytes(b) != want_adm:
                 problems.append(f"artifact_tampered: engine_build/{rel_key} digest mismatch")
-            elif rel_key == "admission.json":
-                try:
-                    adm_doc = json.loads(b.decode("utf-8"))
-                except (UnicodeDecodeError, ValueError) as e:
-                    problems.append(f"artifact_tampered: engine_build/admission.json invalid JSON: {e}")
+            else:
+                info["signed_bench_digests"][rel_key] = want_adm
+                info["bound"][rel_key] = want_adm
         except (FileNotFoundError, SIO.LinkRefused, OSError) as e:
             problems.append(f"artifact_tampered: engine_build/{rel_key} unreadable: {e}")
-    if isinstance(adm_doc, dict):
-        if adm_doc.get("status") != "admitted" or adm_doc.get("snapshot_sha256") != snap_sha:
-            problems.append("artifact_tampered: engine_build/admission.json status or snapshot_sha256 inconsistent")
-    # Optional bound files (e.g. bench/fitted.yaml): verify whenever signed OR present on disk
+
     for rel_key in OPTIONAL_BOUND_FILES:
-        want = bound.get(rel_key)
+        want_adm = adm_digests.get(rel_key)
+        want_so = bound.get(rel_key) if require_signoff else want_adm
         on_disk = os.path.lexists(os.path.join(run_dir, "engine_build", rel_key))
-        if want is None and not on_disk:
+        if want_adm is None and want_so is None and not on_disk:
             continue
-        if not _is_sha64(want):
-            problems.append(f"artifact_tampered: engine_build/{rel_key} present without valid signed digest")
+        if not _is_sha64(want_adm) or (require_signoff and (not _is_sha64(want_so) or want_so != want_adm)):
+            problems.append(f"artifact_tampered: engine_build/{rel_key} digest missing or inconsistent")
             continue
         try:
             b, st = SIO.read_nofollow(run_dir, f"engine_build/{rel_key}")
             if st.st_nlink > 1:
                 problems.append(f"artifact_tampered: engine_build/{rel_key} has multiple hard links")
-            elif _sha256_bytes(b) != want:
+            elif _sha256_bytes(b) != want_adm:
                 problems.append(f"artifact_tampered: engine_build/{rel_key} digest mismatch")
+            else:
+                info["signed_bench_digests"][rel_key] = want_adm
+                info["bound"][rel_key] = want_adm
         except (FileNotFoundError, SIO.LinkRefused, OSError) as e:
             problems.append(f"artifact_tampered: engine_build/{rel_key} unreadable: {e}")
+
+    for ref_k in ("reference_snapshot", "reference_comparison"):
+        rv = adm_digests.get(ref_k)
+        if rv:
+            if not _is_sha64(rv):
+                problems.append(f"artifact_tampered: engine_build/admission.json invalid {ref_k} digest")
+            else:
+                info["bound"][ref_k] = str(rv)
+    return info, problems
+
+
+def verify_engine_snapshot(run_dir: str) -> list[str]:
+    """Verify the signed built-engine snapshot and admission chain in `run_dir` (empty = intact).
+    Thin wrapper around `verify_admitted_engine(run_dir, require_signoff=True)`."""
+    _info, problems = verify_admitted_engine(run_dir, require_signoff=True)
     return problems
 
 

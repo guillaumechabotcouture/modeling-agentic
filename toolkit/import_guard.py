@@ -298,7 +298,7 @@ def _self_test() -> int:
     except Exception as e:  # noqa: BLE001 -- reported in the case
         ig6 = (f"{type(e).__name__}: {e}"[:200], None)
     ok(ig6 == ("allowed", "refused"), f"IG6 a worker allows a test reference only with the pool initializer ({ig6})")
-    # BE36b: toolkit.engines.built.candidate is refused across EVERY policy before any import
+    # BE36b: retired candidate runner module stays refused across EVERY policy before any import
     cand_refused = []
     for k in POLICIES:
         try:
@@ -307,7 +307,7 @@ def _self_test() -> int:
         except ImportRefused:
             cand_refused.append(True)
         try:
-            check_ref(k, "toolkit.engines.built.candidate:CandidateEngine")
+            check_ref(k, "toolkit.engines.built.candidate:BuiltEngine")
             cand_refused.append(False)
         except ImportRefused:
             cand_refused.append(True)

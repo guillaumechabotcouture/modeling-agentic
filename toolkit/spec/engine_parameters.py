@@ -520,9 +520,7 @@ def held(spec) -> dict:
 def companions(dt) -> dict:
     """{parameter: value} of a parameter_value decision test's `with`: companion engine parameters held at these
     values in every case of the test (owner, 20 Nov). {} without the field or for a malformed one (validation
-    reports that). A `perturb` test's held parameter targets are its companions (W0-B, toolkit/spec/perturb.py)."""
-    from toolkit.spec import perturb as PT
-    dt = PT.view(dt)
+    reports that)."""
     w = dt.get("with") if isinstance(dt, dict) and dt.get("type") == "parameter_value" else None
     return {str(k): float(v) for k, v in w.items() if _isnum(v)} if isinstance(w, dict) else {}
 
@@ -534,9 +532,7 @@ def test_settings(dt, numbers_only: bool = False, names=None) -> dict:
     raises ValueError (as these readers did before `with`; Codex r1-r2). `numbers_only`: only values written as
     numbers, nothing raised (tested_boxes' rule before `with`). `names`: the parameters the reader uses; a test's own
     values are read only when its parameter is one of them, so a value the reader never used raises nothing (Codex
-    r3), and only those parameters are returned. A `perturb` test is read in its per-target form (W0-B)."""
-    from toolkit.spec import perturb as PT
-    dt = PT.view(dt)
+    r3), and only those parameters are returned."""
     if not isinstance(dt, dict) or dt.get("type") != "parameter_value":
 
         return {}
@@ -680,9 +676,9 @@ def posterior_point(spec) -> dict:
     """A declared net-effect posterior's verified chosen point ({} without one): the arms' point (v2-posterior-point)."""
     if "net_effect_posterior" not in ((_raw(spec).get("uncertainty") or {})):
         return {}
-    from toolkit.analysis import uncertainty as UQ
-    ne = UQ.net_effect_sample(spec, spec.engine())
-    return {} if ne is None else UQ.posterior_point(spec, ne, {})
+    from toolkit.engines import hooks as _hooks
+    ne = _hooks.external_posterior_sample(spec, spec.engine())
+    return {} if ne is None else _hooks.external_posterior_point(spec, ne, {})
 
 
 def write_spec_benchmarks(run_dir: str, pack: dict, fitted: dict | None = None, workers: int = 1, seeds=None,

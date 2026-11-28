@@ -210,8 +210,8 @@ def _run_built_engine_defects() -> list[tuple[str, str, bool]]:
     if REPO not in sys.path:
         sys.path.insert(0, REPO)
     import numpy as np
+    from toolkit.engines.built import adapter as BADAPT
     from toolkit.engines.built import admission as BADM
-    from toolkit.engines.built import candidate as BCAND
     from toolkit.engines.built import fixtures as BFIX
     from toolkit.engines.built import worker as BWORK
     from toolkit.engines.contract import Package
@@ -225,18 +225,18 @@ def _run_built_engine_defects() -> list[tuple[str, str, bool]]:
     pkgs = [Package("none", {"comp_a": 0}), Package("a", {"comp_a": 1})]
 
     # BE2: dead parameter p_sev caught by A6
-    c2 = BCAND.CandidateEngine(BFIX.two_group_sir_files("dead_param"), b, unsandboxed_ok=dev_un)
+    c2 = BADAPT.BuiltEngine.from_verified(BFIX.two_group_sir_files("dead_param"), b, unsandboxed_ok=dev_un)
     a6_2 = BADM.check_a6(c2, b, sp, np.random.default_rng(11), n_bases=1, min_moving=1, th=th)
     be2_ok = a6_2.get("status") == "fail" and any("p_sev" in str(p) for p in a6_2.get("problems") or [])
 
     # BE8: 0.1%/step population growth under conservation=closed caught by A5
-    c8 = BCAND.CandidateEngine(BFIX.two_group_sir_files("mass_growth"), b, unsandboxed_ok=dev_un)
+    c8 = BADAPT.BuiltEngine.from_verified(BFIX.two_group_sir_files("mass_growth"), b, unsandboxed_ok=dev_un)
     a5_8 = BADM.check_a5(c8, b, units, pkgs, hor, th=th)
     be8_ok = a5_8.get("status") == "fail" and any("conservation" in str(p) for p in a5_8.get("problems") or [])
 
     # BE10: public lookup table caught by hidden A4 (n_free=3 matches admission.py)
     f10 = BFIX.two_group_sir_files("public_table")
-    c10 = BCAND.CandidateEngine(f10, b, unsandboxed_ok=dev_un)
+    c10 = BADAPT.BuiltEngine.from_verified(f10, b, unsandboxed_ok=dev_un)
     hid_a4 = BADM.check_a4(c10, b, sp, np.random.default_rng(19), n_free=3, th=th)
     be10_ok = hid_a4.get("status") == "fail"
 

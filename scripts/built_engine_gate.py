@@ -33,7 +33,7 @@ from toolkit.engines.built import snapshot as BSNAP  # noqa: E402
 from toolkit.engines.built import worker as BWORK  # noqa: E402
 
 _VALID_CHECK_STATUSES = frozenset({"pass", "fail", "skipped", "not_applicable", "inconclusive", "unavailable"})
-_GATING_CHECKS = frozenset({"A1", "A2", "A3", "A4", "A5", "A6", "A8", "A11"})
+_GATING_CHECKS = frozenset({"A1", "A2", "A4", "A5", "A6", "A8", "A11"})
 
 
 def _finding(kind: str, key: str, claim: str) -> dict:
@@ -300,13 +300,13 @@ def gate_findings(run_dir: str) -> list[dict]:
                         findings.append(_finding("built_engine_signoff_invalid", f"{so_rel}:{bk}",
                                                  f"{so_rel} sha256[{bk!r}] is not a valid sha256"))
             try:
-                snap_probs = BSNAP.verify_engine_snapshot(run_dir)
+                _info, snap_probs = BSNAP.verify_admitted_engine(run_dir, require_signoff=True)
                 if snap_probs:
                     findings.append(_finding("built_engine_snapshot_invalid", so_rel,
                                              "; ".join(snap_probs[:3])))
             except Exception as e:  # noqa: BLE001
                 findings.append(_finding("built_engine_snapshot_invalid", so_rel,
-                                         f"verify_engine_snapshot failed: {type(e).__name__}: {e}"))
+                                         f"verify_admitted_engine failed: {type(e).__name__}: {e}"))
     return findings
 
 

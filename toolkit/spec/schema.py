@@ -103,9 +103,8 @@ docs/design/v2-spec-and-analysis.md §1):
       stability: {holdout_group: col, covariates: [..]}
       sensitivity: {parameters: fitted | [names], cost_items: {id: [lo, hi]}}
       share_threshold: 0.10                # decision tests: share of units changing package
-      decision_tests: [{id, type, text, finding, ...}]     # type perturb: set [{target, ..}] (W0-B, the one
-                                           # generic test: toolkit/spec/perturb.py); the types below are aliases
-                                           # compiled to it. type cost_items: multipliers {cost_item_id: m}, one
+      decision_tests: [{id, type, text, finding, ...}]     # canonical per-type decision tests:
+                                           # type cost_items: multipliers {cost_item_id: m}, one
                                            # price case in which the listed unit costs change together;
                                            # type unit_attribute: unit_attribute {column, units: [ids] | all,
                                            # values | scale | set_from} (a units-table column, F6);
@@ -197,8 +196,7 @@ CONDITIONAL_KINDS = {"burden_anchor": "the anchors' external burden estimates (v
                      "health_weights": "health-measure disability/utility weights with declared ranges "
                                        "(cost_effectiveness.health_measure)"}
 UNIT_RATES = "unit_rates"
-# W0-B: `perturb` is the one generic test (toolkit/spec/perturb.py); the others are aliases compiled to it
-DECISION_TEST_TYPES = ("perturb", "interaction_rescale", "parameter_value", "group_rule", "envelope", "cost_items",
+DECISION_TEST_TYPES = ("interaction_rescale", "parameter_value", "group_rule", "envelope", "cost_items",
                        "unit_attribute", "calibration_target", "outcome_ratio", "burden_scale", "boundary_engine")
 DELIVERABLE_KINDS = ("package_per_unit", "estimates", "cost_effectiveness")    # estimates/cost_effectiveness: no allocation file
 PLAN_RULES = ("point", "expected_value")     # deliverable.plan (toolkit/analysis/plan_rule.py); absent: point
@@ -455,8 +453,12 @@ class Spec:
     # ---- units
     def units(self) -> list[dict]:
         if self._units is None:
-            with open(self.resolve(self.raw["decision_units"]["csv"]), newline="", encoding="utf-8") as f:
-                self._units = list(csv.DictReader(f))
+            du = self.raw.get("decision_units") if isinstance(self.raw.get("decision_units"), Mapping) else {}
+            if "csv" not in du and isinstance(du.get("units_inline"), list):
+                self._units = [dict(u) for u in du["units_inline"] if isinstance(u, Mapping)]
+            else:
+                with open(self.resolve(self.raw["decision_units"]["csv"]), newline="", encoding="utf-8") as f:
+                    self._units = list(csv.DictReader(f))
         return self._units
 
     @property
@@ -549,9 +551,8 @@ class Spec:
                     lo[it_id] = min(lo.get(it_id, 1.0), float(r[0]))
         for it_id, r in (((self.raw.get("analysis") or {}).get("sensitivity") or {}).get("cost_items") or {}).items():
             lo[it_id] = min(lo.get(it_id, 1.0), float(r[0]))
-        from toolkit.spec import perturb as PT
-        for dt in PT.tests(self.raw.get("analysis")):      # a cost_items test's price case
-            if dt.get("type") == "cost_items" and isinstance(dt.get("multipliers"), dict):
+        for dt in ((self.raw.get("analysis") or {}).get("decision_tests") or []):      # a cost_items test's price case
+            if isinstance(dt, dict) and dt.get("type") == "cost_items" and isinstance(dt.get("multipliers"), dict):
                 for it_id, m in dt["multipliers"].items():
                     if _isnum(m):
                         lo[it_id] = min(lo.get(it_id, 1.0), float(m))
@@ -646,12 +647,12 @@ def check_engine_ref(ref, *, allow_built: bool = False) -> tuple[str, str]:
     the registry (PR #363 question 15): a ref the policy allows but the registry does not hold (a hook or toy engine
     under toolkit/engines/) is refused, whether the signed spec names it, an engine: auto candidate lists it or an
     engine choice picks it. `toolkit.engines.built:BuiltEngine` is accepted only when `allow_built=True` (resolved
-    from a signed build spec); `toolkit.engines.built.candidate` is always refused. Self-tests extend the registry
-    in-process only (import_guard.register_test_engine)."""
+    from a signed build spec); submodules under `toolkit.engines.built.*` are always refused. Self-tests extend the
+    registry in-process only (import_guard.register_test_engine)."""
     from toolkit import import_guard as G
-    from toolkit.engines.built import BUILT_ADAPTER_REF, BUILT_REF_PREFIX, CANDIDATE_MODULE
-    if isinstance(ref, str) and (ref.startswith(CANDIDATE_MODULE) or (
-            (ref == BUILT_ADAPTER_REF or ref.startswith(BUILT_REF_PREFIX + ".")) and not (allow_built and ref == BUILT_ADAPTER_REF))):
+    from toolkit.engines.built import BUILT_ADAPTER_REF, BUILT_REF_PREFIX
+    if isinstance(ref, str) and (ref == BUILT_ADAPTER_REF or ref.startswith(BUILT_REF_PREFIX + ".")) and not (
+            allow_built and ref == BUILT_ADAPTER_REF):
         raise UnregisteredEngine(f"engine {ref}: built-engine adapter is reachable only through a signed engine.build request")
     try:
         out = G.check_ref("engine", ref)
@@ -1271,14 +1272,13 @@ def _validate_pending(s: Spec) -> list[str]:
     bad += [e for e in _validate_uncertainty(s, {}) if "the engine" not in e]
     from toolkit.spec import engine_parameters as PV
     bad += PV.shape_problems(s)           # the engine-dependent checks run per candidate and after the choice
-    from toolkit.spec import perturb as PT
     for dt in r["analysis"].get("decision_tests") or []:
+        if not isinstance(dt, dict):
+            bad.append("analysis.decision_tests: every entry must be a mapping")
+            continue
         if str(dt.get("id") or "").startswith(("prior_range_", "fitted_range_", "scenario_excluded_",
                                                 "anchor_range_")):       # W0-B review r1: also before the engine
             bad.append(f"decision test {dt.get('id')}: that id is one the harness generates; the spec cannot use it")
-        if dt.get("type") == PT.TYPE:          # W0-B: its structure here, the rest on its per-target form
-            bad += PT.problems(dt)
-            dt = PT.view(dt)
         if dt.get("type") not in DECISION_TEST_TYPES:
             bad.append(f"decision test {dt.get('id')}: type {dt.get('type')!r} not in {DECISION_TEST_TYPES}")
         if "with" in dt and dt.get("type") != "parameter_value":       # as after the engine choice (Codex r2)
@@ -1544,8 +1544,9 @@ def parameter_domain(raw: dict, defaults: dict, drawn: dict) -> dict:
             dom.setdefault(n, []).append((f"uncertainty.priors.{n}.range", list(q["range"])))
     for n, (lo, hi) in (drawn or {}).items():
         dom.setdefault(n, []).append((f"the drawn prior on {n}", [lo, hi]))
-    from toolkit.spec import perturb as PT
-    for dt in PT.tests((raw or {}).get("analysis")):
+    for dt in (((raw or {}).get("analysis") or {}).get("decision_tests") or []):
+        if not isinstance(dt, dict):
+            continue
         if dt.get("type") == "parameter_value" and dt.get("parameter") in dom:
             dom[dt["parameter"]].append((f"decision test {dt.get('id')}", list(dt.get("values") or [])))
         for n, v in PV.companions(dt).items():        # a companion value (`with`) is a value the run evaluates
@@ -1882,16 +1883,6 @@ def _validate_analysis(s, card, pnames, cols, pk) -> list[str]:
                        "generated by the harness (toolkit/analysis/decision_tests.py); the spec cannot declare one")
             continue
         seen.add(i)
-        from toolkit.spec import perturb as PT
-        if dt.get("type") == PT.TYPE:          # W0-B: its structure here; every check below on its per-target form
-            pb = PT.problems(dt)
-            bad += pb
-            if pb:
-                continue
-            dt = PT.view(dt)
-            if dt.get("type") in (PT.TYPE, "prior_range", "fitted_range", "scenario_excluded", "anchor_range"):
-                bad.append(f"decision test {i}: its targets cannot be read as one test the runner executes")
-                continue
         t = dt.get("type")
         if t not in DECISION_TEST_TYPES:
             bad.append(f"decision test {i}: type {t!r} not in {DECISION_TEST_TYPES}")
@@ -2752,23 +2743,25 @@ def _self_test() -> int:
         dtc(multipliers={"ca": 0.8, "cb": 1.3})(r_c)
         ok(validate(Spec(r_c, d)) == [], f"SP11j a cost_items decision test on declared cost items validates: "
                                          f"{validate(Spec(r_c, d))[:3]}")
-        # W0-B: one generic perturb test; the per-target checks are its alias's (toolkit/spec/perturb.py)
-        dtp = lambda *ts, **kw: (lambda r: r["analysis"]["decision_tests"].append(  # noqa: E731
-            dict({"id": "DTp", "type": "perturb", "text": "t", "set": list(ts)}, **kw)))
+        # Retired type: perturb must be refused; canonical per-type decision tests validate directly
+        dtp = lambda **kw: (lambda r: r["analysis"]["decision_tests"].append(  # noqa: E731
+            dict({"id": "DTp", "type": "parameter_value", "text": "t", "parameter": "eff_a", "values": [0.3, 0.6]},
+                 **kw)))
         r_p = copy.deepcopy(s.raw)
-        dtp({"target": "cost_item", "name": "ca", "scale": 0.8}, {"target": "cost_item", "name": "cb", "scale": 1.3})(r_p)
-        dtp({"target": "parameter", "name": "eff_a", "values": [0.3, 0.6]}, id="DTq")(r_p)
-        ok(validate(Spec(r_p, d)) == [], f"SPP1 perturb tests (a price case, a parameter) validate: "
+        dtc(multipliers={"ca": 0.8, "cb": 1.3})(r_p)
+        dtp(id="DTq")(r_p)
+        ok(validate(Spec(r_p, d)) == [], f"SPP1 direct decision tests (cost_items, parameter_value) validate: "
                                          f"{validate(Spec(r_p, d))[:3]}")
-        bad(dtp({"target": "magic"}), "unknown target", "SPP2 DT_PERTURB_UNKNOWN_TARGET_REFUSED at validation")
-        bad(dtp({"target": "cost_item", "name": "nope", "scale": 1.2}), "unknown cost item",
-            "SPP3 a perturb target gets its alias's checks (an unknown cost item is refused)")
-        bad(dtp({"target": "parameter", "name": "nope", "values": [1.0]}), "not an engine parameter",
-            "SPP4 a perturb parameter target that is not an engine parameter is refused")
-        bad(dtp({"target": "parameter", "name": "eff_a", "values": [0.3]}, {"target": "envelope", "values": [9e3]}),
-            "cannot be applied together", "SPP5 targets of different kinds are refused together")
-        bad(dtp({"target": "parameter", "name": "eff_a", "values": [0.3]}, id="prior_range_eff_a"),
-            "generated by the harness", "SPP6 a perturb test cannot shadow an automatic test")
+        bad(lambda r: r["analysis"]["decision_tests"].append({"id": "DTp", "type": "perturb", "text": "t",
+                                                               "set": [{"target": "parameter", "name": "eff_a",
+                                                                        "values": [0.3]}]}),
+            "not in", "SPP2 retired type perturb is refused")
+        bad(dtc(multipliers={"nope": 1.2}), "unknown cost item",
+            "SPP3 direct cost_items test on an unknown cost item is refused")
+        bad(dtp(parameter="nope", values=[1.0]), "not an engine parameter",
+            "SPP4 direct parameter_value test with unknown parameter is refused")
+        bad(dtp(id="prior_range_eff_a"), "generated by the harness",
+            "SPP6 a decision test cannot shadow an automatic test")
         _self_test_unit_attribute(ok, s, d, bad)
         # F6 run 1, owner decision R1: a calibration-target test (the listed units' targets scaled, the calibration redone)
         dct = lambda **kw: (lambda r: r["analysis"]["decision_tests"].append(  # noqa: E731

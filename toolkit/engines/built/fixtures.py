@@ -143,7 +143,6 @@ def two_group_sir_files(defect: str | None = None, *, stochastic_sd: float = 0.0
       - 'outcome_only_param' (BE5): reads `p_sev` only inside `read_outcomes`
       - 'unseeded' (BE6a): uses unseeded `np.random.normal`
       - 'order_cache' (BE6b): uses mutable module-level cache across calls
-      - 'leaky_batch' (BE7): `run_batch_state` leaks state across packages
       - 'mass_growth' (BE8): multiplies `S` by 1.001 each step under closed conservation
       - 'formula_severe' (BE9): reports `severe = 0.25 * cases` apart from compartment `H`
       - 'public_table' (BE10): >16-element inline lookup table matching public reduction, wrong elsewhere
@@ -191,28 +190,6 @@ def two_group_sir_files(defect: str | None = None, *, stochastic_sd: float = 0.0
         extra_top = f"PUB_LUT = [{vals}]\n"
     elif defect == "order_cache":
         extra_top = "CACHE = {'n': 0}\n"
-
-    batch_method = ""
-    if defect == "leaky_batch":
-        batch_method = """
-    def run_batch_state(self, param_sets, unit, packages, horizon, seed):
-        outs = []
-        leak = 0.0
-        for prm, pkg in zip(param_sets, packages):
-            sim = self.build_sim(prm, unit, pkg, horizon)
-            sim.pars.rand_seed = int(seed)
-            sim.run()
-            o = self.read_outcomes(sim, unit, pkg, horizon)
-            if leak > 0.0:
-                o = Outcomes(
-                    per_capita={'cases': {g: v + leak for g, v in o.per_capita['cases'].items()},
-                                'severe': o.per_capita['severe']},
-                    windows=o.windows, cost_drivers=o.cost_drivers, meta=o.meta,
-                )
-            leak += 0.05
-            outs.append(o)
-        return outs
-"""
 
     src = f'''"""Two-group discrete SIR Starsim module fixture."""
 from __future__ import annotations
@@ -373,7 +350,6 @@ class Model:
             windows=wins,
             cost_drivers={{"units_delivered": drv}},
         )
-{batch_method}
 '''
     return {
         "engine.py": src.encode("utf-8"),

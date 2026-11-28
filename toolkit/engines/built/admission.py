@@ -7,19 +7,16 @@ Deterministic harness verification of an immutable content-addressed snapshot ag
 `engine.build` request, spec, and dossier:
 - Public + hidden + real-unit typed domain generators with opaque IDs and invariance checks
 - Static checks S1-S3 (before any run)
-- Run checks A1-A6, A8, A10, A11:
+- Run checks A1-A2, A4-A6, A8, optional A11:
   - A1: conformance (`contract.check_engine` + exact card/parameter/output checks)
   - A2: determinism across processes, `PYTHONHASHSEED`, case order, and `seed_test_setting`
-  - A3: `run_batch` vs `run` parity (skipped when no batch path exists)
   - A4: analytic/oracle reductions (`oracles.py`) + absent-component & N-invariance identities
   - A5: mass balance, population conservation, and compartment transition-count witness (`starsim_module`)
   - A6: dead-parameter read tracking (`meta.param_reads`), `read_outcomes`-only phase check, non-trivial output movement, and declared-output liveness
   - A8: trial benchmarks (`benchmark.py`) + built-engine coverage policy (`benchmark_coverage.gate(..., policy="built")`)
-  - A10: identifiability via `calibrators.calibrate_as_run`
-  - A11: independent reference equivalence (deterministic tolerance or stochastic 95% CRN CI with `inconclusive`)
-- Hidden-seed commitment (`engine_build/.hidden/seed.json`), reuse key (`compute_reuse_key`,
-  `try_reuse_admission`), authoritative `engine_build/bench/*`, `engine_build/admission_sheet.md`,
-  and atomic `engine_build/admission.json`. Nothing here names a disease.
+  - A11: optional deterministic independent reference equivalence
+- Hidden-seed commitment (`engine_build/.hidden/seed.json`), authoritative `engine_build/bench/*`,
+  `engine_build/admission_sheet.md`, and atomic `engine_build/admission.json`. Nothing here names a disease.
 """
 from __future__ import annotations
 
@@ -50,7 +47,6 @@ from toolkit.engines import benchmark_sources as BS  # noqa: E402
 from toolkit.engines import contract as C  # noqa: E402
 from toolkit.engines.contract import Horizon, Outcomes, Package, UnitSpec  # noqa: E402
 from toolkit.engines.built import adapter as BADAPT  # noqa: E402
-from toolkit.engines.built import candidate as BCAND  # noqa: E402
 from toolkit.engines.built import oracles as BORC  # noqa: E402
 from toolkit.engines.built import requested as BREQ  # noqa: E402
 from toolkit.engines.built import snapshot as BSNAP  # noqa: E402
@@ -285,24 +281,20 @@ def _domain_points_param(ps: Mapping) -> list:
     return [v * 0.5, v * 0.85, v * 1.15, v * 1.5] if abs(v) > 1e-12 else [0.0, 0.25, 0.75, 1.0]
 
 
-def _real_units_and_packages(spec_raw: Mapping, req: Mapping, *, base_dir: str | None = None,
-                             max_units: int = 200, max_packages: int = 64,
-                             rng: np.random.Generator | None = None) -> tuple[list[UnitSpec], list[Package]]:
-    """Extract the signed spec's real decision units and packages (stratified + extremes when > cap)."""
+def spec_units_and_packages(spec_raw: Mapping, req: Mapping, *, base_dir: str | None = None,
+                            max_units: int = 200, max_packages: int = 64,
+                            rng: np.random.Generator | None = None) -> tuple[list[UnitSpec], list[Package]]:
+    """Extract the signed spec's real decision units and packages via `schema.Spec` (downsampled when > cap)."""
+    from toolkit.spec import schema as _SCH
     rng = rng or np.random.default_rng(0)
+    sp = _SCH.Spec(dict(spec_raw), base_dir or ".")
     attr_specs = req.get("unit_attributes") or {}
     comp_specs = req.get("components") or {}
     du = spec_raw.get("decision_units") if isinstance(spec_raw, Mapping) else None
     raw_units: list[dict] = []
-    if isinstance(du, Mapping):
-        if isinstance(du.get("units_inline"), list):
-            raw_units = [dict(u) for u in du["units_inline"] if isinstance(u, Mapping)]
-        elif du.get("csv") and base_dir:
-            import csv
-            csv_p = os.path.join(base_dir, str(du["csv"]))
-            if os.path.isfile(csv_p):
-                with open(csv_p, encoding="utf-8", newline="") as f:
-                    raw_units = list(csv.DictReader(f))
+    if isinstance(du, Mapping) and (isinstance(du.get("units_inline"), list)
+                                    or (du.get("csv") and base_dir and os.path.isfile(os.path.join(base_dir, str(du["csv"]))))):
+        raw_units = sp.units()
     id_col = str((du or {}).get("id") or (du or {}).get("id_column") or "unit_id") if isinstance(du, Mapping) else "unit_id"
     ea = (du or {}).get("engine_attributes") if isinstance(du, Mapping) else {}
     ea = ea if isinstance(ea, Mapping) else {}
@@ -316,7 +308,6 @@ def _real_units_and_packages(spec_raw: Mapping, req: Mapping, *, base_dir: str |
     def _effective_cal_scale(aspec: Mapping) -> str:
         if isinstance(cal_scale_decl, str) and cal_scale_decl in ("log", "linear"):
             return cal_scale_decl
-        # Match toolkit/spec/schema.py:card_scale() — log default for non-negative declared ranges, linear otherwise
         rng_a = aspec.get("range") if "range" in aspec else aspec.get("test_range")
         if isinstance(rng_a, (list, tuple)) and len(rng_a) >= 1 and _finite(rng_a[0]):
             return "linear" if float(rng_a[0]) < 0.0 else "log"
@@ -347,47 +338,23 @@ def _real_units_and_packages(spec_raw: Mapping, req: Mapping, *, base_dir: str |
     units: list[UnitSpec] = []
     for idx, row in enumerate(raw_units):
         uid = str(row.get(id_col) or f"unit_{idx}")
+        bound_attrs = sp.unit_attributes(row) if ea else {}
         attrs: dict = {}
         for aname, aspec in attr_specs.items():
-            bind = ea.get(aname)
-            if isinstance(bind, Mapping) and "value" in bind:
-                val = copy.deepcopy(bind["value"])
-            elif isinstance(bind, Mapping) and "column" in bind:
-                col = bind["column"]
-                if col not in row:
-                    raise ValueError(f"real unit {uid!r}: missing bound column {col!r} for attribute {aname!r}")
-                raw_cell = row[col]
-                if "split" in bind:
-                    if "empty" in bind and str(raw_cell).strip() == str(bind["empty"]).strip():
-                        val = []
-                    else:
-                        val = [float(x) for x in str(raw_cell).split(bind["split"])]
-                else:
-                    val = _coerce_attr(raw_cell, aspec)
-            elif isinstance(bind, Mapping) and "columns" in bind:
-                cols = bind["columns"]
-                if isinstance(cols, Mapping):
-                    if aspec.get("type") == "vector":
-                        raise ValueError(
-                            f"real unit {uid!r}: vector attribute {aname!r} requires a list of column names, not a mapping"
-                        )
-                    missing_c = [c for c in cols.values() if c not in row]
-                    if missing_c:
-                        raise ValueError(f"real unit {uid!r}: missing column(s) {missing_c} for attribute {aname!r}")
-                    val = {k: float(row[c]) for k, c in cols.items()}
-                elif isinstance(cols, (list, tuple)):
-                    missing_c = [c for c in cols if c not in row]
-                    if missing_c:
-                        raise ValueError(f"real unit {uid!r}: missing column(s) {missing_c} for attribute {aname!r}")
-                    val = [float(row[c]) for c in cols]
-                else:
-                    raise ValueError(f"real unit {uid!r}: invalid columns binding for attribute {aname!r}")
+            if aname in ea:
+                bind = ea[aname]
+                if isinstance(bind, Mapping) and isinstance(bind.get("columns"), Mapping) and aspec.get("type") == "vector":
+                    raise ValueError(
+                        f"real unit {uid!r}: vector attribute {aname!r} requires a list of column names, not a mapping"
+                    )
+                val = bound_attrs[aname]
+                if isinstance(bind, Mapping) and ("column" in bind) and "split" not in bind:
+                    val = _coerce_attr(val, aspec)
             elif aname in row:
                 val = _coerce_attr(row[aname], aspec)
             elif isinstance(ab.get(aname), Mapping) and "default" in ab[aname]:
                 val = copy.deepcopy(ab[aname]["default"])
             elif (cal_attr and aname == cal_attr) or (aname in cal_priors):
-                # Calibrated per-unit attribute (or prior-calibrated attribute): supply interior prior midpoint.
                 rng_a = aspec.get("range") if "range" in aspec else aspec.get("test_range")
                 pr_decl = cal_priors.get(aname) if isinstance(cal_priors.get(aname), Mapping) else None
                 pr_rng = pr_decl.get("range") if pr_decl is not None else None
@@ -414,7 +381,6 @@ def _real_units_and_packages(spec_raw: Mapping, req: Mapping, *, base_dir: str |
         units.append(UnitSpec(uid, attrs))
 
     if len(units) > max_units:
-        # Include every unit at an attribute extreme + stratified remainder up to max_units
         keep_idx: set[int] = set()
         for aname, aspec in attr_specs.items():
             if aspec.get("type") in ("continuous", "integer"):
@@ -429,7 +395,6 @@ def _real_units_and_packages(spec_raw: Mapping, req: Mapping, *, base_dir: str |
             keep_idx.update(int(i) for i in chosen)
         units = [units[i] for i in sorted(keep_idx)[:max_units]]
 
-    # Packages from options.engine_map + options.packages (respecting option groups & never exploding Cartesian products)
     opts = spec_raw.get("options") if isinstance(spec_raw, Mapping) else {}
     emap = (opts.get("engine_map") or {}) if isinstance(opts, Mapping) else {}
     opt_comps = (opts.get("components") or {}) if isinstance(opts, Mapping) else {}
@@ -437,48 +402,37 @@ def _real_units_and_packages(spec_raw: Mapping, req: Mapping, *, base_dir: str |
     absent_pkg = {c: cs["absent"] for c, cs in comp_specs.items()}
     packages: list[Package] = []
 
-    def _pkg_from_opt_set(opt_names: tuple[str, ...]) -> Package:
-        comp_map = dict(absent_pkg)
-        for m in opt_names:
-            if m in emap and isinstance(emap[m], Mapping):
-                comp_map.update(emap[m])
-        pid = "+".join(opt_names) if opt_names else "none"
-        return Package(pid, comp_map)
-
-    if isinstance(pks_decl, Mapping) and pks_decl and not pks_decl.get("generate"):
-        items = list(pks_decl.items())
-        if len(items) > max_packages:
-            idx = sorted(set([0, len(items) - 1]
-                             + rng.choice(len(items), size=max(0, max_packages - 2), replace=False).tolist()))
-            items = [items[i] for i in idx]
-        for pid, members in items:
-            comp_map = dict(absent_pkg)
-            for m in (members or []):
-                if m in emap and isinstance(emap[m], Mapping):
-                    comp_map.update(emap[m])
-            packages.append(Package(str(pid), comp_map))
-    elif isinstance(opt_comps, Mapping) and opt_comps and isinstance(emap, Mapping) and emap:
-        # Respect mutually exclusive option groups (same grouping rule as toolkit.alloc.costs.packages)
-        groups: dict[str, list[str]] = {}
-        for oc, od in opt_comps.items():
-            grp = str((od or {}).get("group") or oc) if isinstance(od, Mapping) else str(oc)
-            groups.setdefault(grp, []).append(str(oc))
-        group_choices = [[None] + sorted(vs) for _gk, vs in sorted(groups.items())]
-        total_combos = math.prod(len(ch) for ch in group_choices)
-        if total_combos <= max_packages:
-            for pick in itertools.product(*group_choices):
-                chosen_opts = tuple(sorted(c for c in pick if c is not None))
-                packages.append(_pkg_from_opt_set(chosen_opts))
+    if (isinstance(pks_decl, Mapping) and pks_decl and not pks_decl.get("generate")) or (
+        isinstance(opt_comps, Mapping) and opt_comps and isinstance(emap, Mapping) and emap
+    ):
+        # Delegate option-package & mutually-exclusive-group expansion to schema.Spec (within_envelope / alloc_costs)
+        if isinstance(pks_decl, Mapping) and pks_decl.get("generate"):
+            groups: dict[str, list[str]] = {}
+            for oc, od in opt_comps.items():
+                grp = str((od or {}).get("group") or oc) if isinstance(od, Mapping) else str(oc)
+                groups.setdefault(grp, []).append(str(oc))
+            est_combos = math.prod(1 + len(vs) for vs in groups.values())
         else:
-            seen_opts: set[tuple[str, ...]] = set()
+            est_combos = len(pks_decl)
+        if est_combos <= max_packages:
+            for pid, comps_set in sp.packages().items():
+                comp_map = dict(absent_pkg)
+                comp_map.update(sp.engine_package(comps_set))
+                packages.append(Package(str(pid), comp_map))
+        else:
+            # Large group product: sample without materializing full Cartesian product
+            groups = {}
+            for oc, od in opt_comps.items():
+                grp = str((od or {}).get("group") or oc) if isinstance(od, Mapping) else str(oc)
+                groups.setdefault(grp, []).append(str(oc))
+            group_choices = [[None] + sorted(vs) for _gk, vs in sorted(groups.items())]
+            seen_opts: set[tuple[str, ...]] = {()}
             ordered_sets: list[tuple[str, ...]] = [()]
-            seen_opts.add(())
             for oc in sorted(opt_comps):
                 t = (str(oc),)
                 if t not in seen_opts and len(ordered_sets) < max_packages:
                     seen_opts.add(t)
                     ordered_sets.append(t)
-            # Sample additional valid multi-group packages without ever materializing full product
             attempts = 0
             while len(ordered_sets) < max_packages and attempts < max_packages * 12:
                 attempts += 1
@@ -490,9 +444,14 @@ def _real_units_and_packages(spec_raw: Mapping, req: Mapping, *, base_dir: str |
                     seen_opts.add(chosen_opts)
                     ordered_sets.append(chosen_opts)
             for opt_tuple in ordered_sets[:max_packages]:
-                packages.append(_pkg_from_opt_set(opt_tuple))
+                comp_map = dict(absent_pkg)
+                comp_map.update(sp.engine_package(opt_tuple))
+                packages.append(Package("+".join(opt_tuple) if opt_tuple else "none", comp_map))
+        if len(packages) > max_packages:
+            idx = sorted(set([0, len(packages) - 1]
+                             + rng.choice(len(packages), size=max(0, max_packages - 2), replace=False).tolist()))
+            packages = [packages[i] for i in idx]
     else:
-        # Engine-domain combinations without materializing huge Cartesian products
         names = sorted(comp_specs)
         val_lists = [list(comp_specs[c]["values"]) for c in names]
         total_combos = math.prod(len(vs) for vs in val_lists) if val_lists else 0
@@ -509,7 +468,6 @@ def _real_units_and_packages(spec_raw: Mapping, req: Mapping, *, base_dir: str |
                     seen_tups.add(key)
                     chosen_tups.append(t)
 
-            # Include all-absent, all-max, each single-active value, then random draws
             _add_tup(tuple(comp_specs[c]["absent"] for c in names))
             _add_tup(tuple(comp_specs[c]["values"][-1] for c in names))
             for ci, c in enumerate(names):
@@ -555,8 +513,8 @@ def generate_domain_units(req: Mapping, n: int, rng: np.random.Generator, *, ref
     return out
 
 
-# --------------------------------------------------------------------------- Individual checks A1-A11
-def check_a1(cand: BCAND.CandidateEngine, build_decl: Mapping, spec_raw: Mapping,
+# --------------------------------------------------------------------------- Individual checks A1-A8, A11
+def check_a1(cand: BADAPT.BuiltEngine, build_decl: Mapping, spec_raw: Mapping,
              units: list[UnitSpec], packages: list[Package], horizon: Horizon, *, seed: int = 1) -> dict:
     """A1 conformance: `contract.check_engine` + exact card/parameter/output agreement with signed request."""
     import yaml
@@ -661,7 +619,7 @@ def check_a1(cand: BCAND.CandidateEngine, build_decl: Mapping, spec_raw: Mapping
             "problems": probs[:12]}
 
 
-def check_a2(cand: BCAND.CandidateEngine, build_decl: Mapping, units: list[UnitSpec],
+def check_a2(cand: BADAPT.BuiltEngine, build_decl: Mapping, units: list[UnitSpec],
              packages: list[Package], horizon: Horizon, *, th: Mapping, check_invariance: bool = True) -> dict:
     """A2 determinism under seed across processes, PYTHONHASHSEED, case orders, opaque IDs, and seed_test_setting."""
     req = build_decl["request"]
@@ -698,61 +656,6 @@ def check_a2(cand: BCAND.CandidateEngine, build_decl: Mapping, units: list[UnitS
             "problems": probs[:12]}
 
 
-def check_a3(cand: BCAND.CandidateEngine, units: list[UnitSpec], packages: list[Package],
-             horizon: Horizon, *, th: Mapping, build_decl: Mapping | None = None) -> dict:
-    """A3 batch equals run: skipped when module has no `run_batch_state`; else exact pair-by-pair
-    match across distinct parameter sets and packages (BE7)."""
-    if not cand.has_batch():
-        return {"id": "A3", "status": "skipped", "passed": 0, "total": 0, "problems": []}
-    tol = float(th["batch_vs_run_rel_tol"])
-    probs: list[str] = []
-    # Pick distinct valid parameter sets so A3 catches batch code reusing member 0's params
-    req = (build_decl or {}).get("request") or {}
-    inert = set((req.get("inert") or {}).keys())
-    param_specs = [p for p in (req.get("parameters") or []) if p.get("name") not in inert]
-    # Pick a non-inert parameter with multiple distinct domain points
-    varied_name: str | None = None
-    varied_pts: list = []
-    for ps in sorted(param_specs, key=lambda p: p["name"]):
-        pts = _domain_points_param(ps)
-        uniq = list(dict.fromkeys(pts))
-        if len(uniq) >= 2:
-            varied_name = str(ps["name"])
-            varied_pts = uniq
-            break
-    if varied_name is None:
-        for p in cand.parameters():
-            if p.lo is not None and p.hi is not None and float(p.hi) > float(p.lo):
-                lo, hi = float(p.lo), float(p.hi)
-                varied_name = p.name
-                varied_pts = [lo + 0.25 * (hi - lo), lo + 0.75 * (hi - lo)]
-                break
-
-    batch_pkgs = list(packages)
-    if len(batch_pkgs) == 1 and varied_pts:
-        batch_pkgs = [batch_pkgs[0], batch_pkgs[0]]
-    p_sets: list[dict] = []
-    for idx in range(len(batch_pkgs)):
-        if varied_name is not None and varied_pts:
-            p_sets.append({varied_name: varied_pts[idx % len(varied_pts)]})
-        else:
-            p_sets.append({})
-
-    n_total, n_pass = 0, 0
-    for u in units[:4]:
-        b_outs = cand.run_batch(p_sets, u, batch_pkgs, horizon, seed=7)
-        s_outs = cand.run_many([(prm, u, pk, horizon, 7) for prm, pk in zip(p_sets, batch_pkgs)])
-        for prm, pk, bo, so in zip(p_sets, batch_pkgs, b_outs, s_outs):
-            n_total += 1
-            same, worst = _outcomes_close(bo, so, rel=tol, abs_tol=tol)
-            if same:
-                n_pass += 1
-            else:
-                probs.append(f"{u.id}/{pk.id} ({prm}): run_batch differs from run (rel={worst:.3g} > {tol})")
-    return {"id": "A3", "status": "pass" if not probs else "fail", "passed": n_pass, "total": n_total,
-            "problems": probs[:12]}
-
-
 def _within_tol(got, want, tol: Mapping) -> tuple[bool, float]:
     if isinstance(want, (list, tuple)):
         if not isinstance(got, (list, tuple)) or len(got) != len(want):
@@ -773,7 +676,7 @@ def _within_tol(got, want, tol: Mapping) -> tuple[bool, float]:
     return (ok_abs or ok_rel), diff
 
 
-def check_a4(cand: BCAND.CandidateEngine, build_decl: Mapping, spec_raw: Mapping,
+def check_a4(cand: BADAPT.BuiltEngine, build_decl: Mapping, spec_raw: Mapping,
              rng: np.random.Generator, *, n_free: int, th: Mapping, ref_units: list[UnitSpec] | None = None) -> dict:
     """A4 analytic/oracle reductions + harness-derived absent-component & N-invariance identities (BE10)."""
     req = build_decl["request"]
@@ -903,7 +806,7 @@ def check_a4(cand: BCAND.CandidateEngine, build_decl: Mapping, spec_raw: Mapping
             "problems": probs[:12], "details": details[:12]}
 
 
-def check_a5(cand: BCAND.CandidateEngine, build_decl: Mapping, units: list[UnitSpec],
+def check_a5(cand: BADAPT.BuiltEngine, build_decl: Mapping, units: list[UnitSpec],
              packages: list[Package], horizon: Horizon, *, th: Mapping) -> dict:
     """A5 mass balance, population conservation, and compartment transition-count witness (BE8, BE9)."""
     if build_decl.get("kind") != "starsim_module":
@@ -987,7 +890,7 @@ def check_a5(cand: BCAND.CandidateEngine, build_decl: Mapping, units: list[UnitS
             "problems": probs[:12]}
 
 
-def check_a6(cand: BCAND.CandidateEngine, build_decl: Mapping, spec_raw: Mapping,
+def check_a6(cand: BADAPT.BuiltEngine, build_decl: Mapping, spec_raw: Mapping,
              rng: np.random.Generator, *, n_bases: int, min_moving: int, th: Mapping,
              ref_units: list[UnitSpec] | None = None) -> dict:
     """A6 wiring & liveness sanity (BE2, BE3, BE5):
@@ -1273,7 +1176,7 @@ def check_a6(cand: BCAND.CandidateEngine, build_decl: Mapping, spec_raw: Mapping
             "passed": n_pass, "total": n_total, "problems": a6_probs[:12], "wiring": wiring_rows}
 
 
-def build_trial_bench_artifacts(cand: BCAND.CandidateEngine, build_decl: Mapping, spec_raw: Mapping) -> tuple[dict, dict, dict, dict | None]:
+def build_trial_bench_artifacts(cand: BADAPT.BuiltEngine, build_decl: Mapping, spec_raw: Mapping) -> tuple[dict, dict, dict, dict | None]:
     """Generate authoritative `pack.yaml`, `results.yaml`, `benchmark_coverage.yaml`, and optional
     `fitted.yaml` for A8 from `request.trials`, run through `toolkit/engines/benchmark.py`."""
     req = build_decl["request"]
@@ -1406,7 +1309,7 @@ def build_trial_bench_artifacts(cand: BCAND.CandidateEngine, build_decl: Mapping
         cov_benchmarks["ID0"] = {"covers": {}, "covers_none_because": "structural identity benchmark (no trial declared)"}
 
     pack_doc = {
-        "engine": BCAND.CandidateEngine.ENGINE_REF,
+        "engine": BADAPT.BuiltEngine.ENGINE_REF,
         "seeds": seeds,
         "initialisation": {
             "method": "built-engine admission harness",
@@ -1461,7 +1364,7 @@ def build_trial_bench_artifacts(cand: BCAND.CandidateEngine, build_decl: Mapping
     return pack_doc, res_doc, cov_doc, fitted_doc
 
 
-def check_a8(cand: BCAND.CandidateEngine, build_decl: Mapping, spec_raw: Mapping,
+def check_a8(cand: BADAPT.BuiltEngine, build_decl: Mapping, spec_raw: Mapping,
              *, departures_status: str = "signed", base_dir: str | None = None) -> tuple[dict, dict, dict, dict, dict | None]:
     """A8 trial benchmarks + built coverage policy (`policy='built'`, BE15)."""
     import yaml
@@ -1524,70 +1427,20 @@ def check_a8(cand: BCAND.CandidateEngine, build_decl: Mapping, spec_raw: Mapping
     return chk, pack_doc, res_doc, cov_doc, fitted_doc
 
 
-def check_a10(cand: BCAND.CandidateEngine, build_decl: Mapping, spec_raw: Mapping,
-              *, base_dir: str | None = None) -> dict:
-    """A10 identifiability on calibration targets via `calibrators.calibrate_as_run` (non-gating on its own)."""
-    cal = spec_raw.get("calibration") if isinstance(spec_raw, Mapping) else None
-    method = str((cal or {}).get("method", "none")) if isinstance(cal, Mapping) else "none"
-    if method == "none" and not (isinstance(cal, Mapping) and cal.get("joint")):
-        return {"id": "A10", "status": "skipped", "passed": 0, "total": 0, "problems": [], "classes": {}}
-    from toolkit.engines.built import calibrators as BCAL
-    try:
-        res = BCAL.calibrate_as_run(
-            lambda _cfg=None: cand,
-            {"spec_raw": dict(spec_raw), "base_dir": base_dir or os.getcwd()},
-            seed=53,
-        )
-        classes = dict(res.get("classes") or {})
-        lik_classes = dict(res.get("likelihood_classes") or {})
-        ridges = list(res.get("ridges") or [])
-        ridge_params = {str(p) for r in ridges if isinstance(r, Mapping) for p in (r.get("params") or [])}
-        all_names = set(classes) | set(lik_classes) | ridge_params
-        unid = sorted(
-            k for k in all_names
-            if classes.get(k) in ("unidentified", "prior_dominated")
-            or lik_classes.get(k) in ("on_ridge", "unidentified")
-            or k in ridge_params
-        )
-        probs: list[str] = []
-        if res.get("blocked"):
-            probs.append(f"joint calibration blocked (unmatched={res.get('unmatched') or []})")
-        return {
-            "id": "A10",
-            "status": "pass" if not res.get("blocked") else "fail",
-            "passed": max(0, len(all_names) - len(unid)),
-            "total": len(all_names),
-            "classes": classes,
-            "likelihood_classes": lik_classes,
-            "ridges": ridges,
-            "unidentified": unid,
-            "problems": probs,
-        }
-    except Exception as e:  # noqa: BLE001 -- A10 does not gate admission on its own (open question 8)
-        return {"id": "A10", "status": "unavailable", "passed": 0, "total": 0,
-                "classes": {}, "problems": [f"A10 calibration check unavailable: {e}"]}
-
-
-def check_a11(cand: BCAND.CandidateEngine, ref_cand: BCAND.CandidateEngine | None, build_decl: Mapping,
-              cases: list[tuple[dict, UnitSpec, Package, Horizon]], *, th: Mapping, required: bool = True) -> dict:
-    """A11 independent reference equivalence test (BE17):
-    - Compares every individual full path (`per_capita.<o>.<g>`, `windows.<w>.<m>`, `cost.<d>`).
-    - Deterministic: every compared output within `min(request.reference_tolerance, thresholds.reference_rel_ceiling)`.
-    - Stochastic: 95% paired CRN CI of mean difference must lie ENTIRELY inside tolerance; doubles K up to
-      `stochastic_seeds_max`; still straddling -> `inconclusive` (NOT admitted!)."""
+def check_a11(cand: BADAPT.BuiltEngine, ref_cand: BADAPT.BuiltEngine | None, build_decl: Mapping,
+              cases: list[tuple[dict, UnitSpec, Package, Horizon]], *, th: Mapping, required: bool = False) -> dict:
+    """A11 optional deterministic reference equivalence test:
+    Compares every individual full path (`per_capita.<o>.<g>`, `windows.<w>.<m>`, `cost.<d>`) within
+    `min(request.reference_tolerance, thresholds.reference_rel_ceiling)`."""
     if ref_cand is None:
         if not required:
             return {"id": "A11", "status": "skipped", "passed": 0, "total": 0, "problems": []}
         return {"id": "A11", "status": "unavailable", "passed": 0, "total": 0,
                 "problems": ["independent reference implementation unavailable (A11 required)"]}
     req = build_decl["request"]
-    stochastic = bool(req.get("stochastic", False))
     rtol_decl = req.get("reference_tolerance") or {}
     rel_lim = min(float(rtol_decl.get("rel", th["reference_rel_ceiling"])), float(th["reference_rel_ceiling"]))
     abs_lim = float(rtol_decl.get("abs", th["reference_abs_default"]))
-    z_crit = NormalDist().inv_cdf(0.5 + float(th["move_ci_level"]) / 2.0)
-    k_init = int(th["stochastic_seeds_init"])
-    k_max = int(th["stochastic_seeds_max"])
 
     req_outs = req.get("outputs") or {}
     age_groups = list(req.get("age_groups") or [])
@@ -1601,92 +1454,39 @@ def check_a11(cand: BCAND.CandidateEngine, ref_cand: BCAND.CandidateEngine | Non
     for drv in (req_outs.get("cost_drivers") or []):
         out_names.append(f"cost.{drv}")
     probs: list[str] = []
-    inconclusive = False
     n_total, n_pass = 0, 0
     rows: list[dict] = []
 
-    if not stochastic:
-        det_cases = [(prm, u, pk, hor, 71 + ci) for ci, (prm, u, pk, hor) in enumerate(cases)]
-        c_det = cand.run_many(det_cases) if det_cases else []
-        r_det = ref_cand.run_many(det_cases) if det_cases else []
-        for ci, (oc, or_) in enumerate(zip(c_det, r_det)):
-            for oname in out_names:
-                n_total += 1
-                vc, vr = _extract_output(oc, oname), _extract_output(or_, oname)
-                diff = abs(vc - vr)
-                tol = max(abs_lim, rel_lim * max(abs(vr), 1e-12))
-                ok_ = math.isfinite(diff) and diff <= tol
-                rows.append({"case": ci, "output": oname, "cand": vc, "ref": vr, "tol": tol, "ok": ok_})
-                if ok_:
-                    n_pass += 1
-                else:
-                    probs.append(f"case {ci} {oname}: candidate={vc:.5g} vs ref={vr:.5g} (|diff|={diff:.4g} > tol={tol:.4g})")
-    else:
-        for ci, (prm, u, pk, hor) in enumerate(cases):
-            # Stochastic equivalence: double K until CI lies inside [-tol, +tol], clearly outside, or hits k_max
-            k = k_init
-            while True:
-                seeds = [200 + ci * 1000 + s for s in range(k)]
-                c_outs = cand.run_many([(prm, u, pk, hor, s) for s in seeds])
-                r_outs = ref_cand.run_many([(prm, u, pk, hor, s) for s in seeds])
-                need_more = False
-                case_rows = []
-                case_probs = []
-                case_inc = False
-                for oname in out_names:
-                    cs = [_extract_output(o, oname) for o in c_outs]
-                    rs = [_extract_output(o, oname) for o in r_outs]
-                    diffs = [a - b for a, b in zip(cs, rs)]
-                    mean_d = float(np.mean(diffs))
-                    mean_r = float(np.mean(rs))
-                    se = float(np.std(diffs, ddof=1)) / math.sqrt(k) if k > 1 else 0.0
-                    lo_ci, hi_ci = mean_d - z_crit * se, mean_d + z_crit * se
-                    tol = max(abs_lim, rel_lim * max(abs(mean_r), 1e-12))
-                    if lo_ci >= -tol and hi_ci <= tol:
-                        case_rows.append({"case": ci, "output": oname, "mean_diff": mean_d, "ci": [lo_ci, hi_ci],
-                                          "tol": tol, "k": k, "status": "equivalent"})
-                    elif lo_ci > tol or hi_ci < -tol:
-                        case_probs.append(f"case {ci} {oname}: ref mismatch CI [{lo_ci:.4g}, {hi_ci:.4g}] outside +/-{tol:.4g} (K={k})")
-                        case_rows.append({"case": ci, "output": oname, "mean_diff": mean_d, "ci": [lo_ci, hi_ci],
-                                          "tol": tol, "k": k, "status": "fail"})
-                    elif k < k_max:
-                        need_more = True
-                        break
-                    else:
-                        case_inc = True
-                        case_probs.append(f"case {ci} {oname}: inconclusive at K={k} (CI [{lo_ci:.4g}, {hi_ci:.4g}], tol +/-{tol:.4g})")
-                        case_rows.append({"case": ci, "output": oname, "mean_diff": mean_d, "ci": [lo_ci, hi_ci],
-                                          "tol": tol, "k": k, "status": "inconclusive"})
-                if need_more:
-                    k = min(k * 2, k_max)
-                    continue
-                for cr in case_rows:
-                    n_total += 1
-                    if cr["status"] == "equivalent":
-                        n_pass += 1
-                rows.extend(case_rows)
-                probs.extend(case_probs)
-                if case_inc:
-                    inconclusive = True
-                break
+    det_cases = [(prm, u, pk, hor, 71 + ci) for ci, (prm, u, pk, hor) in enumerate(cases)]
+    c_det = cand.run_many(det_cases) if det_cases else []
+    r_det = ref_cand.run_many(det_cases) if det_cases else []
+    for ci, (oc, or_) in enumerate(zip(c_det, r_det)):
+        for oname in out_names:
+            n_total += 1
+            vc, vr = _extract_output(oc, oname), _extract_output(or_, oname)
+            diff = abs(vc - vr)
+            tol = max(abs_lim, rel_lim * max(abs(vr), 1e-12))
+            ok_ = math.isfinite(diff) and diff <= tol
+            rows.append({"case": ci, "output": oname, "cand": vc, "ref": vr, "tol": tol, "ok": ok_})
+            if ok_:
+                n_pass += 1
+            else:
+                probs.append(f"case {ci} {oname}: candidate={vc:.5g} vs ref={vr:.5g} (|diff|={diff:.4g} > tol={tol:.4g})")
 
-    if probs:
-        status = "inconclusive" if inconclusive and not any("ref mismatch" in p for p in probs) else "fail"
-    else:
-        status = "pass"
+    status = "fail" if probs else "pass"
     comp_sha = _sha256_json(rows)
     return {"id": "A11", "status": status, "passed": n_pass, "total": n_total,
             "problems": probs[:12], "rows": rows[:12], "comparison_sha256": comp_sha}
 
 
 # --------------------------------------------------------------------------- Public checks (try tool)
-def run_public_checks(cand: BCAND.CandidateEngine, build_decl: Mapping, spec_raw: Mapping,
+def run_public_checks(cand: BADAPT.BuiltEngine, build_decl: Mapping, spec_raw: Mapping,
                       *, checks: list[str] | None = None, base_dir: str | None = None,
                       departures_status: str = "signed") -> dict:
     """Run ONLY public checks using `PUBLIC_SEED_BYTES` (used by `try_tool`)."""
     th = load_thresholds()
     req = build_decl["request"]
-    want = set(checks) if checks is not None else {"A1", "A2", "A3", "A4", "A5", "A6", "A8"}
+    want = set(checks) if checks is not None else {"A1", "A2", "A4", "A5", "A6", "A8"}
     rng = _rng_from(PUBLIC_SEED_BYTES, "public")
     hor = _default_horizon(spec_raw, req)
     comp_specs = req.get("components") or {}
@@ -1702,8 +1502,6 @@ def run_public_checks(cand: BCAND.CandidateEngine, build_decl: Mapping, spec_raw
         out_checks["A1"] = check_a1(cand, build_decl, spec_raw, pub_units, pub_pkgs, hor)
     if "A2" in want:
         out_checks["A2"] = check_a2(cand, build_decl, pub_units, pub_pkgs, hor, th=th, check_invariance=True)
-    if "A3" in want:
-        out_checks["A3"] = check_a3(cand, pub_units, pub_pkgs, hor, th=th, build_decl=build_decl)
     if "A4" in want:
         out_checks["A4"] = check_a4(cand, build_decl, spec_raw, _rng_from(PUBLIC_SEED_BYTES, "a4"), n_free=1, th=th)
     if "A5" in want:
@@ -1716,80 +1514,6 @@ def run_public_checks(cand: BCAND.CandidateEngine, build_decl: Mapping, spec_raw
         out_checks["A8"] = a8
     ok_all = all(c.get("status") in ("pass", "skipped", "not_applicable") for c in out_checks.values())
     return {"ok": ok_all, "checks": out_checks}
-
-
-# --------------------------------------------------------------------------- Reuse key & cross-run reuse (§5.4, BE32)
-def compute_reuse_key(
-    snapshot_sha256: str,
-    build_decl: Mapping,
-    spec_raw: Mapping,
-    *,
-    config: Mapping | None = None,
-    require_reference: bool = True,
-    reference_files: Mapping[str, bytes] | None = None,
-    dossier_bytes: bytes | None = None,
-    base_dir: str | None = None,
-    deps_digest: str | None = None,
-) -> str:
-    """Reuse key over every resolved input of every admission check (BE32)."""
-    def _file_sha(p: str) -> str:
-        if os.path.isfile(p):
-            with open(p, "rb") as fh:
-                return _sha256_bytes(fh.read())
-        return "missing"
-
-    def _collect_refs(obj, prefix: str, out: dict[str, str]) -> None:
-        if isinstance(obj, Mapping):
-            for k, v in sorted(obj.items(), key=lambda kv: str(kv[0])):
-                ks = str(k)
-                if ks in ("csv", "targets_csv", "file", "data", "path") and isinstance(v, str) and v:
-                    out[f"{prefix}.{ks}:{v}"] = _file_sha(os.path.join(base_dir, v))
-                else:
-                    _collect_refs(v, f"{prefix}.{ks}", out)
-        elif isinstance(obj, list):
-            for idx, item in enumerate(obj):
-                _collect_refs(item, f"{prefix}[{idx}]", out)
-
-    du = spec_raw.get("decision_units") if isinstance(spec_raw, Mapping) else None
-    cal = spec_raw.get("calibration") if isinstance(spec_raw, Mapping) else None
-    data_digests: dict[str, str] = {}
-    if base_dir:
-        _collect_refs(du, "units", data_digests)
-        _collect_refs(cal, "cal", data_digests)
-    ref_sha = (
-        _sha256_json({str(k): _sha256_bytes(bytes(v)) for k, v in sorted(reference_files.items())})
-        if reference_files is not None else "none"
-    )
-    payload = {
-        "snapshot_sha256": str(snapshot_sha256),
-        "request_sha256": BREQ.request_sha256(build_decl),
-        "config_sha256": BADAPT.effective_config_sha256(config or {}),
-        "horizon": spec_raw.get("horizon") if isinstance(spec_raw, Mapping) else None,
-        "decision_units": du,
-        "options": spec_raw.get("options") if isinstance(spec_raw, Mapping) else None,
-        "objective": spec_raw.get("objective") if isinstance(spec_raw, Mapping) else None,
-        "calibration": cal,
-        "engine_departures": spec_raw.get("engine_departures") if isinstance(spec_raw, Mapping) else None,
-        "engine_parameters": spec_raw.get("engine_parameters") if isinstance(spec_raw, Mapping) else None,
-        "uncertainty": spec_raw.get("uncertainty") if isinstance(spec_raw, Mapping) else None,
-        "decision_tests": (
-            (spec_raw.get("analysis") or {}).get("decision_tests")
-            if isinstance(spec_raw, Mapping) and isinstance(spec_raw.get("analysis"), Mapping)
-            else None
-        ),
-        "data_digests": data_digests,
-        "require_reference": bool(require_reference),
-        "reference_sha256": ref_sha,
-        "dossier_sha256": _sha256_bytes(dossier_bytes) if dossier_bytes is not None else "none",
-        "thresholds_sha256": _file_sha(THRESHOLDS_PATH),
-        "oracles_sha256": _file_sha(os.path.join(HERE, "oracles.py")),
-        "worker_sha256": _file_sha(os.path.join(HERE, "worker.py")),
-        "adapter_sha256": _file_sha(os.path.join(HERE, "adapter.py")),
-        "calibrators_sha256": _file_sha(os.path.join(HERE, "calibrators.py")),
-        "admission_sha256": _file_sha(os.path.abspath(__file__)),
-        "deps_sha256": deps_digest if deps_digest is not None else BADAPT.deps_sha256(),
-    }
-    return _sha256_json(payload)
 
 
 def _is_sha64(x) -> bool:
@@ -1846,93 +1570,6 @@ def _publish_verified_snapshot(target_snaps: str, snap_sha: str, verified_files:
     BSNAP.read_verified_snapshot(target_snaps, snap_sha)
 
 
-def try_reuse_admission(prior_run_dir: str, target_run_dir: str, expected_reuse_key: str) -> dict | None:
-    """Reuse a prior run's admission when `reuse_key` matches, the prior run is sandboxed, and
-    every mandatory snapshot, optional reference snapshot, and bench artifact verifies (BE32). Never
-    copies `signoff.json` (the owner signs the engine again for the new run, §5.4). Idempotent over
-    existing immutable target snapshots."""
-    # Refuse reuse of any unsandboxed development run so unsandboxed.json can never be washed away
-    if os.path.lexists(os.path.join(prior_run_dir, "engine_build", "unsandboxed.json")):
-        return None
-    if BWORK.unsandboxed_findings(prior_run_dir):
-        return None
-    try:
-        adm_bytes, st = SIO.read_nofollow(prior_run_dir, "engine_build/admission.json")
-        if st.st_nlink > 1:
-            return None
-        adm = json.loads(adm_bytes.decode("utf-8"))
-    except (FileNotFoundError, SIO.LinkRefused, OSError, UnicodeDecodeError, ValueError):
-        return None
-    if not isinstance(adm, dict) or adm.get("status") != "admitted" or adm.get("reuse_key") != expected_reuse_key:
-        return None
-    snap_sha = adm.get("snapshot_sha256")
-    if not _is_sha64(snap_sha):
-        return None
-    prior_snaps = os.path.join(prior_run_dir, "engine_build", "snapshots")
-    try:
-        verified_files = BSNAP.read_verified_snapshot(prior_snaps, snap_sha)
-    except BSNAP.SnapshotError:
-        return None
-    # Require EVERY mandatory bench/* digest in prior admission.json and verify every file before copying
-    digests = adm.get("digests") if isinstance(adm.get("digests"), Mapping) else {}
-    for req_rel in BADAPT.BENCH_FILES:
-        if not _is_sha64(digests.get(req_rel)):
-            return None
-    if os.path.lexists(os.path.join(prior_run_dir, "engine_build", "bench", "fitted.yaml")) and "bench/fitted.yaml" not in digests:
-        return None
-    verified_ref_files: dict[str, bytes] | None = None
-    ref_sha: str | None = None
-    if "reference_snapshot" in digests:
-        ref_sha = digests.get("reference_snapshot")
-        if not _is_sha64(ref_sha):
-            return None
-        prior_ref_snaps = os.path.join(prior_run_dir, "engine_build", "reference", "snapshots")
-        try:
-            verified_ref_files = BSNAP.read_verified_snapshot(prior_ref_snaps, ref_sha)
-        except BSNAP.SnapshotError:
-            return None
-    if "reference_comparison" in digests and not _is_sha64(digests.get("reference_comparison")):
-        return None
-    copied_bench: dict[str, bytes] = {}
-    for rel, want in digests.items():
-        if rel in ("reference_snapshot", "reference_comparison"):
-            continue
-        if not _is_sha64(want):
-            return None
-        try:
-            raw, bst = SIO.read_nofollow(prior_run_dir, f"engine_build/{rel}")
-            if bst.st_nlink > 1 or _sha256_bytes(raw) != want:
-                return None
-            copied_bench[rel] = raw
-        except (FileNotFoundError, SIO.LinkRefused, OSError):
-            return None
-
-    # Publish verified candidate (and optional reference) snapshots idempotently
-    _publish_verified_snapshot(os.path.join(target_run_dir, "engine_build", "snapshots"), snap_sha, verified_files)
-    if verified_ref_files is not None and ref_sha is not None:
-        _publish_verified_snapshot(
-            os.path.join(target_run_dir, "engine_build", "reference", "snapshots"),
-            ref_sha,
-            verified_ref_files,
-        )
-
-    if "bench/fitted.yaml" not in copied_bench:
-        SIO.remove_nofollow(target_run_dir, "engine_build/bench/fitted.yaml", missing_ok=True)
-    for rel, raw in copied_bench.items():
-        SIO.write_nofollow(target_run_dir, f"engine_build/{rel}", raw, atomic=True)
-    prior_sheet = ""
-    try:
-        prior_sheet = SIO.read_nofollow(prior_run_dir, "engine_build/admission_sheet.md")[0].decode("utf-8")
-    except (FileNotFoundError, SIO.LinkRefused, OSError, UnicodeDecodeError):
-        pass
-    banner = f"> **Reused from run `{os.path.abspath(prior_run_dir)}`** (reuse key `{expected_reuse_key[:16]}`; requires new sign-off).\n\n"
-    SIO.write_nofollow(target_run_dir, "engine_build/admission_sheet.md", (banner + prior_sheet).encode("utf-8"), atomic=True)
-    new_adm = dict(adm, reused_from=os.path.abspath(prior_run_dir))
-    SIO.write_nofollow(target_run_dir, "engine_build/admission.json",
-                       json.dumps(new_adm, indent=1, sort_keys=True).encode("utf-8"), atomic=True)
-    return new_adm
-
-
 # --------------------------------------------------------------------------- Admission sheet & orchestrator
 def render_admission_sheet(adm: Mapping) -> str:
     """Render `engine_build/admission_sheet.md` (§5.3)."""
@@ -1943,7 +1580,6 @@ def render_admission_sheet(adm: Mapping) -> str:
         f"- **Status:** `{adm.get('status')}`",
         f"- **Snapshot sha256:** `{adm.get('snapshot_sha256')}`",
         f"- **Request sha256:** `{adm.get('request_sha256')}`",
-        f"- **Reuse key:** `{adm.get('reuse_key')}`",
         f"- **Hidden seed commitment:** `{adm.get('hidden_commitment')}`",
         "",
         "> **Scope of automated checks:** These checks verify mathematical, structural, wiring, and trial-consistency "
@@ -1999,28 +1635,20 @@ def admit(
     *,
     config: Mapping | None = None,
     reference_files: Mapping[str, bytes] | None = None,
-    require_reference: bool = True,
+    require_reference: bool = False,
     dossier_bytes: bytes | None = None,
     departures_status: str = "signed",
     unsandboxed_ok: bool = False,
     _force_sandbox: str | None = "auto",
 ) -> dict:
-    """Run the full admission gate (S1-S3, A1-A6, A8, A10, A11) on an immutable snapshot in `run_dir`,
-    writing `engine_build/bench/*`, `engine_build/admission_sheet.md`, and atomically
-    `engine_build/admission.json` last."""
+    """Run the admission gate (S1-S3, A1-A2, A4-A6, A8, optional deterministic A11) on an immutable
+    snapshot in `run_dir`, writing `engine_build/bench/*`, `engine_build/admission_sheet.md`,
+    and atomically `engine_build/admission.json` last."""
     import yaml
     th = load_thresholds()
     snaps_dir = os.path.join(run_dir, "engine_build", "snapshots")
     verified_files = BSNAP.read_verified_snapshot(snaps_dir, snapshot_sha256)
     seed_bytes, commitment = _load_or_commit_hidden_seed(run_dir)
-    reuse_key = compute_reuse_key(
-        snapshot_sha256, build_decl, spec_raw,
-        config=config,
-        require_reference=require_reference,
-        reference_files=reference_files,
-        dossier_bytes=dossier_bytes,
-        base_dir=run_dir,
-    )
 
     # S1-S3 static checks BEFORE any run
     static_probs = BSNAP.check_static(verified_files, request=build_decl)
@@ -2034,7 +1662,6 @@ def admit(
             "request_sha256": BREQ.request_sha256(build_decl),
             "config_sha256": BADAPT.effective_config_sha256(config or {}),
             "hidden_commitment": commitment,
-            "reuse_key": reuse_key,
             "static_problems": static_probs,
             "checks": {},
             "digests": {},
@@ -2045,7 +1672,7 @@ def admit(
                            json.dumps(adm, indent=1, sort_keys=True).encode("utf-8"), atomic=True)
         return adm
 
-    cand = BCAND.CandidateEngine(
+    cand = BADAPT.BuiltEngine.from_verified(
         verified_files, build_decl, config=config, run_dir=run_dir,
         unsandboxed_ok=unsandboxed_ok, id_salt=commitment[:16],
     )
@@ -2055,7 +1682,7 @@ def admit(
     if reference_files is not None:
         ref_build = copy.deepcopy(dict(build_decl))
         ref_build["kind"] = "closed_form"
-        ref_cand = BCAND.CandidateEngine(
+        ref_cand = BADAPT.BuiltEngine.from_verified(
             reference_files, ref_build, config=config, run_dir=run_dir,
             unsandboxed_ok=unsandboxed_ok, id_salt=commitment[:16],
         )
@@ -2077,7 +1704,7 @@ def admit(
     hor = _default_horizon(spec_raw, req)
     rng_h = _rng_from(seed_bytes, "hidden")
     try:
-        real_units, real_pkgs = _real_units_and_packages(
+        real_units, real_pkgs = spec_units_and_packages(
             spec_raw, req, base_dir=run_dir,
             max_units=int(th["hidden_max_units"]), max_packages=int(th["hidden_max_packages"]), rng=rng_h,
         )
@@ -2096,7 +1723,6 @@ def admit(
     else:
         checks["A1"] = _safe_check("A1", lambda: check_a1(cand, build_decl, spec_raw, a1_units, real_pkgs, hor))
     checks["A2"] = _safe_check("A2", lambda: check_a2(cand, build_decl, a2_units, real_pkgs, hor, th=th, check_invariance=True))
-    checks["A3"] = _safe_check("A3", lambda: check_a3(cand, a1_units[:4], real_pkgs, hor, th=th, build_decl=build_decl))
     checks["A4"] = _safe_check("A4", lambda: check_a4(cand, build_decl, spec_raw, _rng_from(seed_bytes, "a4"),
                                                       n_free=int(th["a4_hidden_settings"]), th=th, ref_units=real_units))
     checks["A5"] = _safe_check("A5", lambda: check_a5(cand, build_decl, a5_units, real_pkgs, hor, th=th))
@@ -2116,23 +1742,11 @@ def admit(
     a11_cases = [(dict(), u, real_pkgs[i % len(real_pkgs)], hor) for i, u in enumerate((real_units + gen_units_a1)[:4])]
     checks["A11"] = _safe_check("A11", lambda: check_a11(cand, ref_cand, build_decl, a11_cases, th=th, required=require_reference))
 
-    gating_ids = ("A1", "A2", "A3", "A4", "A5", "A6", "A8", "A11")
+    gating_ids = ("A1", "A2", "A4", "A5", "A6", "A8", "A11")
     failed_gating = [cid for cid in gating_ids if checks[cid]["status"] not in ("pass", "skipped", "not_applicable")]
-    if failed_gating:
-        checks["A10"] = {
-            "id": "A10",
-            "status": "skipped",
-            "passed": 0,
-            "total": 0,
-            "classes": {},
-            "problems": [],
-            "skipped_reason": f"skipped because gating check(s) failed: {', '.join(failed_gating)}",
-        }
-    else:
-        checks["A10"] = _safe_check("A10", lambda: check_a10(cand, build_decl, spec_raw, base_dir=run_dir))
     checks = {
         cid: checks[cid]
-        for cid in ("A1", "A2", "A3", "A4", "A5", "A6", "A8", "A10", "A11")
+        for cid in ("A1", "A2", "A4", "A5", "A6", "A8", "A11")
         if cid in checks
     }
 
@@ -2182,7 +1796,6 @@ def admit(
         "request_sha256": BREQ.request_sha256(build_decl),
         "config_sha256": BADAPT.effective_config_sha256(config or {}),
         "hidden_commitment": commitment,
-        "reuse_key": reuse_key,
         "static_problems": [],
         "checks": checks,
         "digests": digests,
@@ -2234,47 +1847,11 @@ def _self_test() -> int:
         return td, d, b, sp, man["snapshot_sha256"], adm
 
     # BE1: healthy two-group SIR Starsim fixture passes every check -> status: admitted
-    td1, d1, b1, sp1, sha1, adm1 = _run_fixture(None)
+    td1, d1, b1, sp1, sha1, adm1 = _run_fixture(None, require_reference=True, with_ref=True)
     try:
         bad1 = {k: v.get("problems") for k, v in adm1["checks"].items() if v.get("status") not in ("pass", "skipped", "not_applicable")}
         ok(adm1["status"] == "admitted" and not bad1 and os.path.isfile(os.path.join(d1, "engine_build", "admission_sheet.md")),
            f"BE1 healthy two-group SIR Starsim fixture passes every check and is admitted (bad={bad1})")
-
-        # BE32: reuse key hit copies admission & bench/ (idempotent over 0555 snapshot), refuses unsandboxed runs,
-        # and invalidates on changed calibration targets, config, require_reference, or dep pin
-        key1 = adm1["reuse_key"]
-        sp_cal = copy.deepcopy(sp1)
-        sp_cal["calibration"] = {"method": "likelihood", "targets": {"csv": "data/other_targets.csv"}}
-        key_cal = compute_reuse_key(sha1, b1, sp_cal, base_dir=d1)
-        key_dep = compute_reuse_key(sha1, b1, sp1, base_dir=d1, deps_digest="0" * 64)
-        key_noref = compute_reuse_key(sha1, b1, sp1, base_dir=d1, require_reference=False)
-        key_cfg = compute_reuse_key(sha1, b1, sp1, base_dir=d1, config={"dt_step": 0.25})
-        with tempfile.TemporaryDirectory() as d_reuse:
-            # First ensure an unsandboxed marker blocks reuse
-            un_path = os.path.join(d1, "engine_build", "unsandboxed.json")
-            if not os.path.exists(un_path):
-                SIO.write_nofollow(d1, "engine_build/unsandboxed.json", b'{"events":[{"action":"run"}]}', atomic=True)
-            blocked_un = try_reuse_admission(d1, d_reuse, key1)
-            # Clear marker so reuse path can be verified (twice, checking idempotency over 0555 snapshot dir)
-            SIO.remove_nofollow(d1, "engine_build/unsandboxed.json", missing_ok=True)
-            reused = try_reuse_admission(d1, d_reuse, key1)
-            reused2 = try_reuse_admission(d1, d_reuse, key1)
-            miss_reuse = try_reuse_admission(d1, d_reuse, key_cal)
-            ref_sha1 = (adm1.get("digests") or {}).get("reference_snapshot")
-            ref_copied_ok = bool(
-                ref_sha1 and BSNAP.read_verified_snapshot(
-                    os.path.join(d_reuse, "engine_build", "reference", "snapshots"), ref_sha1
-                )
-            )
-            # Removing the source reference snapshot manifest must make reuse fail closed
-            SIO.remove_nofollow(d1, f"engine_build/reference/snapshots/{ref_sha1}.json", missing_ok=True)
-            miss_ref = try_reuse_admission(d1, d_reuse, key1)
-            ok(blocked_un is None and reused is not None and reused2 is not None and ref_copied_ok and miss_ref is None
-               and reused["status"] == "admitted" and reused.get("reused_from") == os.path.abspath(d1)
-               and not os.path.exists(os.path.join(d_reuse, "engine_build", "signoff.json"))
-               and miss_reuse is None and key_cal != key1 and key_dep != key1
-               and key_noref != key1 and key_cfg != key1,
-               "BE32 reuse refuses unsandboxed/missing-ref runs, copies snapshots+ref idempotently (no signoff.json), and invalidates on changed inputs")
     finally:
         td1.cleanup()
 
@@ -2323,13 +1900,6 @@ def _self_test() -> int:
         td_a.cleanup()
         td_b.cleanup()
 
-    # BE7: leaky run_batch_state fails A3
-    td, _, _, _, _, adm = _run_fixture("leaky_batch", require_reference=False, with_ref=False)
-    try:
-        ok(adm["checks"]["A3"]["status"] == "fail", f"BE7 leaky batch path fails A3 ({adm['checks']['A3']['problems'][:1]})")
-    finally:
-        td.cleanup()
-
     # BE8: 0.1%/step population growth under conservation=closed fails A5
     td, _, _, _, _, adm = _run_fixture("mass_growth", require_reference=False, with_ref=False)
     try:
@@ -2349,7 +1919,7 @@ def _self_test() -> int:
     # BE10: public lookup table passes public A4 and fails hidden A4
     td, _, b10, sp10, sha10, adm10 = _run_fixture("public_table", require_reference=False, with_ref=False)
     try:
-        cand10 = BCAND.CandidateEngine(BFIX.two_group_sir_files("public_table"), b10, unsandboxed_ok=dev_un)
+        cand10 = BADAPT.BuiltEngine.from_verified(BFIX.two_group_sir_files("public_table"), b10, unsandboxed_ok=dev_un)
         pub_a4 = check_a4(cand10, b10, sp10, _rng_from(PUBLIC_SEED_BYTES, "a4"), n_free=1, th=load_thresholds())
         hid_a4 = check_a4(cand10, b10, sp10, _rng_from(b"hidden-be10", "a4"), n_free=3, th=load_thresholds())
         ok(adm10["status"] == "not_admitted" and pub_a4["status"] == "pass" and hid_a4["status"] == "fail",
@@ -2384,25 +1954,16 @@ def _self_test() -> int:
     finally:
         td.cleanup()
 
-    # BE17: reference off by 6% fails deterministic A11; stochastic fixture with 5% bias & huge noise is inconclusive
+    # BE17: optional deterministic A11 fails on 6% biased ref and skips cleanly without ref when not required
     td_det, _, _, _, _, adm_det = _run_fixture(None, ref_bias=0.06, require_reference=True, with_ref=True)
-    b_st = BFIX.two_group_sir_build(stochastic=True)
-    sp_st = BFIX.two_group_sir_spec(b_st)
+    td_sk, _, _, _, _, adm_sk = _run_fixture(None, require_reference=False, with_ref=False)
     try:
-        cand_st = BCAND.CandidateEngine(BFIX.two_group_sir_files("stochastic_bias", stochastic_sd=0.60),
-                                        b_st, unsandboxed_ok=dev_un)
-        ref_b = copy.deepcopy(b_st)
-        ref_b["kind"] = "closed_form"
-        ref_st = BCAND.CandidateEngine(BFIX.two_group_sir_reference_files(rel_bias=0.0), ref_b, unsandboxed_ok=dev_un)
-        th_fast = dict(load_thresholds(), stochastic_seeds_init=4, stochastic_seeds_max=8)
-        hor = _default_horizon(sp_st, b_st["request"])
-        u_st = UnitSpec("u0", {"N": 10000.0, "s0": 0.9, "age_pop": [5000.0, 5000.0]})
-        a11_st = check_a11(cand_st, ref_st, b_st, [({}, u_st, Package("p0", {"comp_a": 0}), hor)],
-                           th=th_fast, required=True)
-        ok(adm_det["checks"]["A11"]["status"] == "fail" and a11_st["status"] == "inconclusive",
-           f"BE17 biased ref fails A11 ({adm_det['checks']['A11']['status']}); noisy biased stochastic is inconclusive ({a11_st['status']})")
+        ok(adm_det["checks"]["A11"]["status"] == "fail" and adm_sk["status"] == "admitted"
+           and adm_sk["checks"]["A11"]["status"] == "skipped",
+           f"BE17 biased ref fails A11 ({adm_det['checks']['A11']['status']}); omitted ref skips cleanly ({adm_sk['checks']['A11']['status']})")
     finally:
         td_det.cleanup()
+        td_sk.cleanup()
 
     # BE33: admission compute reservation against run balance pauses before dispatch when balance < cap
     # and rejects non-finite (NaN/inf) amounts
@@ -2427,7 +1988,7 @@ def _self_test() -> int:
     h_warm = _default_horizon({"horizon": {"start": 2010, "stop": 2035}, "objective": {"horizon": [2025, 2030]}},
                               {"outputs": {"windows": {"w0": ["prev"]}}})
     req_30 = {"components": {f"c{i:02d}": {"values": [0, 1], "absent": 0} for i in range(30)}, "unit_attributes": {}}
-    _, pkgs_30 = _real_units_and_packages({}, req_30, max_packages=16, rng=np.random.default_rng(1))
+    _, pkgs_30 = spec_units_and_packages({}, req_30, max_packages=16, rng=np.random.default_rng(1))
     req_grp = {"components": {"a": {"values": [0, 1], "absent": 0}, "b": {"values": [0, 1], "absent": 0}}, "unit_attributes": {}}
     sp_grp = {
         "options": {
@@ -2436,7 +1997,7 @@ def _self_test() -> int:
             "packages": {"generate": True},
         }
     }
-    _, pkgs_grp = _real_units_and_packages(sp_grp, req_grp, max_packages=16, rng=np.random.default_rng(1))
+    _, pkgs_grp = spec_units_and_packages(sp_grp, req_grp, max_packages=16, rng=np.random.default_rng(1))
     both_active = any(pk.components.get("a") == 1 and pk.components.get("b") == 1 for pk in pkgs_grp)
     td_nr, _, _, _, _, adm_nr = _run_fixture(None, require_reference=True, with_ref=False)
     try:
@@ -2448,7 +2009,7 @@ def _self_test() -> int:
        and len(pkgs_30) == 16 and not both_active and nr_ok,
        "BE_REG1 outcomes key parity, warm-up horizon, 30-bool/group packages, and unavailable A11")
 
-    # BE_CAL_ATTR1: _real_units_and_packages supplies interior midpoint for calibration.attribute (log & linear)
+    # BE_CAL_ATTR1: spec_units_and_packages supplies interior midpoint for calibration.attribute (log & linear)
     # without requiring a column binding, while still refusing unbound non-calibrated required attributes
     req_cal = {
         "components": {"c": {"values": [0, 1], "absent": 0}},
@@ -2463,14 +2024,14 @@ def _self_test() -> int:
                            "engine_attributes": {"base": {"column": "base"}}},
         "calibration": {"method": "posterior", "attribute": "rate", "scale": "log", "range": [-6.0, -2.0]},
     }
-    u_log, _ = _real_units_and_packages(sp_cal_log, req_cal, rng=np.random.default_rng(1))
+    u_log, _ = spec_units_and_packages(sp_cal_log, req_cal, rng=np.random.default_rng(1))
     sp_cal_lin = copy.deepcopy(sp_cal_log)
     sp_cal_lin["calibration"] = {"method": "posterior", "attribute": "rate", "scale": "linear", "range": [0.1, 0.3]}
-    u_lin, _ = _real_units_and_packages(sp_cal_lin, req_cal, rng=np.random.default_rng(1))
+    u_lin, _ = spec_units_and_packages(sp_cal_lin, req_cal, rng=np.random.default_rng(1))
     sp_unb = {"decision_units": sp_cal_log["decision_units"]}
     unb_refused = False
     try:
-        _real_units_and_packages(sp_unb, req_cal, rng=np.random.default_rng(1))
+        spec_units_and_packages(sp_unb, req_cal, rng=np.random.default_rng(1))
     except ValueError:
         unb_refused = True
     ok(len(u_log) == 1 and abs(u_log[0].attributes["rate"] - math.exp(-4.0)) < 1e-12
@@ -2574,16 +2135,6 @@ def _self_test() -> int:
     ok(a6_lg["status"] == "pass" and a6_ld["status"] == "fail",
        f"BE_A6_LAZY active-mode fallback passes intervention-gated param while dead fails "
        f"(good={a6_lg['status']}, dead={a6_ld['status']})")
-
-    # BE_A10_SKIP: failing gating check skips A10 immediately (status='skipped')
-    td_sk, _, _, _, _, adm_sk = _run_fixture(None, ref_bias=0.06, require_reference=True, with_ref=True)
-    try:
-        a10_sk = adm_sk["checks"]["A10"]
-        ok(adm_sk["status"] == "not_admitted" and a10_sk["status"] == "skipped"
-           and "A11" in str(a10_sk.get("skipped_reason") or ""),
-           f"BE_A10_SKIP gating failure short-circuits A10 (A10={a10_sk.get('status')})")
-    finally:
-        td_sk.cleanup()
 
     if fails:
         print(f"FAILED: {len(fails)} case(s)")

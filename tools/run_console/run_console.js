@@ -530,8 +530,8 @@ function remoteBlock() {   // a remote answer needs a fresh mirror: why not, or 
 function decisionCard(c, head) {
   // The controls act on the run and the content this card was rendered for (ref), never on whatever run is
   // selected when the button is pressed; the server checks the ticket and the sign command the content.
-  const k = ref({ run: c.run_id, ticket: c.ticket, sub: c.sub, sha: c.spec_sha256, dsha: c.derivations_sha256, ssha: c.sheet_sha256, fps: c.fingerprints || [] });
-  const block = remoteBlock() || (c.sub === "spec" && c.sheet_stale ? `The sign-off sheet is stale (${c.sheet_stale}); approval waits for the regenerated sheet.` : ""), dis = block ? " disabled" : "";
+  const k = ref({ run: c.run_id, ticket: c.ticket, sub: c.sub, sha: c.spec_sha256, dsha: c.derivations_sha256, fps: c.fingerprints || [] });
+  const block = remoteBlock(), dis = block ? " disabled" : "";
   const blockNote = block ? `<div class="small" style="color:var(--bad)">${esc(block)}</div>` : "";
   if (c.sub === "spec") return `<div class="card need" data-ck="need">${head(esc(c.title))}${ctx("The run waits for the owner to sign its decision spec.", "yes, answer below.")}<div class="body">${md(c.body)}</div>
     <div class="small muted">Signing binds to decision_spec.yaml sha256 ${esc(String(c.spec_sha256 || "?").slice(0, 12))}; a spec changed since this page loaded is refused.</div>
@@ -603,7 +603,7 @@ async function act(b) {
       if (remoteBlock()) { res.textContent = remoteBlock(); return; }
       const body = { run: R.run, ticket: R.ticket, note, confirm: confirmed };
       if (b.dataset.act === "scope") { body.fingerprints = R.fps; body.answers = {}; b.closest(".card").querySelectorAll("input[type=radio]:checked").forEach((r) => (body.answers[r.dataset.f] = r.value)); }
-      else { body.spec_sha256 = R.sha; body.derivations_sha256 = R.dsha; body.sheet_sha256 = R.ssha; }
+      else { body.spec_sha256 = R.sha; body.derivations_sha256 = R.dsha; }
       if (!confirmed) { res.textContent = "Tick the confirmation first."; return; }
       if (!window.confirm(b.dataset.act === "scope" ? "Submit these answers through scripts/scope_signoff.py sign?" : "Sign the decision spec through agents/stage_machine.py sign?")) return;
       try { const r = await api(b.dataset.act === "scope" ? "/api/scope" : "/api/sign_spec", body);
@@ -704,7 +704,7 @@ async function cloud(force) {
   if (!s) { $("cloud").innerHTML = '<p class="muted small">No snapshot yet: turn on live.</p>'; return; }
   const cl = s.clusters ? Object.entries(s.clusters).map(([k, v]) => `<tr><td>${k}</td><td><code>${esc(v.name || "")}</code></td><td><b>${esc(v.state)}</b></td></tr>`).join("") : "";
   $("cloud").innerHTML = `<p class="small muted">snapshot ${when(s.at)}${j.next_refresh_s ? " · next refresh in " + j.next_refresh_s + " s" : ""}</p>${cl ? `<table class="kv">${cl}</table>` : ""}` +
-    ["status", "health", "report-cost"].map((k) => `<h4>${k} <span class="muted small">exit ${esc(s[k].rc)}</span></h4><pre>${esc(s[k].out)}</pre>`).join("");
+    ["status", "report-cost"].map((k) => `<h4>${k} <span class="muted small">exit ${esc(s[k].rc)}</span></h4><pre>${esc(s[k].out)}</pre>`).join("");
 }
 async function buildOn() {
   if (!window.confirm("Write a draft directory that reuses this run's assets? Nothing is launched.")) return;

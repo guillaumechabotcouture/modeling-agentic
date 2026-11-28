@@ -484,20 +484,9 @@ def _archive_member(code: bytes, name: str) -> bytes | None:
         return None
 
 
-SHEET_SOURCES_MARK = "<!-- signoff-sheet-sources: "   # toolkit/spec/signoff.py SHEET_SOURCES, the sheet's last line
-
-
 def stale_sheet_problems(code: bytes, flags, pipeline: str = "v2") -> list[str]:
-    """For a resumed run (--resume <run dir>) still at SIGN in the archive that ships: the sign-off sheet must
-    record the sha256 of the shipped decision_spec.yaml and data/derivations_record.json ("none" when absent),
-    as toolkit/spec/signoff.py write_sheet wrote them; the signer refuses otherwise, so the run would stop at
-    SIGN after the cluster is paid for (2026-11-12 canary). Fail closed: a missing or unparsable sheet is a
-    problem. A run past SIGN, a launch that resumes no run, or a v1 launch (no run_state.json, no sheet) has
-    nothing to check here. `--resume <dir>` and `--resume=<dir>` are both read, the dir normalised as main.py
-    resolves it (Codex review of #207). F6 evidence dossier: when the spec names one (`evidence.dossier`), the sheet
-    must record the shipped dossier's sha256 too; a run past SIGN must ship the dossier its sign-off record hashed
-    (an edit after signing makes the signature stale)."""
-    import hashlib
+    """For a resumed run (--resume <run dir>) at or past SIGN in the archive that ships: check spec existence and
+    all registered preconditions on the shipped bytes so an unsignable or stale run never starts a cluster."""
     if pipeline != "v2":
         return []
     import argparse
@@ -533,26 +522,8 @@ def stale_sheet_problems(code: bytes, flags, pipeline: str = "v2") -> list[str]:
             out += _signed_run_problems(code, rel)
             continue
         spec = _archive_member(code, f"{rel}/decision_spec.yaml")
-        sheet = _archive_member(code, f"{rel}/decision_spec.signoff_sheet.md")
-        rec = _archive_member(code, f"{rel}/data/derivations_record.json")
-        regen = f"regenerate it: python toolkit/spec/signoff.py sheet {rel} --write"
-        src = None
-        for line in reversed((sheet or b"").decode("utf-8", "replace").splitlines()):
-            if line.startswith(SHEET_SOURCES_MARK) and line.endswith(" -->"):
-                try:
-                    src = json.loads(line[len(SHEET_SOURCES_MARK):-4])
-                except ValueError:
-                    src = None
-                break
         if spec is None:
             out.append(f"{rel}: decision_spec.yaml is missing in the code to launch")
-        elif not isinstance(src, dict):
-            out.append(f"{rel}: at SIGN with no sign-off sheet recording its sources; {regen}")
-        elif src.get("spec_sha256") != hashlib.sha256(spec).hexdigest():
-            out.append(f"{rel}: the sign-off sheet was generated from another decision_spec.yaml "
-                       f"({str(src.get('spec_sha256'))[:12]}, shipped {hashlib.sha256(spec).hexdigest()[:12]}); {regen}")
-        elif src.get("derivations_sha256") != (hashlib.sha256(rec).hexdigest() if rec is not None else "none"):
-            out.append(f"{rel}: the sign-off sheet was generated from another data/derivations_record.json; {regen}")
         else:       # F6 (#218): what signing will check (coverage too), so an unsignable run never starts a cluster
             out += [f"{rel}: {p}" for p in _preconditions(code, rel, "sign")]
     return out
@@ -605,7 +576,7 @@ def _preconditions(code: bytes, rel: str, signer: str) -> list[str]:
         return [str(x) for x in got] if isinstance(got, list) else ["the preconditions check gave no list"]
 
 
-SIGNOFF_RECORDS = ("decision_spec.signoff.json", "decision_brief.signoff.json")   # toolkit/spec/signoff.py, decision_brief
+SIGNOFF_RECORDS = ("decision_spec.signoff.json",)   # toolkit/spec/signoff.py
 
 
 PRE_SIGN_STATES = ("SPEC",)          # agents/stage_machine.py EDGES: always before SIGN (a draft); EVIDENCE is before SIGN
@@ -2137,14 +2108,14 @@ def relaunch(cfg, label) -> int:
 
 def parse_sign_args(rest: list, labels) -> dict:
     """`sign <answers.yaml> [--label L] [--run RUN_DIR_NAME] [--expect-spec-sha256 SHA] [note ...]`. The options
-    name the remote run the owner was shown (the run console passes all three); without --label the config's
+    name the remote run the owner was shown (the run console passes them); without --label the config's
     first label is used, as before."""
     if not rest:
         raise SystemExit("sign needs <answers.yaml>")
     out, i = {"answers": rest[0], "label": None, "run": None, "expect": None, "action": None,
-              "expect_derivations": None, "expect_sheet": None}, 1
+              "expect_derivations": None}, 1
     flags = {"--label": "label", "--run": "run", "--expect-spec-sha256": "expect", "--action": "action",
-             "--expect-derivations-sha256": "expect_derivations", "--expect-sheet-sha256": "expect_sheet"}
+             "--expect-derivations-sha256": "expect_derivations"}
     while i < len(rest) and rest[i] in flags:
         if i + 1 >= len(rest):
             raise SystemExit(f"sign: {rest[i]} needs a value")
@@ -3557,10 +3528,9 @@ def _self_test_sign(ok) -> None:
             seen.clear()
             r = ws.sign_side("F1", "", "n", run_name="2026_b", action="spec", _runner=fake)
             ok(r["rc"] != 0 and not any("sign" in c for c in seen), f"RS7 action spec without a sha fails closed ({r})")
-            a = parse_sign_args(["a.yaml", "--action", "spec", "--expect-derivations-sha256", "none",
-                                 "--expect-sheet-sha256", "cd", "n"], ["F1"])
-            ok(a.get("action") == "spec" and a.get("expect_derivations") == "none" and a.get("expect_sheet") == "cd",
-               f"RS8 sign parses --action and the snapshot's other shas ({a})")
+            a = parse_sign_args(["a.yaml", "--action", "spec", "--expect-derivations-sha256", "none", "n"], ["F1"])
+            ok(a.get("action") == "spec" and a.get("expect_derivations") == "none",
+               f"RS8 sign parses --action and the snapshot's shas ({a})")
         except Exception as e:  # noqa: BLE001
             ok(False, f"RS6-RS8 worker sign action: {type(e).__name__}: {e}")
         finally:
@@ -5063,20 +5033,13 @@ def _self_test_sheet(ok) -> None:
         return bio.getvalue()
 
     spec, rec = b"spec: 1\n", b'{"r": 1}'
-    def sheet_for(sp, rc):
-        return ("# sheet\n<!-- signoff-sheet-sources: " + json.dumps(
-            {"spec_sha256": hashlib.sha256(sp).hexdigest(), "derivations_sha256": hashlib.sha256(rc).hexdigest()})
-            + " -->\n").encode()
     R = "runs/r1"
     flags = ("--resume", R, "--signoff", "lead")
     st = lambda s_: json.dumps({"state": s_}).encode()      # noqa: E731
     base = {f"{R}/run_state.json": st("SIGN"), f"{R}/decision_spec.yaml": spec,
-            f"{R}/data/derivations_record.json": rec, f"{R}/decision_spec.signoff_sheet.md": sheet_for(spec, rec)}
+            f"{R}/data/derivations_record.json": rec}
     fresh = stale_sheet_problems(tar_of(base), flags)
-    stale = stale_sheet_problems(tar_of({**base, f"{R}/decision_spec.yaml": b"spec: 2\n"}), flags)
-    stale_rec = stale_sheet_problems(tar_of({**base, f"{R}/data/derivations_record.json": b'{"r": 2}'}), flags)
-    nosheet = stale_sheet_problems(tar_of({k: v for k, v in base.items() if not k.endswith(".md")}), flags)
-    garbled = stale_sheet_problems(tar_of({**base, f"{R}/decision_spec.signoff_sheet.md": b"# no sources\n"}), flags)
+    nospec = stale_sheet_problems(tar_of({k: v for k, v in base.items() if not k.endswith(".yaml")}), flags)
     # #218 review round 1: a run past SIGN ships the spec its sign-off hashed (with that record's evidence binding)
     def rec_for(sp, ev=None):
         return json.dumps({"sha256": {"decision_spec.yaml": hashlib.sha256(sp).hexdigest()},
@@ -5089,7 +5052,7 @@ def _self_test_sheet(ok) -> None:
                                           f"{R}/decision_spec.signoff.json": rec_for(spec)}), flags)
     norun = stale_sheet_problems(tar_of(base), ("--signoff", "lead"))
     ok(fresh == [] and signed == [] and norun == [],
-       f"RC80a a fresh sheet, a run past SIGN and a launch with no resumed run pass: {fresh} {signed} {norun}")
+       f"RC80a a valid SIGN run, a run past SIGN and a launch with no resumed run pass: {fresh} {signed} {norun}")
     # RC80f (v2 autonomy 1B-ii): EVIDENCE now runs before SIGN, so a run there with no sign-off record is a draft;
     # one with a record (signed under the earlier order) is checked as signed
     ev_draft = stale_sheet_problems(tar_of({**base, f"{R}/run_state.json": st("EVIDENCE"),
@@ -5103,16 +5066,10 @@ def _self_test_sheet(ok) -> None:
        f"RC80f a run at EVIDENCE with no sign-off is a draft; one signed under the earlier order (a record, or a "
        f"signature in its history) is checked "
        f"({ev_draft}; {ev_signed}; {ev_lost})")
-    ok(len(stale) == 1 and "spec" in stale[0] and "signoff.py sheet" in stale[0] and "--write" in stale[0]
-       and len(stale_rec) == 1
-       and "derivation" in stale_rec[0],
-       f"RC80b a resumed run at SIGN whose spec or derivation record changed after its sheet is refused, with the "
-       f"command that regenerates the sheet: {stale} {stale_rec}")
-    ok(len(nosheet) == 1 and len(garbled) == 1,
-       f"RC80c fail closed: no sheet, or a sheet without recorded sources, is refused: {nosheet} {garbled}")
+    ok(len(nospec) == 1, f"RC80c fail closed: missing decision_spec.yaml at SIGN is refused: {nospec}")
     # Codex review of #207 (both reviewers, P2): v2 only; ./ and --resume= forms are checked; an unreadable
     # run state is refused, not skipped.
-    stale_tar = tar_of({**base, f"{R}/decision_spec.yaml": b"spec: 2\n"})
+    stale_tar = tar_of({k: v for k, v in base.items() if not k.endswith(".yaml")})
     v1 = stale_sheet_problems(stale_tar, flags, pipeline="v1")
     dot = stale_sheet_problems(stale_tar, ("--resume", "./" + R))
     eq = stale_sheet_problems(stale_tar, ("--resume=" + R,))
@@ -5124,8 +5081,8 @@ def _self_test_sheet(ok) -> None:
     # resume flag is read as main.py's argparse reads it (an abbreviation, the last value wins).
     none_mode = stale_sheet_problems(tar_of({**base, f"{R}/run_state.json": json.dumps({"state": "SIGN",
                                      "signoff": "none"}).encode(), f"{R}/decision_spec.yaml": b"spec: 2\n"}), flags)
-    # RC81 (F6 evidence dossier): the sheet and the signature bind the dossier the spec names; a launch refuses a
-    # run whose shipped dossier is not the one its sheet (at SIGN) or its sign-off (past SIGN) recorded
+    # RC81 (F6 evidence dossier): the signature binds the dossier the spec names; a launch refuses a
+    # run whose shipped dossier is not the one its sign-off (past SIGN) or current preconditions (at SIGN) expect
     dspec, dos = b"spec: 1\nevidence: {dossier: evidence_dossier.yaml}\n", b"inputs: {}\n"
 
     if root not in sys.path:
@@ -5137,15 +5094,8 @@ def _self_test_sheet(ok) -> None:
                             "run:evidence_dossier.yaml": hashlib.sha256(ds).hexdigest(),
                             "run:data/derivations_record.json": hashlib.sha256(rc).hexdigest()}.items()))
 
-    def sheet_d(sp, rc, ds):
-        return ("# sheet\n<!-- signoff-sheet-sources: " + json.dumps(
-            {"spec_sha256": hashlib.sha256(sp).hexdigest(), "derivations_sha256": hashlib.sha256(rc).hexdigest(),
-             "evidence_dossier_sha256": hashlib.sha256(ds).hexdigest(),
-             "input_closure_sha256": ED.closure_digest(closure_of(sp, rc, ds))}) + " -->\n").encode()
-    dbase = {**base, f"{R}/decision_spec.yaml": dspec, f"{R}/evidence_dossier.yaml": dos,
-             f"{R}/decision_spec.signoff_sheet.md": sheet_d(dspec, rec, dos)}
+    dbase = {**base, f"{R}/decision_spec.yaml": dspec, f"{R}/evidence_dossier.yaml": dos}
     d_fresh = stale_sheet_problems(tar_of(dbase), flags)
-    d_edit = stale_sheet_problems(tar_of({**dbase, f"{R}/evidence_dossier.yaml": b"inputs: {x: 1}\n"}), flags)
     d_gone = stale_sheet_problems(tar_of({k: v for k, v in dbase.items() if not k.endswith("dossier.yaml")}), flags)
     signed_rec = json.dumps({"sha256": {"evidence_dossier.yaml": hashlib.sha256(dos).hexdigest(),
                                         "decision_spec.yaml": hashlib.sha256(dspec).hexdigest()},
@@ -5155,10 +5105,10 @@ def _self_test_sheet(ok) -> None:
     past = {**dbase, f"{R}/run_state.json": st("ANALYZE"), f"{R}/decision_spec.signoff.json": signed_rec}
     p_ok = stale_sheet_problems(tar_of(past), flags)
     p_edit = stale_sheet_problems(tar_of({**past, f"{R}/evidence_dossier.yaml": b"inputs: {x: 1}\n"}), flags)
-    ok(d_fresh == [] and p_ok == [] and any("another evidence dossier" in x for x in d_edit)
+    ok(d_fresh == [] and p_ok == []
        and any("does not exist" in x for x in d_gone) and any("not the one the sign-off recorded" in x for x in p_edit),
-       f"RC81 a dossier edited after the sheet (at SIGN) or after the sign-off (past SIGN), or missing, refuses the "
-       f"launch; unchanged ones pass: {d_fresh} {d_edit} {d_gone} {p_ok} {p_edit}")
+       f"RC81 a missing dossier at SIGN or edited dossier past SIGN refuses the launch; unchanged ones pass: "
+       f"{d_fresh} {d_gone} {p_ok} {p_edit}")
     # RC82 (#218 review round 1)
     nspec = (b"options: {components: {n: {}}, engine_map: {n: {net: pyr}}}\n"
              b"engine: {ref: 'toolkit.engines.malaria.engine:MalariaEngine'}\n")
@@ -5618,7 +5568,7 @@ def main(argv) -> int:
         except ImportError:
             pass
         r = _side(cfg, ws.sign_side, open(a["answers"]).read(), a["note"], a["run"], a["expect"], None, a["action"],
-                  a["expect_derivations"], a["expect_sheet"], label=a["label"])
+                  a["expect_derivations"], label=a["label"])
         print(r["out"])
         return r["rc"]
     else:

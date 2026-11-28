@@ -26,10 +26,10 @@ A file that cannot be read or parsed is geometry_check_failed (HIGH): never a si
 Exceptions. `decision_units.geometry_accepted: {<finding id>: "<reason>"}` in the spec holds proposals. A MEDIUM or
 LOW one is accepted by its entry. A HIGH one counts only once the owner approves it: the owner's sign-off (or
 `python3 toolkit/spec/geometry.py approve <run_dir> --by owner` after it) records the approval in
-data/geometry_signoff.json, bound to the evidence hash of the current inputs. A lead sign-off approves nothing, and
+`decision_spec.signoff.json["geometry"]`, bound to the evidence hash of the current inputs. A lead sign-off approves nothing, and
 the run pauses at SIGN for the owner. A HIGH with no proposal sends the spec back to the planner.
 
-Freeze. Every sign-off writes data/geometry_signoff.json: the geometry declaration (enabled or not, the boundaries
+Freeze. Every sign-off writes `decision_spec.signoff.json["geometry"]`: the geometry declaration (enabled or not, the boundaries
 and crosswalk as declared, the columns) and the sha256 of the boundary, crosswalk and units files. Any later change
 is geometry_inputs_changed_after_signoff (HIGH), and an approval lapses when its evidence changes. Labels stay
 unsigned. Areas: equal-area integration of edges straight in longitude/latitude (exact for such edges; resampling
@@ -58,11 +58,11 @@ FAILED, NOT_RUN, ACCEPT_BAD, EDGE = ("geometry_check_failed", "geometry_check_no
                                      "point_near_own_boundary")
 CHANGED = "geometry_inputs_changed_after_signoff"
 MISSING = "geometry_record_missing"       # a signed spec with no geometry sign-off record (Codex round 2 on #131)
-SPEC_SIGNOFFS = ("decision_spec.signoff.json", "decision_brief.signoff.json")   # the spec's own; the brief's
+SPEC_SIGNOFFS = ("decision_spec.signoff.json",)
 ACCEPT_KEY = "geometry_accepted"          # in the spec: proposals (a HIGH one counts only once the owner approves it)
-# The harness's geometry sign-off record (written by the sign-off and by `approve --by owner`; no task can write it):
-# the frozen declaration, the input hashes, and the owner's approvals of HIGH exceptions bound to those hashes.
-SIGNOFF_FILE = "data/geometry_signoff.json"
+# The harness's geometry sign-off record (embedded under decision_spec.signoff.json["geometry"], written by sign-off
+# and by `approve --by owner`; no task can write it): the frozen declaration, the input hashes, and owner approvals.
+SIGNOFF_FILE = "decision_spec.signoff.json"
 KM_PER_DEG = math.pi / 180.0 * 6371.0088          # mean Earth radius (IUGG)
 LAT_NAMES, LON_NAMES, AREA_NAMES = ("lat", "latitude"), ("lon", "lng", "long", "longitude"), ("area_km2",)
 
@@ -537,8 +537,8 @@ def _load_spec(run_dir: str):
 
 
 def _load_signoff(run_dir: str) -> dict | None:
-    """The harness's geometry sign-off record, or None when the spec has not been signed with one. Unreadable: fail
-    closed."""
+    """The harness's geometry sign-off record (from decision_spec.signoff.json['geometry']), or None when absent.
+    Unreadable: fail closed."""
     p = os.path.join(run_dir, SIGNOFF_FILE)
     if not os.path.lexists(p):
         return None
@@ -547,28 +547,29 @@ def _load_signoff(run_dir: str) -> dict | None:
         doc = json.loads(sio.read_nofollow(run_dir, SIGNOFF_FILE)[0])     # never through a planted link
     except (sio.LinkRefused, OSError, ValueError) as e:
         raise GeometryError(f"{SIGNOFF_FILE}: unreadable geometry sign-off record: {e}") from e
-    if not isinstance(doc, dict) or not isinstance(doc.get("declaration"), dict):
+    if not isinstance(doc, dict):
         raise GeometryError(f"{SIGNOFF_FILE}: not a geometry sign-off record")
-    return doc
+    if "geometry" not in doc or doc["geometry"] is None:
+        return None
+    geo = doc["geometry"]
+    if not isinstance(geo, dict) or not isinstance(geo.get("declaration"), dict):
+        raise GeometryError(f"{SIGNOFF_FILE}: not a geometry sign-off record")
+    return geo
 
 
 def _spec_signed(run_dir: str) -> bool:
-    """Is the decision spec signed? Its own sign-off record (toolkit/spec/signoff.py, agents/stage_machine.py), or
-    the brief's when that hashed the spec (scripts/decision_brief.py). A brief-only sign-off is not."""
+    """Is the decision spec signed?"""
     sio = _safe_io()
-    for name in SPEC_SIGNOFFS:
-        p = os.path.join(run_dir, name)
-        if not os.path.lexists(p):
-            continue
-        if name == "decision_spec.signoff.json":
-            return True
-        try:
-            doc = json.loads(sio.read_nofollow(run_dir, name)[0])
-        except (sio.LinkRefused, OSError, ValueError):
-            return True                   # unreadable or a link: assume signed (fail closed: the record must exist)
-        if not isinstance(doc, dict) or (doc.get("sha256") or {}).get(SPEC_FILE) is not None:
-            return True
-    return False
+    p = os.path.join(run_dir, SIGNOFF_FILE)
+    if not os.path.lexists(p):
+        return False
+    try:
+        doc = json.loads(sio.read_nofollow(run_dir, SIGNOFF_FILE)[0])
+    except (sio.LinkRefused, OSError, ValueError):
+        return True                   # unreadable or a link: assume signed (fail closed: the record must exist)
+    if not isinstance(doc, dict):
+        return True
+    return bool((doc.get("sha256") or {}).get(SPEC_FILE) is not None or doc.get("spec_sha256") is not None)
 
 
 def _declaration(cfg, pres, cols, units) -> dict:
@@ -720,12 +721,11 @@ def run(run_dir: str, spec: dict | None = None) -> dict:
 
 
 def freeze(run_dir: str, by: str, extra: dict | None = None, spec: dict | None = None, th: dict | None = None,
-           expect_evidence: str | None = None) -> dict:
-    """The sign-off's geometry record (data/geometry_signoff.json): the declaration and input hashes as signed, and,
-    when the owner signs, an approval of each HIGH finding the spec proposes as an exception (plus `extra`
-    {finding id: reason}), bound to the evidence hash. A lead sign-off approves nothing. A check that failed cannot be
-    signed over (ValueError). `expect_evidence`: the evidence hash the sign-off sheet showed (Codex on 08f96a9); a
-    different current hash refuses the sign-off, so nothing is approved against evidence nobody saw."""
+           expect_evidence: str | None = None, *, write_record: bool = True) -> dict:
+    """The sign-off's geometry record (embedded in decision_spec.signoff.json["geometry"]): the declaration and input
+    hashes as signed, and, when the owner signs, an approval of each HIGH finding the spec proposes as an exception
+    (plus `extra` {finding id: reason}), bound to the evidence hash. A lead sign-off approves nothing. A check that
+    failed cannot be signed over (ValueError)."""
     import datetime as _dt
     if by not in ("owner", "lead"):
         raise ValueError(f"sign-off by {by!r}: owner or lead")
@@ -733,8 +733,8 @@ def freeze(run_dir: str, by: str, extra: dict | None = None, spec: dict | None =
     if rep["status"] == "failed":
         raise ValueError(f"the input geometry check failed: {rep['reason']}")
     if expect_evidence is not None and (rep.get("evidence_sha256") or "none") != expect_evidence:
-        raise ValueError("the geometry inputs (declaration, boundary, crosswalk or units files) changed since the "
-                         "sign-off sheet was shown: regenerate the sheet and read it again before signing")
+        raise ValueError("the geometry inputs (declaration, boundary, crosswalk or units files) changed since they "
+                         "were shown: inspect them again before signing")
     now = _dt.datetime.now(_dt.timezone.utc).isoformat()
     approvals = {}
     if by == "owner":
@@ -748,7 +748,18 @@ def freeze(run_dir: str, by: str, extra: dict | None = None, spec: dict | None =
                          "approved_by": "owner", "at": now} for k, why in sorted(want.items())}
     rec = {"producer": PRODUCER, "version": 1, "signed_by": by, "at": now, "declaration": rep["declaration"],
            "input_sha256": rep["input_sha256"], "evidence_sha256": rep["evidence_sha256"], "approvals": approvals}
-    write(run_dir, rec, SIGNOFF_FILE)
+    if write_record:
+        sio = _safe_io()
+        doc: dict = {}
+        if os.path.lexists(os.path.join(run_dir, SIGNOFF_FILE)):
+            try:
+                loaded = json.loads(sio.read_nofollow(run_dir, SIGNOFF_FILE)[0])
+                if isinstance(loaded, dict):
+                    doc = loaded
+            except (sio.LinkRefused, OSError, ValueError):
+                doc = {}
+        doc["geometry"] = rec
+        write(run_dir, doc, SIGNOFF_FILE)
     return rec
 
 
@@ -930,22 +941,6 @@ def _square(x0, y0, s):
     return [[x0, y0], [x0 + s, y0], [x0 + s, y0 + s], [x0, y0 + s], [x0, y0]]
 
 
-def toy_write_sheet(d: str, footer: bool = True) -> str:
-    """A minimal sign-off sheet for a toy run dir: the geometry section and, with `footer`, the sources line
-    (spec sha256, no derivation record, the shown geometry evidence) the real sheet writer records. For self-tests
-    of signers that do not build the full sheet (toolkit/spec/signoff.write_sheet does)."""
-    rep = run(d)
-    spec_sha = _sha(os.path.join(d, SPEC_FILE))
-    text = "# Decision spec sign-off sheet\n\n" + "\n".join(sheet_lines(d)) + "\n"
-    if footer:
-        src = json.dumps({"spec_sha256": spec_sha, "derivations_sha256": "none",
-                          "geometry_evidence_sha256": str(rep.get("evidence_sha256") or "none")}, sort_keys=True)
-        text += f"\n<!-- signoff-sheet-sources: {src} -->\n"
-    p = os.path.join(d, "decision_spec.signoff_sheet.md")
-    open(p, "w").write(text)
-    return p
-
-
 def toy_spec_with_boundaries(d: str, accept: dict | None = None) -> str:
     """A schema-valid toy spec (toolkit/spec/schema.py toy_spec) whose units carry points, with a square per unit in
     b.geojson declared in presentation.yaml; units 0 and 1 carry each other's points (one reciprocal swap).
@@ -1116,6 +1111,7 @@ def _self_test_owner(ok, th) -> None:
         os.remove(os.path.join(d, SIGNOFF_FILE))
         os.symlink(outside, os.path.join(d, SIGNOFF_FILE))
         r_link = check(d, th=th)
+        os.makedirs(os.path.join(d, "data"), exist_ok=True)
         for rel in (ARTIFACT,):
             if os.path.lexists(os.path.join(d, rel)):
                 os.remove(os.path.join(d, rel))
@@ -1142,34 +1138,30 @@ def _self_test_owner(ok, th) -> None:
            f"IG17 the sheet never reads the check's record through a link and shows the refusal ({txt[:140]!r})")
     # IG13 (Codex round 2): a signed spec with no geometry record is HIGH (signed before the check, or through a path
     # that skipped the freeze); the owner's approve creates the record (the migration path)
-    for how in ("spec", "brief"):
-        with tempfile.TemporaryDirectory() as d:
-            toy_inputs(d)
-            r0 = check(d, th=th)
-            if how == "spec":
-                json.dump({"signed_by": "owner", "sha256": {SPEC_FILE: _sha(os.path.join(d, SPEC_FILE))}},
-                          open(os.path.join(d, "decision_spec.signoff.json"), "w"))
-            else:
-                json.dump({"signed_by": "owner", "sha256": {SPEC_FILE: _sha(os.path.join(d, SPEC_FILE)),
-                                                            "decision_brief.yaml": None}},
-                          open(os.path.join(d, "decision_brief.signoff.json"), "w"))
-            r1 = check(d, th=th)
-            k1 = {(f["kind"], f["severity"], f["scope_declarable"]) for f in findings(r1)}
-            try:
-                approve(d, "owner")
-                k2 = {f["kind"] for f in findings(check(d, th=th))}
-            except (NameError, ValueError) as e:
-                k2 = {f"error: {e}"}
-            ok(MISSING not in {f["kind"] for f in findings(r0)} and (MISSING, "HIGH", False) in k1
-               and MISSING not in k2,
-               f"IG13 ({how}): a signed spec without a geometry record is HIGH {MISSING}, not declarable; the owner's "
-               f"approve creates the record ({sorted(k1)[:3]}; after: {sorted(k2)[:3]})")
+    with tempfile.TemporaryDirectory() as d:
+        toy_inputs(d)
+        r0 = check(d, th=th)
+        json.dump({"signed_by": "owner", "sha256": {SPEC_FILE: _sha(os.path.join(d, SPEC_FILE))}},
+                  open(os.path.join(d, SIGNOFF_FILE), "w"))
+        r1 = check(d, th=th)
+        k1 = {(f["kind"], f["severity"], f["scope_declarable"]) for f in findings(r1)}
+        try:
+            approve(d, "owner")
+            k2 = {f["kind"] for f in findings(check(d, th=th))}
+        except (NameError, ValueError) as e:
+            k2 = {f"error: {e}"}
+        signed_after = json.load(open(os.path.join(d, SIGNOFF_FILE)))
+        ok(MISSING not in {f["kind"] for f in findings(r0)} and (MISSING, "HIGH", False) in k1
+           and MISSING not in k2 and signed_after.get("signed_by") == "owner"
+           and isinstance(signed_after.get("geometry"), dict),
+           f"IG13: a signed spec without a geometry record is HIGH {MISSING}, not declarable; the owner's "
+           f"approve embeds the geometry record into {SIGNOFF_FILE} ({sorted(k1)[:3]}; after: {sorted(k2)[:3]})")
     with tempfile.TemporaryDirectory() as d:
         toy_inputs(d)
         os.remove(os.path.join(d, SPEC_FILE))
-        json.dump({"signed_by": "owner", "sha256": {"decision_brief.yaml": "x", SPEC_FILE: None}},
-                  open(os.path.join(d, "decision_brief.signoff.json"), "w"))
-        ok(not _spec_signed(d), "IG13b a brief-only sign-off (no spec hashed) is not a signed spec")
+        json.dump({"signed_by": "owner", "sha256": {SPEC_FILE: None}},
+                  open(os.path.join(d, SIGNOFF_FILE), "w"))
+        ok(not _spec_signed(d), "IG13b a sign-off record with no spec hashed is not a signed spec")
 
 
 def _self_test_shapes(ok, th) -> None:

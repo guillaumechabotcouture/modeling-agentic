@@ -163,62 +163,11 @@ def review_blocks_lead(run_dir: str) -> str | None:
 
 
 def _verify_admitted_evidence(run_dir: str) -> tuple[dict, bytes, bytes, dict[str, str]]:
-    """Read and verify admission.json, admission_sheet.md, snapshot, bench/*, and optional reference digests."""
-    adm_bytes = _read_single(run_dir, ADMISSION_REL)
-    adm_sha = _sha256_bytes(adm_bytes)
-    try:
-        adm = json.loads(adm_bytes.decode("utf-8"))
-    except (UnicodeDecodeError, ValueError) as e:
-        raise ValueError(f"{ADMISSION_REL} invalid JSON: {e}") from None
-    if not isinstance(adm, dict) or adm.get("status") != "admitted":
-        raise ValueError(f"built engine is not admitted (status={adm.get('status') if isinstance(adm, dict) else None!r})")
-    rs, rs_err = _read_json_optional(run_dir, "run_state.json")
-    if rs_err:
-        raise ValueError(f"run_state.json unreadable: {rs_err}")
-    if isinstance(rs, dict) and isinstance(rs.get("engine_build"), dict):
-        rec_adm_sha = rs["engine_build"].get("admission_sha256")
-        if isinstance(rec_adm_sha, str) and len(rec_adm_sha) == 64 and rec_adm_sha != adm_sha:
-            raise ValueError("admission.json changed since ENGINE_ADMIT recorded its digest in run_state.json")
-    snap_sha = adm.get("snapshot_sha256")
-    if not isinstance(snap_sha, str) or len(snap_sha) != 64:
-        raise ValueError(f"{ADMISSION_REL} missing valid snapshot_sha256")
-    # Verify content-addressed snapshot bytes before signing
-    try:
-        BSNAP.read_verified_snapshot(os.path.join(run_dir, "engine_build", "snapshots"), snap_sha)
-    except BSNAP.SnapshotError as e:
-        raise ValueError(f"snapshot verification failed: {e}") from None
-
-    sheet_bytes = _read_single(run_dir, SHEET_REL)
-    adm_digests = adm.get("digests") if isinstance(adm.get("digests"), Mapping) else {}
-    bound: dict[str, str] = {
-        "admission.json": adm_sha,
-        "admission_sheet.md": _sha256_bytes(sheet_bytes),
-        "snapshot": snap_sha,
-    }
-    for rel in BADAPT.BENCH_FILES:
-        want = adm_digests.get(rel)
-        if not want:
-            raise ValueError(f"{ADMISSION_REL} missing digest for {rel}")
-        got = _sha256_bytes(_read_single(run_dir, f"engine_build/{rel}"))
-        if got != want:
-            raise ValueError(f"engine_build/{rel} changed after admission")
-        bound[rel] = got
-    for rel in BADAPT.OPTIONAL_BENCH_FILES:
-        want = adm_digests.get(rel)
-        on_disk = os.path.lexists(os.path.join(run_dir, "engine_build", rel))
-        if want is None and not on_disk:
-            continue
-        if not want:
-            raise ValueError(f"unexpected engine_build/{rel} not recorded in admission.json")
-        got = _sha256_bytes(_read_single(run_dir, f"engine_build/{rel}"))
-        if got != want:
-            raise ValueError(f"engine_build/{rel} changed after admission")
-        bound[rel] = got
-    # Optional reference snapshot & comparison digests recorded by admission (§5.3)
-    for ref_k in ("reference_snapshot", "reference_comparison"):
-        if adm_digests.get(ref_k):
-            bound[ref_k] = str(adm_digests[ref_k])
-    return adm, adm_bytes, sheet_bytes, bound
+    """Verify admission.json, admission_sheet.md, snapshot, bench/*, and optional reference digests via unified verifier."""
+    info, probs = BSNAP.verify_admitted_engine(run_dir, require_signoff=False)
+    if probs:
+        raise ValueError(probs[0])
+    return info["adm"], info["adm_bytes"], info["sheet_bytes"], info["bound"]
 
 
 def status(run_dir: str) -> str:
