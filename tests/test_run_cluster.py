@@ -3141,6 +3141,66 @@ def _self_test_replicate_names(ok, tb) -> None:
     shutil.rmtree(root, ignore_errors=True)
 
 
+def _self_test_code_tarball(ok):
+    with tempfile.TemporaryDirectory() as raw_td:
+        td = os.path.realpath(raw_td)
+        origin = os.path.join(td, "origin.git")
+        tree = os.path.join(td, "tree")
+        out_dir = os.path.join(td, "out")
+        subprocess.run(["git", "init", "--bare", "-q", origin], check=True)
+        os.makedirs(tree)
+
+        def git(*args):
+            return subprocess.check_output(["git", "-C", tree, *args], text=True).strip()
+
+        git("init", "-q", "-b", "main")
+        git("config", "user.email", "t@example.invalid")
+        git("config", "user.name", "t")
+        git("config", "commit.gpgsign", "false")
+        with open(os.path.join(tree, "main.py"), "wb") as f:
+            f.write(b"print('ok')\n")
+        git("add", "main.py")
+        git("commit", "-q", "-m", "init")
+        git("remote", "add", "origin", origin)
+        git("push", "-q", "-u", "origin", "main")
+        head = git("rev-parse", "HEAD")
+
+        cfg = RunConfig(name="t-ct", question_file="/dev/null", tree=tree, out_dir=out_dir,
+                        required_files=("main.py",))
+        blob, commit = code_tarball(cfg)
+        with tarfile.open(fileobj=io.BytesIO(blob), mode="r:gz") as t:
+            names = [m.name.removeprefix("./") for m in t.getmembers()]
+        ok(commit == head[:7] and "main.py" in names and _archive_member(blob, "main.py") == b"print('ok')\n",
+           f"RC50g code_tarball builds archive via CO.tarball_from_tree(check_clean=False): {commit} {names}")
+
+        dirty = os.path.join(tree, "dirty.txt")
+        with open(dirty, "w", encoding="utf-8") as f:
+            f.write("dirty\n")
+        try:
+            code_tarball(cfg)
+            ok(False, "RC50h code_tarball refuses dirty tree")
+        except SystemExit as e:
+            ok("uncommitted changes" in str(e), f"RC50h code_tarball refuses dirty tree: {e}")
+        os.remove(dirty)
+
+        with open(os.path.join(tree, "main.py"), "wb") as f:
+            f.write(b"print('ahead')\n")
+        git("add", "main.py")
+        git("commit", "-q", "-m", "ahead")
+        ahead_head = git("rev-parse", "HEAD")
+        try:
+            code_tarball(cfg)
+            ok(False, "RC50i code_tarball(require_main=True) refuses unpushed commit")
+        except SystemExit as e:
+            ok("origin/main" in str(e), f"RC50i code_tarball(require_main=True) refuses unpushed commit: {e}")
+
+        cfg_branch = RunConfig(name="t-ct", question_file="/dev/null", tree=tree, out_dir=out_dir,
+                               require_main=False, required_files=("main.py",))
+        blob2, commit2 = code_tarball(cfg_branch)
+        ok(commit2 == ahead_head[:7] and _archive_member(blob2, "main.py") == b"print('ahead')\n",
+           f"RC50j code_tarball(require_main=False) archives unpushed commit: {commit2}")
+
+
 def _self_test() -> int:
     import datetime as dt
     import io
@@ -3208,6 +3268,7 @@ def _self_test() -> int:
     src = inspect.getsource(code_tarball)
     ok("refuse_hidden_tree(cfg.tree" in src and src.index("refuse_hidden_tree(") < src.index("tarball_from_tree") and '"archive"' in inspect.getsource(CO.tarball_from_tree),
        "RC50f code_tarball checks the launch tree on disk before it builds anything")
+    _self_test_code_tarball(ok)
 
     now = time.time()
 
