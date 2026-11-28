@@ -19,6 +19,8 @@ from __future__ import annotations
 
 import argparse
 import csv
+import datetime
+import hashlib
 import json
 import math
 import os
@@ -80,10 +82,42 @@ class PresentationRefused(ValueError):
     is never recorded as one figure's own failure."""
 
 
-def _fv():
-    sys.path.insert(0, os.path.join(ROOT, "scripts"))
-    import figure_validator
-    return figure_validator
+def _hash_file(path: str) -> str:
+    if not os.path.exists(path):
+        return ""
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(65536), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _provenance_path(png_path: str) -> str:
+    return png_path + ".provenance.json"
+
+
+def validate_figure(png_path: str,
+                    source_data_paths: list[str] | None = None,
+                    expected_annotations: list[str] | None = None,
+                    expected_n_data_points: int | None = None,
+                    run_dir: str | None = None) -> None:
+    """Record figure provenance sidecar under `run_dir` with no link followed."""
+    if not os.path.exists(png_path):
+        raise FileNotFoundError(
+            f"validate_figure called for {png_path}, which does not exist."
+        )
+    source_data_paths = source_data_paths or []
+    expected_annotations = expected_annotations or []
+    source_hashes = {p: _hash_file(p) for p in source_data_paths}
+    sidecar = {
+        "png_path": os.path.abspath(png_path),
+        "generator_script": os.path.abspath(__file__),
+        "source_hashes": source_hashes,
+        "expected_annotations": list(expected_annotations),
+        "expected_n_data_points": expected_n_data_points,
+        "written_at_utc": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+    }
+    _publish(_provenance_path(png_path), json.dumps(sidecar, indent=2, sort_keys=True), run_dir)
 
 
 def resolve_source(run_dir: str, src) -> tuple[str | None, str]:
@@ -2486,8 +2520,7 @@ def _save(fig, out_dir, name, run_dir, sources, harness: bool, t, presentation=N
     _publish(png, _fig_bytes(fig, "png", dpi=FS.DPI, facecolor=t["surface"]), root)
     _publish(svg, _fig_bytes(fig, "svg", facecolor=t["surface"]), root)
     plt.close(fig)
-    fv = _fv()
-    fv.validate_figure(png, source_data_paths=[os.path.join(run_dir, s) for s in sources], run_dir=root)
+    validate_figure(png, source_data_paths=[os.path.join(run_dir, s) for s in sources], run_dir=root)
     sp = png + ".provenance.json"
     from toolkit.analysis.artifacts import _safe_io
     sio = _safe_io()
@@ -2696,7 +2729,6 @@ def _compare_draw(Rs, run_dirs, out_dir, names, t) -> dict:
     plt.close(fig)
     _write_csv(os.path.join(out_dir, "comparison.csv"), rows, out_dir)
     # provenance: every run's sources (absolute: the runs differ), the presentation files, the tier
-    fv = _fv()
     srcs = [os.path.join(R.dir, rel) for R in Rs for rel in ("decision_spec.yaml", os.path.join("analysis", "point.yaml"),
                                                              os.path.join("analysis", "uncertainty.yaml"),
                                                              os.path.join("analysis", "engine.yaml"),
@@ -2705,7 +2737,7 @@ def _compare_draw(Rs, run_dirs, out_dir, names, t) -> dict:
             if os.path.exists(os.path.join(R.dir, rel))]
     srcs += [p if os.path.isabs(p) else os.path.join(R.dir, p) for R in Rs
              for p in (os.path.expanduser(str(e["path"])) for e in R.presentation_record())]
-    fv.validate_figure(png, source_data_paths=srcs, run_dir=out_dir)
+    validate_figure(png, source_data_paths=srcs, run_dir=out_dir)
     sp = png + ".provenance.json"
     sc = json.load(open(sp))
     pres = [dict(e, run=R.dir) for R in Rs for e in R.presentation_record()]

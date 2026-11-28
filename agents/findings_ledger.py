@@ -136,9 +136,24 @@ def owner_state_for(stage: str | None) -> tuple[str, bool]:
     return (s or "ANALYZE"), False
 
 
+_KEY_FIELDS = ("key", "artifact")
+
+
+def _finding_key(v: dict) -> str:
+    """The instance key the producing check set ('' when it set none)."""
+    for f in _KEY_FIELDS:
+        x = v.get(f)
+        if isinstance(x, (list, tuple, set)):
+            names = sorted({str(s).strip() for s in x if str(s).strip()})
+            if names:
+                return f"n={len(names)}:" + hashlib.sha1(",".join(names).encode()).hexdigest()[:8]
+        elif isinstance(x, (str, int)) and not isinstance(x, bool) and str(x).strip():
+            return str(x).strip()
+    return ""
+
+
 def gate_key(v: dict) -> str:
-    import stall_rule
-    k = stall_rule.finding_key(v)
+    k = _finding_key(v)
     if not k and isinstance(v.get("name"), str) and v["name"].strip() and v["name"] != "-":
         k = v["name"].strip()
     return k

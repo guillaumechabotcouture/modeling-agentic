@@ -1,14 +1,7 @@
 #!/usr/bin/env python3
-"""Toolkit, "budget allocation across units" template: optimizer and its benchmark (T1).
+"""Toolkit, "budget allocation across units" template: multiple-choice knapsack optimizer.
 
-    python3 toolkit/alloc/optimize.py <spec.yaml> --benefit <csv> --budget <number> [--units <csv>]
-        [--primary ilp|greedy|brute] [--run-dir <dir>] [--objective-name <name>]
     python3 toolkit/alloc/optimize.py --self-test
-
-The CLI reads the spec (costs from toolkit/alloc/costs.py, feasibility and caps
-from toolkit/alloc/packages.py) and a benefit table with columns
-unit, package, benefit (the run's model output), runs the benchmark and writes
-<run-dir>/models/optimization_quality.yaml.
 
 Choose one package per unit to maximise total benefit within a budget and any
 caps (a multiple-choice knapsack). E7 attempt 7's `models/optimize.py` had two
@@ -19,9 +12,8 @@ defects this module is built to prevent:
   on and always safe;
 - greedy beat the "optimal" ILP at one budget (an unchecked solver status and
   a relative gap), and that was reported as a footnote; here the ILP must
-  report a proven optimum (gap 0), every returned allocation is re-checked
-  against budget, caps and feasibility, and any method beating an exact one
-  stops the benchmark with an error.
+  report a proven optimum (gap 0) and every returned allocation is re-checked
+  against budget, caps and feasibility.
 
 API:
     solve(benefit, cost, feasible, budget, caps=None, method="ilp"|"greedy"|"brute")
@@ -43,33 +35,25 @@ API:
         early; `gap` then holds its proven distance from the LP relaxation's bound), "heuristic",
         "infeasible" (exact methods: no allocation satisfies the constraints)
         or "no_feasible_found" (greedy).
-    benchmark(..., primary="ilp", run_dir=None | out=None, sweep_budgets=None)
-        runs every applicable method (the ILP if PuLP is installed, greedy,
-        brute force if the pruned search space is at most `brute_limit`),
-        raises OptimizerError if any method beats an exact one or the primary
-        is not proven optimal, and writes models/optimization_quality.yaml in
-        the schema scripts/optimization_quality.py checks.
 
 Methods:
 - ilp: PuLP + CBC (PuLP is pinned in requirements.txt), binary x[unit,package],
   one package per unit, budget and caps, relative gap 0 unless the caller states
   `gap_rel` (recorded in the result with `threads`), time limit; status "optimal"
-  only when CBC proves it within that gap. The benchmark always runs at gap 0.
+  only when CBC proves it within that gap.
 - greedy: the multiple-choice knapsack heuristic: start each unit at its
   cheapest feasible package, take steps along each unit's upper convex hull
   of (cost, benefit) in order of incremental benefit per incremental cost
   while they fit, then take the best affordable single-unit upgrades. Without
   caps, exact - greedy <= the largest single hull-step benefit (the LP bound
   of Sinha and Zoltners 1979), and greedy is exact when the budget falls on a
-  hull breakpoint; the benchmark checks and reports that bound. With caps,
-  there is no such bound and greedy is a heuristic only.
+  hull breakpoint. With caps, there is no such bound and greedy is a heuristic only.
 - brute: exhaustive depth-first search with exact bounds (cost, caps and
   benefit), for small instances and as an independent check of the ILP.
 """
 from __future__ import annotations
 
 import argparse
-import importlib.util
 import math
 import os
 import sys
@@ -636,104 +620,6 @@ def _one(benefit, cost, feasible, budget, caps, methods, time_limit, brute_limit
             for m in methods}
 
 
-def benchmark(benefit, cost, feasible, budget, caps=None, primary="ilp", methods=None, run_dir=None, out=None,
-              objective_name="benefit", sweep_budgets=None, time_limit=300, brute_limit=2_000_000,
-              root=None, budget_exact: bool = False) -> dict:
-    """Run every applicable method, check them against each other, and write the optimizer quality report.
-    The report is written under a trusted root the caller names: `run_dir`, or `root` for an `out=` outside a run
-    dir (an `out=` with neither is refused; the root is never taken from the output path)."""
-    us, opts, caps_l, names, b0 = _prepare(benefit, cost, feasible, budget, caps)
-    if caps is None:
-        caps = caps_l
-    lk = _check_links(_links(feasible, None), opts)
-    popts, npruned = prune(opts, lk, budget_exact=budget_exact)
-    skipped = {}
-    if methods is None:
-        methods = []
-        for m in ("ilp", "greedy", "brute"):
-            if m == "ilp" and _pulp() is None:
-                skipped[m] = "PuLP not installed"
-            elif m == "greedy" and lk:
-                skipped[m] = "group rules (links): greedy has no bound"
-            elif m == "greedy" and budget_exact:
-                skipped[m] = "exact-budget constraint: greedy has no bound"
-            elif m == "brute" and search_space(popts) > brute_limit:
-                skipped[m] = f"search space {search_space(popts):.3g} > brute_limit {brute_limit:.3g}"
-            else:
-                methods.append(m)
-    if primary not in methods:
-        raise ValueError(f"primary {primary} is not among the methods run ({methods}; skipped {skipped})")
-    if len(methods) < 2:
-        raise ValueError(f"a benchmark needs at least two methods; ran {methods}, skipped {skipped}")
-    res = _one(benefit, cost, feasible, budget, caps, methods, time_limit, brute_limit, budget_exact=budget_exact)
-    assert_consistent(res, primary)
-    sweep = []
-    for sb in sweep_budgets or []:
-        rs = _one(benefit, cost, feasible, sb, caps, methods, time_limit, brute_limit, budget_exact=budget_exact)
-        assert_consistent(rs, primary)
-        objs = {m: r["objective"] for m, r in rs.items() if r["objective"] is not None}
-        bm = max(objs, key=objs.get)
-        sweep.append({"budget": float(sb), "primary_objective": objs[primary], "best_method": METHOD_NAMES[bm],
-                      "best_objective": objs[bm],
-                      "gap_pct": 100.0 * (objs[bm] - objs[primary]) / objs[bm] if objs[bm] > 0 else None,
-                      "objectives": {METHOD_NAMES[m]: v for m, v in objs.items()}})
-    p = res[primary]
-    objs = {m: r["objective"] for m, r in res.items() if r["objective"] is not None}
-    best = max(objs.values())
-    notes = [f"Written by toolkit/alloc/optimize.py benchmark(); every allocation re-checked against budget, "
-             f"caps and feasibility. {len(us)} units, {sum(len(o) for o in opts.values())} feasible unit-package "
-             f"pairs, {npruned} dominated pairs pruned (cap-aware)."]
-    if res.get("ilp"):
-        notes.append(f"ILP: PuLP + CBC, relative gap 0, time limit {time_limit} s, solver status "
-                     f"{res['ilp'].get('solver_status')}.")
-    g = res.get("greedy")
-    if g and g.get("bound") is not None:
-        notes.append(f"Greedy without caps: exact - greedy <= the largest hull step benefit, {g['bound']:.6g}.")
-    elif g:
-        notes.append("Greedy with caps: no a-priori bound; heuristic only.")
-    for m, why in skipped.items():
-        notes.append(f"{METHOD_NAMES[m]} not run: {why}.")
-    notes.append("gap_pct is relative to the total objective; gain_gap_pct is relative to the gain above "
-                 "baseline_objective (the benefit every allocation gets, e.g. from locked units).")
-    if best <= 0:
-        notes.append(f"The best objective is {best:g} (nothing gained at this budget): gap_pct is undefined, and "
-                     "scripts/optimization_quality.py reports such a file as MALFORMED.")
-    report = {
-        "primary_method": METHOD_NAMES[primary],
-        "primary_objective": float(p["objective"]),
-        "objective_name": objective_name,
-        "primary_status": p["status"],
-        "budget": float(b0),
-        "primary_cost": float(p["cost"]),
-        "benchmark_methods": [{"method": METHOD_NAMES[m], "objective": float(r["objective"]),
-                               "runtime_sec": round(r["seconds"], 4), "status": r["status"],
-                               "cost": float(r["cost"])}
-                              for m, r in res.items() if m != primary and r["objective"] is not None],
-        "gap_pct": 100.0 * (best - p["objective"]) / best if best > 0 else None,
-        "baseline_objective": float(p["baseline"]),
-        "gain_gap_pct": (100.0 * (best - p["objective"]) / (best - p["baseline"])
-                         if best - p["baseline"] > 0 else None),
-        "constraints": [{"name": n, "max": float(cp["max"]), "use": float(p["cap_use"][n])}
-                        for n, cp in zip(names, caps)],
-        "n_units": len(us),
-        "n_pruned_dominated": npruned,
-        "notes": " ".join(notes),
-    }
-    if sweep:
-        report["sweep"] = sweep
-    path = out or (os.path.join(run_dir, "models", "optimization_quality.yaml") if run_dir else None)
-    if path:
-        import sys as _sys
-        _scripts = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "scripts")
-        if _scripts not in _sys.path:
-            _sys.path.insert(0, _scripts)
-        from lib.safe_io import publish                # no link followed (follow-up to review round 5)
-        publish(path, yaml.safe_dump(report, sort_keys=False), run_dir or root)   # None is refused by safe_io
-    report["results"] = res
-    report["path"] = path
-    return report
-
-
 # --------------------------------------------------------------------------- self-test
 
 RR1, RR2 = 0.6, 0.4      # design §3.5: C1 universal (relative risk 0.6), C2 targeted (relative risk 0.4)
@@ -945,23 +831,7 @@ def _self_test() -> int:
         rr = solve(sb, sc, sf, lock_cost * 0.5, method=m)
         ok(rr["choice"] is None and rr["status"] in ("infeasible", "no_feasible_found"),
            f"TC24 ({m}) a budget below the locked units' cost is infeasible, not a wrong answer: {rr['status']}")
-    # the benchmark writes a report that the repo's checker accepts
     with tempfile.TemporaryDirectory() as d:
-        rep = benchmark(benefit, cost, F, B, run_dir=d, objective_name="cases_averted", sweep_budgets=[Bm, 0.5 * B])
-        spec_oq = importlib.util.spec_from_file_location(
-            "optimization_quality", os.path.join(HERE, "..", "..", "scripts", "optimization_quality.py"))
-        oq = importlib.util.module_from_spec(spec_oq)
-        spec_oq.loader.exec_module(oq)
-        v = oq.validate_optimization_quality(os.path.join(d, "models", "optimization_quality.yaml"))
-        ok(v["verdict"] == "CLEAN" and abs(v["gap_pct"] - rep["gap_pct"]) < 1e-9 and rep["gap_pct"] == 0.0,
-           f"TC25 the written optimization_quality.yaml passes scripts/optimization_quality.py: {v}")
-        ok({b["method"] for b in yaml.safe_load(open(rep["path"]))["benchmark_methods"]} == {"greedy"}
-           and "brute_force not run" in rep["notes"], "TC26 brute force is skipped, and says so, on 40 units")
-        rg = benchmark(sb, sc, sf, B2, caps=scap, primary="greedy", out=os.path.join(d, "g.yaml"), root=d)
-        vg = oq.validate_optimization_quality(os.path.join(d, "g.yaml"))
-        ok(vg["verdict"] in ("CLEAN", "GAP_TOO_LARGE") and abs(vg["gap_pct"] - rg["gap_pct"]) < 1e-9
-           and rg["primary_objective"] <= max(b["objective"] for b in rg["benchmark_methods"]),
-           f"TC27 a greedy primary is reported with its true gap to the exact methods: {vg}")
         # Codex review 1: tiny (or huge) objectives must not fall inside a solver's absolute tolerance
         for scale in (1e-9, 1e9):
             tb = {"a": {"none": 0.0, "x": 1.0 * scale}, "b": {"none": 0.0, "x": 2.0 * scale}}
@@ -970,8 +840,6 @@ def _self_test() -> int:
             rs = {m: solve(tb, tc, tf, 1.0, method=m)["choice"] for m in ("ilp", "greedy", "brute")}
             ok(all(c == {"a": "none", "b": "x"} for c in rs.values()),
                f"TC28 (Codex) objectives of scale {scale:g} are optimised exactly by every method: {rs}")
-            rb = benchmark(tb, tc, tf, 1.0)
-            ok(rb["gap_pct"] == 0.0, f"TC29 ... and the benchmark agrees at scale {scale:g}")
         # Codex round 2: an outlier option must not loosen the budget or a cap
         tb = {"a": {"none": 0.0, "small": 1.0, "huge": 2.0}}
         tf = {"a": {"none": True, "small": True, "huge": True}}
@@ -991,14 +859,6 @@ def _self_test() -> int:
         ok(all(c["A"] == "x" and c["B"] == "none" for c in rs.values()),
            f"TC33 (Codex r2) a large fixed benefit does not swamp the gains being optimised: {rs}")
         ok(_better(1e9 + 26, 1e9 + 23, 1e9), "TC34 ... and a disagreement above a large baseline is detected")
-        rb = benchmark(tb, tc, tf, 8.0)
-        ok(rb["gain_gap_pct"] == 0.0 and rb["baseline_objective"] == 1e9, "TC35 the gain-relative gap is reported")
-        # Codex review 3: a budget that buys nothing gives an undefined gap, said so, and no crash
-        rz = benchmark({"a": {"none": 0.0, "x": 1.0}}, {"a": {"none": 0.0, "x": 1.0}},
-                       {"a": {"none": True, "x": True}}, 0.0, out=os.path.join(d, "z.yaml"), root=d)
-        ok(rz["gap_pct"] is None and "gap_pct is undefined" in rz["notes"]
-           and oq.validate_optimization_quality(os.path.join(d, "z.yaml"))["verdict"] == "MALFORMED",
-           "TC30 (Codex) a zero best objective: gap undefined, noted, and the checker fails closed")
         # Phase 42 ε: a run imports the toolkit as a package beside its own models/costs.py;
         # neither may shadow the other (the bug: the toolkit's `import costs` returning the run's file).
         import subprocess
@@ -1097,41 +957,12 @@ def _self_test() -> int:
 
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("spec", nargs="?")
-    ap.add_argument("--units")
-    ap.add_argument("--benefit")
-    ap.add_argument("--budget", type=float)
-    ap.add_argument("--primary", default="ilp", choices=sorted(METHOD_NAMES))
-    ap.add_argument("--run-dir")
-    ap.add_argument("--objective-name", default="benefit")
     ap.add_argument("--self-test", action="store_true")
     a = ap.parse_args(argv)
     if a.self_test:
         return _self_test()
-    if not (a.spec and a.benefit and a.budget is not None):
-        ap.error("spec, --benefit and --budget are required")
-    import csv
-
-    spec = yaml.safe_load(open(a.spec))
-    units = costs.load_units(spec, os.path.dirname(os.path.abspath(a.spec)), a.units)
-    try:
-        F = packages.feasibility(spec, units)
-        cm = costs.cost_matrix(spec, units)
-        benefit = {}
-        with open(a.benefit, newline="", encoding="utf-8") as f:
-            for row in csv.DictReader(f):
-                benefit.setdefault(str(row["unit"]), {})[str(row["package"])] = float(row["benefit"])
-        rep = benchmark(benefit, cm, F, a.budget, primary=a.primary, run_dir=a.run_dir,
-                        objective_name=a.objective_name)
-    except (ValueError, KeyError, OptimizerError) as e:
-        print(f"ERROR: {type(e).__name__}: {e}")
-        return 1
-    print(f"{rep['primary_method']}: {rep['primary_objective']:,.4g} at cost {rep['primary_cost']:,.0f} "
-          f"(budget {rep['budget']:,.0f}); gap "
-          f"{'n/a' if rep['gap_pct'] is None else format(rep['gap_pct'], '.4g') + '%'}; status {rep['primary_status']}")
-    if rep["path"]:
-        print(f"wrote {rep['path']}")
-    return 0
+    ap.print_help()
+    return 2
 
 
 if __name__ == "__main__":

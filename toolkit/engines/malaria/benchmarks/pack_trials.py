@@ -184,11 +184,12 @@ def _self_test() -> int:
     def pt4():
         from toolkit.engines.benchmark_sources import check_pack
         bad = [x for x in check_pack(pack) if x.split(":")[0] in NEW_IDS]
-        from toolkit.engines.malaria.benchmarks import net_effect_fit as NEF
-        ok(not set(NEW_IDS) & set(pack["fit_joint"]["targets"]) and set(NEW_IDS) <= set(NEF.OPTION_A["targets"])
+        from toolkit.engines import effect_fit as EF
+        dcl, _pk, _cv, _ver = EF.pack_files(os.path.join(HERE, "effect_fit.yaml"))
+        ok(not set(NEW_IDS) & set(pack["fit_joint"]["targets"]) and set(NEW_IDS) <= set(dcl["targets"])
            and not bad,
-           f"PT4 B9d-B9g are held out of the pack's own fit and are targets of the net-effect fit's own declaration "
-           f"(F6 option A, fit record (b)); they pass the source check ({bad})")
+           f"PT4 B9d-B9g are held out of the pack's own fit and are targets of the effect fit's own declaration "
+           f"(effect_fit.yaml); they pass the source check ({bad})")
     case("PT4", pt4)
 
     def pt5():

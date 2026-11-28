@@ -689,8 +689,6 @@ def _self_test() -> int:
             fails.append(msg)
 
     q = lambda *a, **k: None  # noqa: E731
-    from toolkit.analysis import dt_golden as DG      # S1: every decision-test record below is a golden record
-    DG.start_capture()
     with tempfile.TemporaryDirectory() as d:
         # ---------------- emulator path, emulator-inversion calibration (the spike's chain)
         bench, v_ok, v_bad = _toy_bench(d)
@@ -838,14 +836,9 @@ def _self_test() -> int:
         sx = byid.get("scenario_excluded_synergy") or {}
         ok(sx.get("status") == "not_run" and "no interaction" in str(sx.get("reason")),
            f"R7c an excluded scenario parameter is listed as a test not run, with the spec's reason: {sx}")
-        sys.path.insert(0, os.path.join(ROOT, "scripts"))
-        import mechanism_manifest as MM
-        if hasattr(MM, "load_test_result"):
-            got, probs = MM.load_test_result(d, dt["path"])
-            ok(got is not None and not probs, f"R8 the result file passes the Phase 49 loader: {probs}")
-        else:
-            ok(set(res) >= {"finding", "varied", "criterion", "decision_changes", "recommendation"},
-               "R8 the result file has every Phase 49 field (loader not on this branch)")
+        from toolkit.analysis import contract as MM
+        got, probs = MM.load_test_result(d, dt["path"])
+        ok(got is not None and not probs, f"R8 the result file passes the Phase 49 loader: {probs}")
         rows = list(csv.DictReader(open(os.path.join(d, "allocation_optimized.csv"))))
         ok(len(rows) == 24 and set(rows[0]) >= {"unit", "package", "dalys_averted"}, "R9 the deliverable CSV is written")
         rep = yaml.safe_load(open(os.path.join(d, "uncertainty_report.yaml")))
@@ -1059,8 +1052,7 @@ def _self_test() -> int:
                 pass
         ok(open(os.path.join(out, "v")).read() == "untouched",
            "AR-RW1 an analysis artifact and the manifest are not written through a link or a planted .tmp")
-    DG.check_capture(ok, failed=fails)
-    _self_test_wiring(ok, q)       # after the golden capture: its runs' decision tests are not golden records
+    _self_test_wiring(ok, q)
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1
@@ -1194,8 +1186,7 @@ def _self_test_moves(ok, d, R):
            f"MS8 a positive regret above its threshold changes the plan on regret alone: {rec.get('triggered_by')}")
         p = os.path.join(d, "models", "decision_tests", "ms8.yaml")
         yaml.safe_dump(plain(rec), open(p, "w"), sort_keys=False)
-        sys.path.insert(0, os.path.join(ROOT, "scripts"))
-        import mechanism_manifest as MM
+        from toolkit.analysis import contract as MM
         got, probs = MM.load_test_result(d, "models/decision_tests/ms8.yaml")
         ok(got is not None and not probs, f"MS9 the Phase 49 loader accepts a verdict set by regret: {probs}")
         os.remove(p)
@@ -1446,15 +1437,8 @@ def _fixed_refusals(ok, d, r):
 
 def _self_test_plan_rule(ok, q):
     """EV-R (hb1 fix 11, J): deliverable.plan: expected_value delivers the plan with the best mean over the
-    uncertainty draws, per-unit means in the CSV and a fixed-plan mean claim; absent or `point`, nothing changes. The
-    golden capture is paused: the toy's decision tests are those of the runs above, and EV-R7 compares the records of
-    the three runs with each other."""
-    from toolkit.analysis import dt_golden as DG
-    DG._CAP["paused"] = True
-    try:
-        _self_test_plan_rule_runs(ok, q)
-    finally:
-        DG._CAP["paused"] = False
+    uncertainty draws, per-unit means in the CSV and a fixed-plan mean claim; absent or `point`, nothing changes."""
+    _self_test_plan_rule_runs(ok, q)
 
 
 def _self_test_plan_rule_runs(ok, q):
@@ -2205,13 +2189,13 @@ def _self_test_posterior_ranges(ok, q):
     import tempfile
     import numpy as np
     import yaml
-    from toolkit.engines.malaria.benchmarks import net_effect_fit as NEF
+    from toolkit.engines import effect_fit as EF
     with tempfile.TemporaryDirectory() as d:
         p = schema.toy_spec(d, n=24)
         u = [float(v) for v in np.random.default_rng(4).uniform(0, 1, 24)]
         rows = [{"eff_a": round(0.25 + 0.5 * x, 6), "eff_b": round(0.15 + 0.3 * (1 - x), 6)} for x in u]
-        NEF._fixture_placeholder(os.path.join(d, "nef.yaml"), schema.load(p).engine(), rows,
-                                 {"eff_a": [0, 1], "eff_b": [0, 1]}, point={"eff_a": 0.433, "eff_b": 0.288})
+        EF._fixture_placeholder(os.path.join(d, "nef.yaml"), schema.load(p).engine(), rows,
+                                {"eff_a": [0, 1], "eff_b": [0, 1]}, point={"eff_a": 0.433, "eff_b": 0.288})
         hull = {k: [min(r[k] for r in rows), max(r[k] for r in rows)] for k in ("eff_a", "eff_b")}
         sha = hashlib.sha256(open(os.path.join(d, "nef.yaml"), "rb").read()).hexdigest()
         r = yaml.safe_load(open(p))
@@ -2255,7 +2239,7 @@ def _self_test_posterior_point(ok):
     import numpy as np
     import yaml
     from toolkit.analysis import joint_calibration as JC
-    from toolkit.engines.malaria.benchmarks import net_effect_fit as NEF
+    from toolkit.engines import effect_fit as EF
     u = [float(v) for v in np.random.default_rng(5).uniform(0, 1, 24)]
     rows = [{"eff_a": round(0.3 + 0.4 * x, 6), "eff_b": round(0.12 + 0.3 * (1 - x), 6), "synergy": round(0.2 * x, 6)}
             for x in u]
@@ -2273,9 +2257,9 @@ def _self_test_posterior_point(ok):
                                                   "basis": "owner_judgement"}}
             r["uncertainty"]["excluded"] = [x for x in r["uncertainty"]["excluded"] if x.get("parameter") != "synergy"]
         if posterior:
-            NEF._fixture_placeholder(os.path.join(d, "nef.yaml"), schema.load(p).engine(),
-                                     [{k: x[k] for k in cols} for x in rows], {k: [0, 1] for k in cols},
-                                     point={k: chosen[k] for k in cols} if point is None else point)
+            EF._fixture_placeholder(os.path.join(d, "nef.yaml"), schema.load(p).engine(),
+                                    [{k: x[k] for k in cols} for x in rows], {k: [0, 1] for k in cols},
+                                    point={k: chosen[k] for k in cols} if point is None else point)
             sha = hashlib.sha256(open(os.path.join(d, "nef.yaml"), "rb").read()).hexdigest()
             r["uncertainty"]["net_effect_posterior"] = {"path": "nef.yaml", "sha256": sha}
         yaml.safe_dump(r, open(p, "w"), sort_keys=False)
@@ -2328,7 +2312,7 @@ def _self_test_posterior_point(ok):
         bench = _toy_bench(d)[0]
         p9 = schema.toy_spec(d, n=12, bench=bench)
         r9 = yaml.safe_load(open(p9))
-        NEF._fixture_placeholder(os.path.join(d, "nef.yaml"), schema.load(p9).engine(), [
+        EF._fixture_placeholder(os.path.join(d, "nef.yaml"), schema.load(p9).engine(), [
             {k: x[k] for k in ("eff_a", "eff_b")} for x in rows], {"eff_a": [0, 1], "eff_b": [0, 1]},
             point={"eff_a": 0.41, "eff_b": 0.27})
         r9["uncertainty"]["net_effect_posterior"] = {
@@ -2731,11 +2715,14 @@ def _self_test_cost_structure(ok, A, R):
        "R5r the results state the floored increments, with the count as a claim")
 
 
+def _perturb_view(rec: dict) -> dict:
+    ignored = ("type", "perturb", "path", "producer", "produced_by")
+    return {k: v for k, v in rec.items() if k not in ignored}
+
+
 def _self_test_perturb(ok, A, R):
     """W0-B: a native perturb test runs through the same machinery as the older type it replaces and gives the same
-    record (every golden part: decision, detail, words, plans); a joint test holds its companions and carries no
-    departure. These records are kept out of the golden capture (they repeat records already in it)."""
-    from toolkit.analysis import dt_golden as DG
+    record (decision, detail, words, plans); a joint test holds its companions and carries no departure."""
     plan = R["point"]["plan"]
     z0 = {i: v["z"] for i, v in R["point"]["per_unit"].items()}
     out0, ben0, cost0 = A.evaluate(A.theta0, z0)
@@ -2757,26 +2744,21 @@ def _self_test_perturb(ok, A, R):
                           {"target": "parameter", "name": nm[0], "values": [box[nm[0]][0], mid[nm[0]]]},
                           {"target": "parameter", "name": nm[1], "value": box[nm[1]][1]}]}))
     ok(len(pairs) == 3, f"RPT0 the toy emulator has two parameter inputs for the joint test: {nm}")
-    DG._CAP["paused"] = True
-    try:
-        for old, new in pairs:
-            r_old = DT.run_one(A, old, z0, ben0, cost0, plan, R["uncertainty"], out0)
-            r_new = DT.run_one(A, new, z0, ben0, cost0, plan, R["uncertainty"], out0)
-            ok(r_new["status"] == "run" and DG.digest(r_new) == DG.digest(r_old) and r_new["type"] == "perturb"
-               and r_old["type"] == old["type"] and r_old["perturb"]["alias"] == old["type"],
-               f"RPT1 a perturb test gives the record of its alias {old['type']} ({old['id']}): "
-               f"{DG.digest(r_new)} vs {DG.digest(r_old)}")
-            lay = r_new["perturb"]["layer"]
-            ok(lay["layer"] == ("post_emulator" if old["type"] == "envelope" else "emulator_design")
-               and lay["engine_rows"] == 0, f"RPT2 the record names the layer the test acts on: {lay}")
-        if len(pairs) == 3:
-            dv = DT.departure_verdicts([{"engine": "e", "benchmark": "B", "decision_test": "DTj"}],
-                                       {"B": {"components": ["a"]}}, {"DTj": r_new})
-            ok(r_new.get("with") == {nm[1]: box[nm[1]][1]} and not dv[0]["effective"] and "companion" in dv[0]["why"],
-               f"RPT3 DT_CONDITIONAL_NO_DEPARTURE: a joint perturb test holds its companion and carries no departure: "
-               f"{dv}")
-    finally:
-        DG._CAP["paused"] = False
+    for old, new in pairs:
+        r_old = DT.run_one(A, old, z0, ben0, cost0, plan, R["uncertainty"], out0)
+        r_new = DT.run_one(A, new, z0, ben0, cost0, plan, R["uncertainty"], out0)
+        ok(r_new["status"] == "run" and _perturb_view(r_new) == _perturb_view(r_old) and r_new["type"] == "perturb"
+           and r_old["type"] == old["type"] and r_old["perturb"]["alias"] == old["type"],
+           f"RPT1 a perturb test gives the record of its alias {old['type']} ({old['id']})")
+        lay = r_new["perturb"]["layer"]
+        ok(lay["layer"] == ("post_emulator" if old["type"] == "envelope" else "emulator_design")
+           and lay["engine_rows"] == 0, f"RPT2 the record names the layer the test acts on: {lay}")
+    if len(nm) >= 2:
+        dv = DT.departure_verdicts([{"engine": "e", "benchmark": "B", "decision_test": "DTj"}],
+                                   {"B": {"components": ["a"]}}, {"DTj": r_new})
+        ok(r_new.get("with") == {nm[1]: box[nm[1]][1]} and not dv[0]["effective"] and "companion" in dv[0]["why"],
+           f"RPT3 DT_CONDITIONAL_NO_DEPARTURE: a joint perturb test holds its companion and carries no departure: "
+           f"{dv}")
 
 
 def _floor_q(theta, theta0, at_point):

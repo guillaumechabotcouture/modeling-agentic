@@ -1500,15 +1500,15 @@ def _self_test_posterior_ranges(ok) -> None:
     import tempfile
     import numpy as np
     import yaml
-    from toolkit.engines.malaria.benchmarks import net_effect_fit as NEF
+    from toolkit.engines import effect_fit as EF
     from toolkit.spec import schema
     toy = "toolkit.engines.contract:ToyEngine"
     with tempfile.TemporaryDirectory() as d:
         p = schema.toy_spec(d)
         u = [float(v) for v in np.random.default_rng(4).uniform(0, 1, 24)]
         rows = [{"eff_a": round(0.25 + 0.5 * x, 6), "eff_b": round(0.15 + 0.3 * (1 - x), 6)} for x in u]
-        NEF._fixture_placeholder(os.path.join(d, "nef.yaml"), schema.load(p).engine(), rows,
-                                 {"eff_a": [0, 1], "eff_b": [0, 1]})
+        EF._fixture_placeholder(os.path.join(d, "nef.yaml"), schema.load(p).engine(), rows,
+                                {"eff_a": [0, 1], "eff_b": [0, 1]})
         raw = yaml.safe_load(open(p))
         r = lambda n: {"kind": "parameter", "name": n, "engines": [(toy, {})], "used_by": ["x"]}  # noqa: E731
         before = _execution_view(r("eff_a"), raw, d, {})

@@ -959,7 +959,7 @@ def _self_test() -> int:
         import hashlib
         import json
         import yaml
-        from toolkit.engines.malaria.benchmarks import net_effect_fit as NEF
+        from toolkit.engines import effect_fit as EF
         from toolkit.spec import schema
         with tempfile.TemporaryDirectory() as d:
             s0 = schema.load(schema.toy_spec(d))
@@ -970,7 +970,7 @@ def _self_test() -> int:
                f"BA-NP1 a spec without a net-effect posterior has the same design and design box as before ({got0[:12]})")
             u = [float(v) for v in np.random.default_rng(4).uniform(0, 1, 24)]
             rows = [{"eff_a": round(0.25 + 0.5 * x, 6), "eff_b": round(0.15 + 0.3 * (1 - x), 6)} for x in u]
-            NEF._fixture_placeholder(os.path.join(d, "nef.yaml"), s0.engine(), rows, {"eff_a": [0, 1], "eff_b": [0, 1]})
+            EF._fixture_placeholder(os.path.join(d, "nef.yaml"), s0.engine(), rows, {"eff_a": [0, 1], "eff_b": [0, 1]})
             hull = {k: (min(r[k] for r in rows), max(r[k] for r in rows)) for k in ("eff_a", "eff_b")}
             raw = yaml.safe_load(open(os.path.join(d, "decision_spec.yaml")))
             raw["uncertainty"]["net_effect_posterior"] = {

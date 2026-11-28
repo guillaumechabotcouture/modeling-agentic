@@ -142,8 +142,8 @@ def _net_effect_posterior(run_dir, spec, signer) -> list:
             and not box[k][0] - tol(box[k]) <= float(point[k]) <= box[k][1] + tol(box[k])]
     # owner, 15 Nov ("tests may go wider"): a parameter_value test on a posterior column may go beyond the hull (it
     # widens the design box, batch.design_box), but never past the column's hard bounds
-    from toolkit.engines.malaria.benchmarks import net_effect_fit as NEF
-    hb = NEF.hard_bounds(eng, list(ne["ranges"]))
+    from toolkit.engines import effect_fit as EF
+    hb = EF.hard_bounds(eng, list(ne["ranges"]))
     from toolkit.spec import engine_parameters as PV
     for t in (spec.raw.get("analysis") or {}).get("decision_tests") or []:
         for n, vs in sorted(PV.test_settings(t, names=hb).items()):     # its own values and each companion's
@@ -465,7 +465,7 @@ def _self_test_posterior(ok) -> None:
     import tempfile
     import yaml
     import numpy as np
-    from toolkit.engines.malaria.benchmarks import net_effect_fit as NEF
+    from toolkit.engines import effect_fit as EF
     from toolkit.engines.malaria.engine import MalariaEngine
     from toolkit.spec import schema, signoff as SO
     u = [float(v) for v in np.random.default_rng(4).uniform(0, 1, 24)]
@@ -473,8 +473,8 @@ def _self_test_posterior(ok) -> None:
 
     def run_dir(d, eng=None, post=None, sources=None, point=None):
         p = schema.toy_spec(d)
-        NEF._fixture_placeholder(os.path.join(d, "nef.yaml"), eng or schema.load(p).engine(), rows,
-                                 {"eff_a": [0, 1], "eff_b": [0, 1]}, point=point)
+        EF._fixture_placeholder(os.path.join(d, "nef.yaml"), eng or schema.load(p).engine(), rows,
+                                {"eff_a": [0, 1], "eff_b": [0, 1]}, point=point)
         raw = yaml.safe_load(open(p))
         raw["uncertainty"]["net_effect_posterior"] = post or {
             "path": "nef.yaml", "sha256": hashlib.sha256(open(os.path.join(d, "nef.yaml"), "rb").read()).hexdigest()}
@@ -540,21 +540,21 @@ def _self_test_posterior(ok) -> None:
                       f"bounds) is accepted: {got[:1]}")
         raw["analysis"]["decision_tests"][-1]["values"] = [0.1, 1.5]
         yaml.safe_dump(raw, open(p, "w"), sort_keys=False)
-        NEF.UNIT_BOUNDS[""] = (0.0, 1.0)        # the toy engine's parameters have no units: give them [0, 1] here
+        EF.UNIT_BOUNDS[""] = (0.0, 1.0)        # the toy engine's parameters have no units: give them [0, 1] here
         try:
             got = problems(d, None, None)
         finally:
-            NEF.UNIT_BOUNDS.pop("", None)
+            EF.UNIT_BOUNDS.pop("", None)
         ok(any("DTpa" in g and "hard bound" in g for g in got),
            f"PC16b a parameter_value test that sets a posterior column outside its hard bounds is refused: {got[:1]}")
         # v2-dt-with: a companion value of a posterior column is checked against the same hard bounds
         raw["analysis"]["decision_tests"][-1].update(parameter="eff_b", values=[0.2], **{"with": {"eff_a": 1.5}})
         yaml.safe_dump(raw, open(p, "w"), sort_keys=False)
-        NEF.UNIT_BOUNDS[""] = (0.0, 1.0)
+        EF.UNIT_BOUNDS[""] = (0.0, 1.0)
         try:
             got = problems(d, None, None)
         finally:
-            NEF.UNIT_BOUNDS.pop("", None)
+            EF.UNIT_BOUNDS.pop("", None)
         ok(any("DTpa" in g and "eff_a" in g and "hard bound" in g for g in got),
            f"PC16c a parameter_value test whose `with` sets a posterior column outside its hard bounds is refused: "
            f"{got[:1]}")

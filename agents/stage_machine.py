@@ -302,25 +302,6 @@ def route_gate(decision: dict | None, post_write: bool, *, built_engine: bool = 
 
 
 # ------------------------------------------------------------------ gates
-def legacy_gate(run_dir: str, round_n: int, max_rounds: int, post_write: bool, history: bool = True,
-                timeout_s: int = 1800) -> dict | None:
-    """Today's STAGE 7 validator CLI, with the final gate's exact flags."""
-    from agents.run_finish import gate_command
-    cmd = gate_command(run_dir, max_rounds, round_n, post_write, history=history)
-    try:
-        p = subprocess.run(cmd, cwd=REPO, capture_output=True, text=True, timeout=timeout_s)
-    except (OSError, subprocess.TimeoutExpired) as e:
-        return {"action": None, "error": f"{type(e).__name__}: {e}"}
-    out = p.stdout.strip()
-    try:
-        d = json.loads(out[out.index("{"):])
-    except ValueError:
-        return {"action": None, "error": (p.stderr.strip().splitlines() or ["no JSON"])[-1][:400],
-                "exit_code": p.returncode}
-    d["exit_code"] = p.returncode
-    return d
-
-
 def spec_signoff_findings(run_dir: str, signoff: str, backend=None) -> list[dict]:
     """decision_spec.yaml must not change after sign-off (non-declarable)."""
     if signoff == "none":
@@ -707,7 +688,6 @@ def open_findings(run_dir: str, decision: dict) -> list[dict]:
     itself). `tested`: the finding has a test the fix loop can work to. A write-up finding waits
     for the draft."""
     import done_when as DW
-    import open_problems as OP
     import validate_critique_yaml as V
     draft = os.path.exists(os.path.join(run_dir, "manuscript.md"))
     drafted = draft or os.path.exists(os.path.join(run_dir, "report.md"))     # the gate's own test for a draft
@@ -738,7 +718,7 @@ def open_findings(run_dir: str, decision: dict) -> list[dict]:
             if (not isinstance(b, dict) or b.get("resolved") or str(b.get("severity")) not in ("HIGH", "MEDIUM")
                     or str(b.get("id")) in closed):
                 continue
-            if not drafted and OP.after_write_item(b):     # the gate's own rule (V._defer_write_findings)
+            if not drafted and V.after_write_item(b):     # the gate's own rule (V._defer_write_findings)
                 continue
             dw = b.get("done_when")
             out.append({"id": str(b.get("id")), "source": reviewer, "severity": b.get("severity"),
@@ -3943,58 +3923,54 @@ class Machine:
     def h_GATE(self):
         pw = self.st.post_write
         waiting: list = []        # findings awaiting the owner's answer: no final disposition is published before it
-        if self.st.gate_mode == "legacy":
-            d = legacy_gate(self.run_dir, self.st.round, self.st.max_rounds, pw)
-            # (owner amendments and declines are v2 rules: the legacy mode replays stored v1 gates and applies neither)
-        else:
-            sv = getattr(self.backend, "spec_violations", None)
-            rv = getattr(self.backend, "registry_violations", None)
-            d = v2_gate(self.run_dir, self.st.round, self.st.max_rounds, pw, self.harness_findings(),
-                        spec_violations=sv(self.run_dir) if sv else None,
-                        registry_violations=rv(self.run_dir) if rv else None,
-                        strict_done_when=self.st.v2_rules and self.st.tries.get("schema", 0) < MAX_SCHEMA_REPAIRS,
-                        append_history=False, signoff=self.st.signoff, checklist_rules=self.st.v2_rules)
-            opened = []
-            if d.get("action") and self.st.v2_rules:
-                opened = open_findings(self.run_dir, d)
-                # synced with this decision, so a gate finding is read as this gate states it (Codex round 3 of #258),
-                # and before the medium rule, which declares what the owner holds (hb1 cause H)
-                led0 = FL.sync(self.run_dir, d, self.st.round, post_write=pw, lead_ok=self.st.signoff == "lead")[0]
-                held_now = sorted(owner_accepted_now(self.run_dir, opened, self.st.signoff == "lead"))
-                gaps_now = sorted(FL.harness_gaps(led0))            # hb2 fix 4: not fix-loop work
-                d = apply_medium_rule(d, opened, int(d.get("rounds_remaining") or 0), not self._out_of_budget(),
-                                      owner_held=held_now, harness_gaps=gaps_now)
-                d = apply_held_rule(d, led0, held_now, gaps_now, opened)
-                d["owner_held"] = held_now      # what this gate read as the owner's (FIX_LOOP's shortcut reads it here)
-                d["harness_gaps"] = gaps_now
-                d["open_tested_ids"] = sorted(str(o["id"]) for o in opened if o.get("tested"))   # the shortcut reads it
-                d = require_judged(d, opened)
-                # Codex re-review of #258 P1-11: the owner's declines hold this gate before anything is written from it
-                d = apply_owner_declines(d, led0)
-                waiting = sorted(set(pending_amendments(led0, d.get("resolved_by_test")) + pending_conflicts(led0)))
-                if d.get("rule_matched") == "owner_declined":
-                    drop_declined(self.run_dir, [h["finding"] for h in d["unresolved_high"]
-                                                 if isinstance(h, dict) and h.get("kind") == "scope_declaration_declined"])
-            if d.get("action"):
-                import validate_critique_yaml as V
-                V._append_validator_history(self.run_dir, self.st.round, d, pw)
-            if self.st.v2_rules and d.get("action") == "DECLARE_SCOPE" and not waiting:
-                # (not while a finding awaits the owner's answer: the gate re-runs after it; Codex r3 of #344, P1-2)
-                # Every DECLARE_SCOPE (rule 3, 3a or 3m) lists what is still open in the write-up.
-                write_declared(self.run_dir, opened, d)
-            if self.st.v2_rules and pw and d.get("action") and self._has_draft():
-                # The final status heads the report; a not-accepted one records any acceptance language. While a
-                # finding awaits the owner's answer the status is pending (Codex r2 of #344, P1-1).
-                fst = None if waiting else route_gate(d, pw)[1]
-                render_report(self.run_dir, self.backend, status=fst or "pending")
-                if fst in ACCEPTED_STATUSES and _render_stale(self.run_dir):
-                    # an accepted test's record changed between this gate's read and the report's (Codex r3 of #357,
-                    # P1-7): the report cannot state what was accepted, so the accept is not delivered
-                    _withhold_report(self.run_dir)
-                    return self._go("FINAL", "an accepted decision test's record changed after the gate read it: "
-                                             "the report could not state the accepted dependence", "completed_gate_error")
-                if fst is not None and fst not in ACCEPTED_STATUSES:
-                    d["report_acceptance_language"] = self._language_check(fst)
+        sv = getattr(self.backend, "spec_violations", None)
+        rv = getattr(self.backend, "registry_violations", None)
+        d = v2_gate(self.run_dir, self.st.round, self.st.max_rounds, pw, self.harness_findings(),
+                    spec_violations=sv(self.run_dir) if sv else None,
+                    registry_violations=rv(self.run_dir) if rv else None,
+                    strict_done_when=self.st.v2_rules and self.st.tries.get("schema", 0) < MAX_SCHEMA_REPAIRS,
+                    append_history=False, signoff=self.st.signoff, checklist_rules=self.st.v2_rules)
+        opened = []
+        if d.get("action") and self.st.v2_rules:
+            opened = open_findings(self.run_dir, d)
+            # synced with this decision, so a gate finding is read as this gate states it (Codex round 3 of #258),
+            # and before the medium rule, which declares what the owner holds (hb1 cause H)
+            led0 = FL.sync(self.run_dir, d, self.st.round, post_write=pw, lead_ok=self.st.signoff == "lead")[0]
+            held_now = sorted(owner_accepted_now(self.run_dir, opened, self.st.signoff == "lead"))
+            gaps_now = sorted(FL.harness_gaps(led0))            # hb2 fix 4: not fix-loop work
+            d = apply_medium_rule(d, opened, int(d.get("rounds_remaining") or 0), not self._out_of_budget(),
+                                  owner_held=held_now, harness_gaps=gaps_now)
+            d = apply_held_rule(d, led0, held_now, gaps_now, opened)
+            d["owner_held"] = held_now      # what this gate read as the owner's (FIX_LOOP's shortcut reads it here)
+            d["harness_gaps"] = gaps_now
+            d["open_tested_ids"] = sorted(str(o["id"]) for o in opened if o.get("tested"))   # the shortcut reads it
+            d = require_judged(d, opened)
+            # Codex re-review of #258 P1-11: the owner's declines hold this gate before anything is written from it
+            d = apply_owner_declines(d, led0)
+            waiting = sorted(set(pending_amendments(led0, d.get("resolved_by_test")) + pending_conflicts(led0)))
+            if d.get("rule_matched") == "owner_declined":
+                drop_declined(self.run_dir, [h["finding"] for h in d["unresolved_high"]
+                                             if isinstance(h, dict) and h.get("kind") == "scope_declaration_declined"])
+        if d.get("action"):
+            import validate_critique_yaml as V
+            V._append_validator_history(self.run_dir, self.st.round, d, pw)
+        if self.st.v2_rules and d.get("action") == "DECLARE_SCOPE" and not waiting:
+            # (not while a finding awaits the owner's answer: the gate re-runs after it; Codex r3 of #344, P1-2)
+            # Every DECLARE_SCOPE (rule 3, 3a or 3m) lists what is still open in the write-up.
+            write_declared(self.run_dir, opened, d)
+        if self.st.v2_rules and pw and d.get("action") and self._has_draft():
+            # The final status heads the report; a not-accepted one records any acceptance language. While a
+            # finding awaits the owner's answer the status is pending (Codex r2 of #344, P1-1).
+            fst = None if waiting else route_gate(d, pw)[1]
+            render_report(self.run_dir, self.backend, status=fst or "pending")
+            if fst in ACCEPTED_STATUSES and _render_stale(self.run_dir):
+                # an accepted test's record changed between this gate's read and the report's (Codex r3 of #357,
+                # P1-7): the report cannot state what was accepted, so the accept is not delivered
+                _withhold_report(self.run_dir)
+                return self._go("FINAL", "an accepted decision test's record changed after the gate read it: "
+                                         "the report could not state the accepted dependence", "completed_gate_error")
+            if fst is not None and fst not in ACCEPTED_STATUSES:
+                d["report_acceptance_language"] = self._language_check(fst)
         tag = f"gate_r{self.st.round}{'_post' if pw else ''}.json"
         _write_json(self.run_dir, tag, d or {})
         if pw and not waiting:
@@ -5864,10 +5840,15 @@ def _self_test_lead_amend_r3(ok, td: str, parent, good: dict, _boom) -> None:
         meta = json.load(open(mc))
         pr = {k: v for k, v in meta["parent_run"].items() if k != "run_state_sha256"}
         json.dump(dict(meta, parent_run=dict(pr, **({"run_state_sha256": digest} if digest else {}))), open(mc, "w"))
+        try:
+            la = json.load(open(os.path.join(p, SPEC_RETHINK_REQUEST))).get("lead_amendment")
+        except (OSError, ValueError, AttributeError):
+            la = None
         ok(load_state(p).status == AMENDED_PROVISIONAL and handoff_child(p) is None
            and handoff_chain(p) == [] and handoff_chain(p, kept=True) == [],
            f"T_R3_STRICT_LINEAGE (P1-10, P1-11) {where}: a child without the parent's final digest is neither resumed "
-           f"nor stored with it ({handoff_chain(p, kept=True)})")
+           f"nor stored with it (status={load_state(p).status!r}, kept={handoff_chain(p, kept=True)}, "
+           f"lead_amendment={la!r})")
     # P2-12: a parent and child moved together, the original tree gone: the confirmation names the moved parent
     p = pair(src, "r3_moved")
     _sh.move(src, src + ".gone")
@@ -5875,7 +5856,8 @@ def _self_test_lead_amend_r3(ok, td: str, parent, good: dict, _boom) -> None:
         al = amendment_lines(p + ".amend1")
     finally:
         _sh.move(src + ".gone", src)
-    ok(al and shlex.quote(p) in al[0] and f"`{src}`" not in al[0] and f"{shlex.quote(src)} " not in al[0],
+    ok(al and shlex.quote(p) in al[0] and f"`{src}`" not in al[0] and f"{shlex.quote(src)} " not in al[0]
+       and "signed by lead" in al[0],
        f"T_R3_MOVED_COMMAND (P2-12) the owner's confirmation command names the moved parent ({al[:1]})")
     # P1-8: the parent stays held across the hand-off; a second resumer cannot take over its child
     d = parent("r3_handover", "lead", good)[0]

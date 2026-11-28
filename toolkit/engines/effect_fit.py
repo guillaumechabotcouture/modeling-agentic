@@ -52,6 +52,7 @@ the targets' resolved declarations, the engine identity and the seeds: a changed
 from __future__ import annotations
 
 import hashlib
+import inspect
 import itertools
 import json
 import math
@@ -924,6 +925,37 @@ def _self_test() -> int:
     ok(refused(lambda: fit(decl, pack, _toy_engine([]), {"name": None})),
        "EF_CACHE: an engine identity with an empty value is refused")
 
+    # Generic posterior load/ranges/hard_bounds/fixture tests
+    from toolkit.engines.contract import ToyEngine
+    from toolkit.spec.toy_engines import ToySpecEngine
+    toy_eng = ToyEngine()
+    ok(_pack_for_engine(toy_eng)[0].get("fit_joint", {}).get("targets") == ["T6", "T18"]
+       and _pack_for_engine(ToySpecEngine())[0].get("fit_joint", {}).get("targets") == ["T6", "T18"],
+       "EF_PACK_TOY: _pack_for_engine returns fixture pack for ToyEngine and ToySpecEngine")
+    with tempfile.TemporaryDirectory() as td:
+        fp = os.path.join(td, "fit.yaml")
+        rows_f = [{"eff_a": 0.3 + 0.02 * i, "eff_b": 0.2 + 0.01 * i} for i in range(10)]
+        _fixture_placeholder(fp, toy_eng, rows_f, {"eff_a": [0, 1], "eff_b": [0, 1]})
+        dig_f = hashlib.sha256(open(fp, "rb").read()).hexdigest()
+        raw_b = read_signed(fp, dig_f)
+        ne_f = load_posterior(fp, toy_eng, {"eff_a": (0, 1), "eff_b": (0, 1)}, dig_f, raw_b)
+        rng_f = posterior_ranges(ne_f, 0.1, hard_bounds(toy_eng, ne_f["names"]))
+        ok(rng_f["eff_a"][0] < 0.3 and rng_f["eff_a"][1] > 0.48, f"EF_POSTERIOR: ranges widened by margin: {rng_f}")
+        ok(refused(lambda: read_signed(fp, "0" * 64)), "EF_POSTERIOR: wrong digest refused")
+    from toolkit import import_guard as IG
+    for f in found:
+        dcl, pk_, _cv, _ver = pack_files(f)
+        for ec in dcl.get("edge_checks") or []:
+            pname = ec.get("param")
+            box = (dcl.get("parameters") or {}).get(pname, {}).get("box")
+            eng_dir = os.path.dirname(os.path.dirname(os.path.abspath(f)))
+            eng_mod_name = os.path.basename(eng_dir)
+            mod = IG.module("engine", f"toolkit.engines.{eng_mod_name}.engine")
+            eng_cls = next(getattr(mod, a) for a in dir(mod) if a.endswith("Engine") and a != "Engine")
+            hb_ec = hard_bounds(eng_cls(), [pname])
+            ok(pname in hb_ec and hb_ec[pname][0] >= box[0] and hb_ec[pname][1] <= box[1],
+               f"EF_EDGE_BOUNDS: {pname} hard_bounds {hb_ec.get(pname)} respects edge_checks box {box}")
+
     print("OK: all self-test cases passed." if not fails else f"FAILED: {len(fails)} case(s)")
     return 1 if fails else 0
 
@@ -941,6 +973,434 @@ def main(argv=None) -> int:
         return 1 if probs else 0
     print(__doc__)
     return 2
+
+
+# ---------------------------------------------------------------------------
+# Generic posterior loading, hard bounds, range derivation & test fixture APIs
+# (ported from net_effect_fit.py; strictly disease- and parameter-agnostic)
+# ---------------------------------------------------------------------------
+
+class PosteriorRefused(ValueError):
+    """The fit's output cannot be the draws' joint sample (fail closed)."""
+
+
+UNIT_BOUNDS = {
+    "probability": (0.0, 1.0),
+    "share": (0.0, 1.0),
+    "days": (0.0, math.inf),
+    "months": (0.0, math.inf),
+    "years": (0.0, math.inf),
+}
+DURATIONS = ("days", "months", "years")
+_Z95 = 1.96
+_CAL_TOL = 0.10
+_ACCEPTANCE_RULE = (
+    "a verified point, and the chosen point, is in band for a target when the 95% interval "
+    "of its seed mean overlaps the target's band (geometric mean over declared seeds)."
+)
+_ACCEPTANCE_STATISTIC = "geometric mean over seeds; 95% interval exp(mean(log v) +- 1.96 sd(log v)/sqrt(n))"
+
+
+def _fixture_pack() -> dict:
+    """Synthetic pack with two training targets (T6, T18) and one held-out target (TH) for toy tests."""
+    p = _toy_pack([{
+        "id": "TH",
+        "target": 0.65,
+        "band": [0.60, 0.70],
+        "estimand": {"type": "ratio", "num": "trt", "den": "ctl", "value": "windows.m6.prev"},
+    }])
+    p["fit_joint"] = {"targets": ["T6", "T18"]}
+    return p
+
+
+def _pack_for_engine(engine) -> tuple[dict, dict | None]:
+    """Discover (<eng_dir>/benchmarks/pack.yaml, effect_fit.yaml) via the engine class; fall back for toy engines."""
+    if (
+        getattr(engine, "is_toy", False)
+        or type(engine).__module__ in ("toolkit.engines.contract", "toolkit.engines.hooks", "toolkit.spec.toy_engines")
+        or type(engine).__name__.startswith("Toy")
+        or any(
+            c.__module__ in ("toolkit.engines.contract", "toolkit.engines.hooks", "toolkit.spec.toy_engines")
+            and c.__name__.startswith("Toy")
+            for c in type(engine).__mro__
+        )
+    ):
+        return _fixture_pack(), None
+    try:
+        eng_file = inspect.getfile(type(engine))
+    except TypeError as ex:
+        raise PosteriorRefused(f"cannot locate benchmark pack for engine {type(engine).__name__}: {ex}") from ex
+    bdir = os.path.join(os.path.dirname(os.path.abspath(eng_file)), "benchmarks")
+    pack_path = os.path.join(bdir, "pack.yaml")
+    if not os.path.isfile(pack_path):
+        raise PosteriorRefused(f"no benchmark pack found at {pack_path}")
+    with open(pack_path, encoding="utf-8") as fh:
+        pack = yaml.safe_load(fh) or {}
+    eff_path = os.path.join(bdir, "effect_fit.yaml")
+    eff = None
+    if os.path.isfile(eff_path):
+        with open(eff_path, encoding="utf-8") as fh:
+            eff = yaml.safe_load(fh)
+    return pack, eff
+
+
+def _pack_targets(pack: dict, eff_decl: dict | None = None) -> list[str]:
+    if isinstance(eff_decl, dict) and isinstance(eff_decl.get("targets"), dict):
+        return list(eff_decl["targets"])
+    return list((pack.get("fit_joint") or {}).get("targets") or [])
+
+
+def _pack_bands(pack: dict, eff_decl: dict | None = None) -> dict:
+    tids = set(_pack_targets(pack, eff_decl))
+    return {b["id"]: list(b["band"]) for b in pack.get("benchmarks") or [] if b.get("id") in tids}
+
+
+def _pack_seeds(pack: dict) -> list:
+    return list(pack.get("seeds") or [])
+
+
+def _replay_target_digests(base: dict, ids) -> dict:
+    from toolkit.engines.benchmark_sources import band_digest
+    return {b["id"]: band_digest(b, base) for b in base.get("benchmarks") or [] if b.get("id") in set(ids)}
+
+
+def read_signed(path: str, digest) -> bytes:
+    """The file's bytes, read once, if their sha256 matches `digest`; else refused."""
+    if not isinstance(digest, str) or len(digest) != 64:
+        raise PosteriorRefused(f"net-effect posterior {path}: no signed sha256 (64 hex characters) for the file")
+    try:
+        with open(path, "rb") as fh:
+            data = fh.read()
+    except OSError as ex:
+        raise PosteriorRefused(f"net-effect posterior {path}: unreadable ({ex})") from ex
+    got = hashlib.sha256(data).hexdigest()
+    if got != digest.lower():
+        raise PosteriorRefused(f"net-effect posterior {path}: its bytes are not the ones signed (sha256 "
+                               f"{got}, signed sha256 {digest})")
+    return data
+
+
+def _same_point(a, b) -> bool:
+    return (isinstance(a, dict) and isinstance(b, dict) and sorted(a) == sorted(b)
+            and all(isinstance(a[k], (int, float)) and isinstance(b[k], (int, float))
+                    and round(float(a[k]), 6) == round(float(b[k]), 6) for k in a))
+
+
+def declared_seeds(seeds) -> list:
+    if not isinstance(seeds, (list, tuple)) or not seeds:
+        raise ValueError(f"no declared seeds ({seeds!r})")
+    if any(isinstance(x, bool) or not isinstance(x, int) for x in seeds):
+        raise ValueError(f"declared seeds must be integers ({list(seeds)!r})")
+    dup = sorted({x for x in seeds if list(seeds).count(x) > 1})
+    if dup:
+        raise ValueError(f"duplicate declared seeds {dup} in {list(seeds)}")
+    return list(seeds)
+
+
+def _seed_interval_95(values, n_seeds: int) -> tuple[float, float] | None:
+    if not isinstance(values, (list, tuple)):
+        return None
+    try:
+        v = [float(x) for x in values]
+        n_seeds = int(n_seeds)
+    except (TypeError, ValueError):
+        return None
+    if n_seeds < 2 or len(v) != n_seeds or not all(np.isfinite(v)) or min(v) <= 0:
+        return None
+    lg = np.log(v)
+    m, h = float(np.mean(lg)), _Z95 * float(np.std(lg, ddof=1)) / float(np.sqrt(len(v)))
+    return float(np.exp(m - h)), float(np.exp(m + h))
+
+
+def _ci_in_band_95(values, band, n_seeds: int) -> bool:
+    iv = _seed_interval_95(values, n_seeds)
+    return iv is not None and iv[0] <= float(band[1]) and iv[1] >= float(band[0])
+
+
+def _per_seed(p) -> dict:
+    per = (p or {}).get("per_seed") if isinstance(p, dict) else None
+    return per if isinstance(per, dict) else {}
+
+
+def seed_count_errors(p: dict, bands: dict, seeds) -> list:
+    per, n = _per_seed(p), len(seeds) if isinstance(seeds, (list, tuple)) else 0
+    out = []
+    for t in bands:
+        v = per.get(t)
+        k = len(v) if isinstance(v, (list, tuple)) else 0
+        if k != n:
+            out.append(f"{t}: {k} seed values for {n} declared seeds")
+    return out
+
+
+def point_in_band(p: dict, bands: dict, seeds) -> tuple[bool, dict]:
+    try:
+        n = len(declared_seeds(seeds))
+    except ValueError:
+        return False, {t: None for t in bands}
+    per = _per_seed(p)
+    ivs = {t: _seed_interval_95(per.get(t) or [], n) for t in bands}
+    return all(_ci_in_band_95(per.get(t) or [], b, n) for t, b in bands.items()), {
+        t: [round(v[0], 4), round(v[1], 4)] if v else None for t, v in ivs.items()}
+
+
+def calibration_ok(cal: dict) -> list:
+    return sorted(s for s, c in (cal or {}).items()
+                  if not abs(float(c["achieved"]) / float(c["target"]) - 1.0) <= _CAL_TOL)
+
+
+def finalize(reg: dict, checked: list, chosen: dict | None = None, grid_edge=(), bands: dict | None = None,
+             seeds=None) -> tuple[dict, int]:
+    bands = {} if bands is None else bands
+    seeds = [] if seeds is None else seeds
+    why = []
+    try:
+        declared_seeds(seeds)
+    except ValueError as ex:
+        why.append(f"the run's seeds cannot be checked against: {ex}")
+    for c in checked:
+        c["in_band_by_rule"], c["seed_mean_interval"] = point_in_band(c, bands, seeds)
+    failed = [c["point"] for c in checked if not c["in_band_by_rule"] or calibration_ok(c.get("calibration_check"))]
+    why += [f"verified point out of band (rule) or off calibration: {p}" for p in failed]
+    for c in checked:
+        if seed_count_errors(c, bands, seeds):
+            why.append(f"verified point without one seed value per declared seed at {c.get('point')}: "
+                       f"{seed_count_errors(c, bands, seeds)}")
+    for c in checked:
+        if calibration_ok(c.get("calibration_check")):
+            why.append(f"control arms off target by more than {_CAL_TOL:.0%} at {c['point']}: "
+                       f"{calibration_ok(c.get('calibration_check'))}")
+    if chosen is None:
+        why.append("the chosen point's verification is missing")
+    else:
+        chosen["in_band_by_rule"], chosen["seed_mean_interval"] = point_in_band(chosen, bands, seeds)
+        if not chosen["in_band_by_rule"]:
+            why.append(f"the chosen point fails its verification under the rule: {chosen['seed_mean_interval']}")
+        if seed_count_errors(chosen, bands, seeds):
+            why.append(f"the chosen point lacks one seed value per declared seed: "
+                       f"{seed_count_errors(chosen, bands, seeds)}")
+        if calibration_ok(chosen.get("calibration_check")):
+            why.append(f"the chosen point's control arms are off target: {calibration_ok(chosen['calibration_check'])}")
+    if grid_edge:
+        why.append(f"the calibration grid clamps at its edge for {sorted(grid_edge)}")
+    if not checked:
+        why.append("no verified sample point")
+    reg["verified"] = {
+        "n": len(checked), "all_in_band": len(checked) - len(failed), "failed": failed,
+        "points": checked, "chosen": chosen, "calibration_tolerance": _CAL_TOL,
+        "acceptance_rule": _ACCEPTANCE_RULE, "acceptance_statistic": _ACCEPTANCE_STATISTIC,
+        "seeds": list(seeds) if isinstance(seeds, (list, tuple)) else seeds,
+        "bands": {t: list(b) for t, b in bands.items()},
+    }
+    reg["acceptance"] = why
+    if why:
+        reg["sample_status"] = "unverified" if why == ["no verified sample point"] else "invalid"
+        reg["sample_unverified"], reg["sample"] = reg.get("sample") or [], []
+        return reg, 2
+    reg["sample_status"] = "verified"
+    return reg, 0
+
+
+def hard_bounds(engine, names, both: bool = False) -> dict:
+    """{name: (lo, hi, what)}: each parameter's hard bounds from the engine (UNIT_BOUNDS, priors.yaml, edge_checks)."""
+    from toolkit.spec import priors as PR
+    card = PR.load_card(engine)["priors"]
+    units = {q.name: q.units for q in engine.parameters()}
+    try:
+        _, eff = _pack_for_engine(engine)
+    except PosteriorRefused:
+        eff = None
+    edge_params = {
+        c["param"]: c for c in ((eff or {}).get("edge_checks") or [])
+        if isinstance(c, dict) and c.get("param")
+    }
+    eff_params = (eff or {}).get("parameters") or {}
+    out = {}
+    for k in names:
+        b = [(*UNIT_BOUNDS[units[k]], f"card units {units[k]}")] if units.get(k) in UNIT_BOUNDS else []
+        if k in edge_params and isinstance((eff_params.get(k) or {}).get("box"), list):
+            box = eff_params[k]["box"]
+            b.append((float(box[0]), float(box[1]), "effect_fit edge ceiling: " + str(edge_params[k].get("basis") or "")))
+        elif k in card:
+            b.append((float(card[k].lo), float(card[k].hi), "priors.yaml range"))
+        if b:
+            out[k] = b if both else (max(x[0] for x in b), min(x[1] for x in b), "; ".join(x[2] for x in b))
+    return out
+
+
+def load_posterior(path: str, engine, ranges: dict, digest, data: bytes | None = None,
+                   exception: dict | None = None) -> dict:
+    """Load and verify a posterior joint sample with full finalize() replay and hard-bound checking."""
+    import copy as _copy
+    from toolkit.engines.contract import engine_identity
+
+    def no(why):
+        raise PosteriorRefused(f"net-effect posterior {path}: {why}")
+
+    data = read_signed(path, digest) if data is None else data
+    if hashlib.sha256(data).hexdigest() != str(digest).lower():
+        no(f"the bytes given are not the ones signed (signed sha256 {digest})")
+    try:
+        doc = yaml.safe_load(data)
+    except yaml.YAMLError as ex:
+        no(f"malformed YAML ({ex})")
+    if not isinstance(doc, dict) or not isinstance(doc.get("joint_region"), dict) or doc.get("producer") not in (BM.PRODUCER, PRODUCER):
+        no("not an output of effect_fit (producer, joint_region)")
+    if doc.get("smoke") is not False:
+        no("a smoke run is not evidence")
+    have, want = doc.get("engine_identity") or {}, engine_identity(engine)
+    for k in ("name", "code_sha256"):
+        if have.get(k) != want[k]:
+            no(f"fitted under engine {k} {have.get(k)}, this engine's is {want[k]}")
+    reg = doc["joint_region"]
+    names = list((doc.get("plan") or {}).get("params") or {})
+    rows = reg.get("sample") or reg.get("sample_unverified")
+    if not names or not isinstance(rows, list) or not rows:
+        no("no fitted parameters or an empty sample")
+    X = []
+    for i, r in enumerate(rows):
+        if not isinstance(r, dict) or sorted(r) != sorted(names):
+            no(f"sample row {i} holds {sorted(r) if isinstance(r, dict) else r}, the fit's parameters are {names}")
+        if not all(isinstance(r[k], (int, float)) and not isinstance(r[k], bool) and math.isfinite(r[k]) for k in names):
+            no(f"sample row {i} holds a non-numeric or non-finite value: {r}")
+        X.append([float(r[k]) for k in names])
+    ver, edge = reg.get("verified") or {}, (doc.get("calibration_grid") or {}).get("at_grid_edge")
+    pts = ver.get("points")
+    if not isinstance(edge, list) or not isinstance(pts, list) or any(
+            not isinstance(p, dict) or p.get("point") not in rows for p in pts):
+        no("the fit's acceptance gate cannot be replayed: a calibration_grid.at_grid_edge record and verified points "
+           "that are rows of the sample are needed")
+    base, eff = _pack_for_engine(engine)
+    seeds, fr = _pack_seeds(base), doc.get("fit_rule")
+    rec = fr.get("seeds") if isinstance(fr, dict) else None
+    try:
+        declared_seeds(rec)
+    except ValueError as ex:
+        no(f"the run's recorded seeds (fit_rule.seeds) are not a valid declaration: {ex}")
+    if rec != seeds:
+        no(f"the run's recorded seeds {rec} are not pack.yaml's {seeds}")
+    bands = _pack_bands(base, eff)
+    exc = None
+    if exception is not None:
+        if reg.get("sample") != [] or not reg.get("sample_unverified") or reg.get("sample_status") != "invalid":
+            no("an exception applies only to a sample the fit recorded as invalid (sample_unverified)")
+        need = (doc.get("plan") or {}).get("verified_sample_points")
+        distinct = {json.dumps(p.get("point"), sort_keys=True) for p in pts}
+        if isinstance(need, bool) or not isinstance(need, int) or need < 1 or len(distinct) < need:
+            no(f"the fit verified {len(distinct)} distinct sample points against a declared {need!r}: not an "
+               f"exception's case")
+        fails = []
+        for p in pts:
+            per = _per_seed(p)
+            bad_ev = seed_count_errors(p, bands, seeds) or [t for t in bands if
+                                                              _seed_interval_95(per.get(t) or [], len(seeds)) is None]
+            if not point_in_band(p, bands, seeds)[0]:
+                cal = p.get("calibration_check")
+                bad_ev = bad_ev or not isinstance(cal, dict) or not cal or calibration_ok(cal)
+            if bad_ev:
+                no(f"verified point {p.get('point')} fails on its seed evidence or calibration, which no exception "
+                   f"waives")
+            if not point_in_band(p, bands, seeds)[0]:
+                per = _per_seed(p)
+                fails.append({"point": p["point"], "targets": sorted(
+                    t for t, b in bands.items() if not _ci_in_band_95(per.get(t) or [], b, len(seeds)))})
+        decl = [{"point": dict(x["point"]), "targets": sorted(x["targets"])} for x in exception["failed_points"]]
+        pair = [[j for j, x in enumerate(decl) if _same_point(f["point"], x["point"]) and f["targets"] == x["targets"]]
+                for f in fails]
+        if not fails or len(fails) != len(decl) or any(len(m) != 1 for m in pair) \
+                or sorted(m[0] for m in pair) != list(range(len(decl))):
+            no(f"the declared exception {decl} is not the file's recorded failures {fails} (the same points, the same "
+               f"targets, one to one)")
+        failed = [f["point"] for f in fails]
+        pts = [p for p in pts if not any(p["point"] == fp for fp in failed)]
+        rows = list(reg["sample_unverified"])
+        if exception.get("draws") == "exclude":
+            rows = [r for r in rows if not any(r == fp for fp in failed)]
+        X = [[float(r[k]) for k in names] for r in rows]
+        exc = dict(exception, failed_points=decl)
+    try:
+        rr, code = finalize({"sample": _copy.deepcopy(rows)}, _copy.deepcopy(pts), _copy.deepcopy(ver.get("chosen")),
+                            edge, bands=bands, seeds=seeds)
+        why = rr["acceptance"]
+    except (KeyError, TypeError, ValueError, AttributeError) as ex:
+        code, why = 2, [f"{type(ex).__name__}: {ex}"]
+    if code != 0 or (exc is None and reg.get("sample") != rows) or not rows:
+        no(f"the fit's acceptance gate (finalize, replayed on the file's evidence) does not pass: {why}")
+    miss = [k for k in names if k not in ranges]
+    if miss:
+        no(f"{miss} are not varied by these draws (an engine-card or spec prior, or a fitted parameter under the "
+           f"engine_parameters source, and not calibrated); the draws vary {sorted(ranges)}")
+    X = np.asarray(X, float)
+    for j, k in enumerate(names):
+        for lo, hi, what in hard_bounds(engine, [k], both=True).get(k, []):
+            tol = 1e-6 * max(1.0, hi - lo) if math.isfinite(hi - lo) else 1e-6
+            if X[:, j].min() < lo - tol or X[:, j].max() > hi + tol:
+                no(f"{k} spans [{X[:, j].min()}, {X[:, j].max()}], outside its hard bound [{lo}, {hi}] ({what})")
+    from toolkit.engines.benchmark_sources import band_digest
+    pl = doc.get("plan") or {}
+    tt, ho = pl.get("targets_train"), pl.get("held_out_untouched") or []
+    decl_map = {b["id"]: b for b in base["benchmarks"]}
+    td = doc.get("target_digests") if isinstance(doc.get("target_digests"), dict) else {}
+    trained = {k: td[k] for k in sorted(set(bands) & set(tt) - set(ho)) if decl_map[k].get("band") == bands[k]
+               and td.get(k) == band_digest(decl_map[k], base)} if isinstance(tt, list) and isinstance(ho, list) else {}
+    return dict({"path": os.path.abspath(path), "sha256": str(digest).lower(), "names": names, "rows": X,
+                 "trained": trained}, **({"exception": exc} if exc else {}))
+
+
+def posterior_ranges(ne: dict, margin=0.0, bounds: dict | None = None) -> dict:
+    """{name: (lo, hi)} of each column of a loaded, verified sample."""
+    if isinstance(margin, bool) or not isinstance(margin, (int, float)) or not math.isfinite(margin) \
+            or not 0 <= margin <= 1:
+        raise ValueError(f"net-effect posterior margin {margin!r}: a share of the hull's width in [0, 1]")
+    X = np.asarray(ne["rows"], float)
+    out = {}
+    for j, k in enumerate(ne["names"]):
+        lo, hi = float(X[:, j].min()), float(X[:, j].max())
+        if not hi > lo:
+            raise PosteriorRefused(f"net-effect posterior: column {k} has no spread ({lo}): it cannot set a range")
+        if margin:
+            w = hi - lo
+            blo, bhi, what = (bounds or {}).get(k, (-math.inf, math.inf, ""))
+            lo, hi = min(lo, max(lo - margin * w, blo)), max(hi, min(hi + margin * w, bhi))
+            if lo <= 0 < X[:, j].min() and any(f"card units {u}" in what for u in DURATIONS):
+                raise PosteriorRefused(f"net-effect posterior: margin {margin} takes {k}, a duration, to {lo} (a zero "
+                                       "duration is not physical); use a smaller margin")
+        out[k] = (lo, hi)
+    return out
+
+
+def _fixture_placeholder(path: str, eng, rows: list, box: dict, gate_ok: bool = True, point=None,
+                         fail_target: str | None = None) -> None:
+    """Write a placeholder verified-sample fixture for self-tests via safe_io."""
+    pack, eff = _pack_for_engine(eng)
+    bands = _pack_bands(pack, eff)
+    seeds = _pack_seeds(pack)
+    ks = [(-1, 0, 1, 0)[i % 4] for i in range(len(seeds))]
+    mid = lambda f: {t: [round(float(np.sqrt(lo * hi)) * f * (1 + 0.01 * k), 4) for k in ks]  # noqa: E731
+                     for t, (lo, hi) in bands.items()}
+    pt = {"point": rows[0], "per_seed": mid(1.0 if gate_ok else 3.0), "calibration_check": {}}
+    ch = {"per_seed": mid(1.0), "all_in_band": True, "disproved_by_verification": [], "calibration_check": {}}
+    if point is not False:
+        ch["point"] = dict(rows[0] if point is None else point)
+    pts = [pt]
+    if fail_target:
+        per = mid(1.0)
+        per[fail_target] = [v * 3.0 for v in per[fail_target]]
+        pts.append({"point": rows[1], "per_seed": per, "calibration_check": {"site": {"achieved": 1.0, "target": 1.0}}})
+    reg, _ = finalize({"sample": [dict(r) for r in rows]}, pts, ch, bands=bands, seeds=seeds)
+    fit_doc = {"parameters": {k: {"value": v} for k, v in ch.get("point", {}).items()}}
+    doc = BM.stamp({
+        "purpose": "effect_fit placeholder fixture",
+        "smoke": False,
+        "plan": {"params": box, "verified_sample_points": len(pts)},
+        "calibration_grid": {"at_grid_edge": []},
+        "fit_rule": {"seeds": seeds},
+        "target_digests": _replay_target_digests(pack, bands),
+        "joint_region": reg,
+        **fit_doc,
+    }, eng)
+    from toolkit.analysis.artifacts import _safe_io
+    _safe_io().publish(path, yaml.safe_dump(doc, sort_keys=False).encode(), os.path.dirname(os.path.abspath(path)))
 
 
 if __name__ == "__main__":

@@ -52,7 +52,7 @@ PRODUCER = "toolkit/spec/geometry.py"
 ARTIFACT = "data/input_checks.json"
 SPEC_FILE = "decision_spec.yaml"
 PRESENTATION_FILES = ("presentation.yaml", "labels.yaml")
-THRESHOLDS_FILE = os.path.join(ROOT, ".claude", "orchestration", "effort_floors.yaml")
+DEFAULT_THRESHOLDS = {"edge_tolerance_km": 5.0, "area_ratio_max": 1.5}
 CODES = ("reciprocal_swap", "point_outside_own_polygon", "area_mismatch", "unmatched")
 FAILED, NOT_RUN, ACCEPT_BAD, EDGE = ("geometry_check_failed", "geometry_check_not_run", "geometry_acceptance_invalid",
                                      "point_near_own_boundary")
@@ -73,9 +73,11 @@ class GeometryError(ValueError):
 
 # --------------------------------------------------------------------------- thresholds
 def thresholds(path: str | None = None) -> dict:
-    """{edge_tolerance_km, area_ratio_max} from effort_floors.yaml `input_checks.geometry` (fail closed)."""
+    """{edge_tolerance_km, area_ratio_max} (defaults inlined; explicit path fails closed)."""
+    if path is None:
+        return dict(DEFAULT_THRESHOLDS)
     import yaml
-    p = path or THRESHOLDS_FILE
+    p = path
     try:
         doc = yaml.safe_load(open(p, encoding="utf-8")) or {}
     except (OSError, yaml.YAMLError) as e:
@@ -1439,7 +1441,7 @@ def _self_test() -> int:
             ok(True, "IG5c missing thresholds fail closed")
     t = thresholds()
     ok(t["edge_tolerance_km"] > 0 and t["area_ratio_max"] > 1,
-       f"IG6 the thresholds come from effort_floors.yaml input_checks.geometry: {t}")
+       f"IG6 DEFAULT_THRESHOLDS valid: {t}")
     for name, fn in (("IG8-IG9 owner approval and the frozen declaration", _self_test_owner),
                      ("IG10-IG12 degenerate rings, overlapping polygons, area", _self_test_shapes)):
         try:

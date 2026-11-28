@@ -770,14 +770,107 @@ def _value_of_information(run_dir: str, unc, voi) -> list[dict]:
             for m in VOI.contract_findings(raw, unc, voi)]
 
 
+REGRET_TOL = 1e-9
+
+
+def _inside(run_dir: str, rel: str):
+    if not isinstance(rel, str) or not rel.strip():
+        return None
+    root = os.path.realpath(run_dir)
+    p = os.path.realpath(os.path.join(root, rel.strip()))
+    if not (p == root or p.startswith(root + os.sep)) or not os.path.isfile(p):
+        return None
+    return p
+
+
+def _load_result(path: str):
+    with open(path, encoding="utf-8") as f:
+        text = f.read()
+    return json.loads(text) if path.endswith(".json") else yaml.safe_load(text)
+
+
+def _num(x):
+    return float(x) if isinstance(x, (int, float)) and not isinstance(x, bool) and math.isfinite(x) else None
+
+
+def _test_result(run_dir: str, rel):
+    p = _inside(run_dir, rel) if isinstance(rel, str) else None
+    if p is None:
+        return None, f"names no existing result file (`sufficiency_test: {rel!r}`)"
+    try:
+        res = _load_result(p)
+    except (OSError, UnicodeDecodeError, ValueError, yaml.YAMLError) as exc:
+        return None, f"has a result file that cannot be parsed ({exc})"
+    if not isinstance(res, dict):
+        return None, "has a result file that is not a mapping"
+    if not isinstance(res.get("decision_changes"), bool):
+        return None, "has a result file without a `decision_changes: true|false` verdict"
+    if not res.get("varied") or not (isinstance(res.get("criterion"), str) and res["criterion"].strip()):
+        return None, "has a result file that does not state what was `varied` and the decision `criterion`"
+    return res, None
+
+
+def _result_conflicts(rel: str, res: dict, label: str, restated) -> list[str]:
+    out = []
+    share, thr = _num(res.get("share_units_changed")), _num(res.get("share_threshold"))
+    given = [k for k in ("share_units_changed", "share_threshold") if res.get(k) is not None]
+    if given and (share is None or thr is None or not 0 <= share <= 1 or not 0 <= thr <= 1):
+        out.append(f"`{rel}`: share_units_changed and share_threshold must both be fractions in [0, 1] when "
+                   f"either is given (got {res.get('share_units_changed')!r}, {res.get('share_threshold')!r}).")
+
+    def fired(r):
+        crit = {"share": (_num(r.get("share_units_changed")), thr)}
+        for name, vk, tk in (("regret", "regret_share", "regret_threshold"),
+                             ("dollars", "dollars_share", "dollars_threshold")):
+            if r.get(vk) is not None or res.get(tk) is not None:
+                v, t = _num(r.get(vk)), _num(res.get(tk))
+                if name == "regret" and r.get(vk) is None and t is not None and 0 <= t <= 1 and (
+                        r.get("point_plan_feasible") is False
+                        or (_num(r.get("reoptimised_objective")) is not None and _num(r["reoptimised_objective"]) <= 0
+                            and _num(r.get("regret")) is not None)):
+                    if _num(r.get("regret")) is not None and r.get("point_plan_feasible") is not False:
+                        crit[name] = (_num(r["regret"]), REGRET_TOL * max(1.0, abs(_num(r["reoptimised_objective"]))))
+                    continue
+                if v is None or t is None or not 0 <= t <= 1:
+                    out.append(f"`{rel}`: {vk} and {tk} must both be numbers ({tk} a fraction in [0, 1]) when "
+                               f"either is given (got {r.get(vk)!r}, {res.get(tk)!r}), unless the point plan is "
+                               "infeasible or the re-optimised objective is not positive.")
+                    continue
+                crit[name] = (v, t)
+        k_ = {k: v > t for k, (v, t) in crit.items() if v is not None and t is not None}
+        if "point_plan_feasible" in r:
+            k_["infeasible"] = r["point_plan_feasible"] is not True
+        return k_
+
+    rows = res.get("results")
+    if isinstance(rows, list) and rows and all(isinstance(x, dict) and "share_units_changed" in x for x in rows):
+        per = [fired(x) for x in rows]
+        known = {k: any(p.get(k, False) for p in per) for k in {k for p in per for k in p}}
+    else:
+        known = fired(res)
+    if known and any(known.values()) != res["decision_changes"]:
+        out.append(f"`{rel}`: criteria {', '.join(f'{k}: {f}' for k, f in known.items())} contradict "
+                   f"decision_changes: {res['decision_changes']}.")
+    tb = res.get("triggered_by")
+    if tb is not None and (not isinstance(tb, list) or sorted(map(str, tb)) != sorted(k for k, f in known.items() if f)):
+        out.append(f"`{rel}`: triggered_by {tb!r} is not the criteria its numbers fire "
+                   f"({sorted(k for k, f in known.items() if f)}).")
+    if isinstance(restated, bool) and restated != res["decision_changes"]:
+        out.append(f"{label} restates decision_changes: {restated}, but its "
+                   f"result file `{rel}` says {res['decision_changes']}.")
+    return out
+
+
+def load_test_result(run_dir: str, rel) -> tuple:
+    res, problem = _test_result(run_dir, rel)
+    if problem:
+        return None, [problem]
+    conflicts = _result_conflicts(str(rel), res, "", None)
+    return (None, conflicts) if conflicts else (res, [])
+
+
 def _decision_tests(run_dir, man) -> list[dict]:
     out = []
-    sys.path.insert(0, os.path.join(ROOT, "scripts"))
-    try:
-        import mechanism_manifest as MM
-        loader = getattr(MM, "load_test_result", None)
-    except Exception:  # noqa: BLE001
-        loader = None
     for rel, ent in (man.get("deliverables") or {}).items():
         if ent.get("role") != "decision_test" or not os.path.exists(os.path.join(run_dir, rel)):
             continue
@@ -789,18 +882,9 @@ def _decision_tests(run_dir, man) -> list[dict]:
         if not isinstance(doc, dict) or doc.get("produced_by") != "harness":
             out.append(_f("analysis_contract_decision_test", f"{rel}: produced_by is not harness", rel))
             continue
-        if loader is not None:
-            res, probs = loader(run_dir, rel)
-            if probs:
-                out.append(_f("analysis_contract_decision_test", f"{rel}: {probs}", rel))
-        else:
-            need = ("finding", "varied", "criterion", "decision_changes", "recommendation")
-            miss = [k for k in need if k not in doc]
-            if miss or not isinstance(doc.get("decision_changes"), bool):
-                out.append(_f("analysis_contract_decision_test", f"{rel}: lacks {miss} or a boolean verdict", rel))
-            elif doc["share_units_changed"] > doc["share_threshold"] and not doc["decision_changes"]:
-                # F6 S1-5: regret or dollars moved can also change the plan (toolkit/analysis/moves.py)
-                out.append(_f("analysis_contract_decision_test", f"{rel}: share and threshold contradict the verdict", rel))
+        _res, probs = load_test_result(run_dir, rel)
+        if probs:
+            out.append(_f("analysis_contract_decision_test", f"{rel}: {probs}", rel))
     return out
 
 

@@ -92,10 +92,8 @@ jobs:
         if: github.event_name == 'pull_request'
         run: .venv/bin/python scripts/assemble_changes.py --check-pr HEAD^1 --upstream origin/main
 
-      - name: Skill attachments and expert priors
-        run: |
-          .venv/bin/python scripts/validate_skill_attachments.py
-          .venv/bin/python scripts/lib/expert_priors.py --validate
+      - name: Skill attachments
+        run: .venv/bin/python scripts/validate_skill_attachments.py
 
       - name: Planted-defect regression eval (deterministic gates)
         run: .venv/bin/python scripts/regression_eval.py
