@@ -24,7 +24,6 @@ from agents import v2_gate as VG
 
 STATE_FILE = "run_state.json"
 SIGNOFF_FILE = "decision_spec.signoff.json"
-SIGNOFF_SHEET = "decision_spec.signoff_sheet.md"
 SCOPE_SIGNOFF = "scope_signoff.json"
 AMENDMENT_RECORD = "amendment_record.json"
 DECLARED_FILE = "declared_findings.yaml"
@@ -81,7 +80,7 @@ def _spec_signed_sha(run_dir: str) -> str | None:
         v = r.get("spec_sha256") or nested(r)
         return False if v is None and "spec_sha256" in r else v
 
-    for f, get in ((SIGNOFF_FILE, own), ("decision_brief.signoff.json", nested)):
+    for f, get in ((SIGNOFF_FILE, own),):
         p = os.path.join(run_dir, f)
         if not os.path.lexists(p):
             continue
@@ -128,7 +127,7 @@ def harness_owned() -> tuple:
         AB.ENGINE_CHOICE, "validator_history.jsonl", "gate_r*", "fix_plan_r*", "fix_progress_r*",
         "analysis/*", "models/pipeline*", "evidence/*", "data/*",
         "acquire", "acquire/*", "engine_build", "engine_build/*", "models/ext/engine_*", "models/ext/engine_*/*",
-        "evidence_dossier.yaml", SIGNOFF_SHEET, AMENDMENT_RECORD,
+        "evidence_dossier.yaml", AMENDMENT_RECORD,
     )
 
 
@@ -614,9 +613,9 @@ def render_report(run_dir: str, backend=None, status: str | None = None) -> str:
                   f"{e.get('required_remedy') or 'not stated by the finding.'}"
                   for e in dec2["declared"]]
     try:
-        from toolkit.spec import evidence_draft as EDR
+        from toolkit.spec import evidence_dossier as EDR
         so = {}
-        for f in (SIGNOFF_FILE, "decision_brief.signoff.json"):
+        for f in (SIGNOFF_FILE,):
             try:
                 d_ = json.load(open(os.path.join(run_dir, f)))
             except (OSError, ValueError):

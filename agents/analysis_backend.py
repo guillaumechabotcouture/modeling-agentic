@@ -550,11 +550,10 @@ class _ToolkitApi:
 
     # B signs the spec itself (toolkit/spec/signoff.py); its analysis refuses an unsigned spec.
     def sign(self, run_dir: str, by: str, note: str = "", expect_sha256: str | None = None,
-             expect_derivations_sha256: str | None = None, expect_sheet_sha256: str | None = None) -> dict:
+             expect_derivations_sha256: str | None = None) -> dict:
         from toolkit.spec import signoff
         return signoff.sign(run_dir, by, note, expect_sha256=expect_sha256,
-                            expect_derivations_sha256=expect_derivations_sha256,
-                            expect_sheet_sha256=expect_sheet_sha256)
+                            expect_derivations_sha256=expect_derivations_sha256)
 
     def signed_sha(self, run_dir: str):
         from toolkit.spec import signoff
@@ -931,7 +930,6 @@ def _self_test_benchmark_gate(ok) -> None:
             run3 = os.path.join(d, "run3")
             os.makedirs(run3)
             schema.toy_spec(run3, bench=rp)
-            signoff.write_sheet(run3)
             try:
                 signoff.sign(run3, "owner")
                 ok(False, "G22 the signing path refuses an engine that fails the benchmark precondition")

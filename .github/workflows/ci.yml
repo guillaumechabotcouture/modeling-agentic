@@ -5,7 +5,9 @@ name: ci
 on:
   pull_request:
   push:
-    branches: [main]
+    branches: [main, v2]
+  schedule:
+    - cron: "0 4 * * *"
 
 permissions:
   contents: read
@@ -15,14 +17,41 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  changes:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    outputs:
+      malaria_engine: ${{ steps.filter.outputs.malaria_engine }}
+      tools: ${{ steps.filter.outputs.tools }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - name: Detect changed path prefixes
+        id: filter
+        run: |
+          changed="$(git diff --name-only HEAD^1 HEAD)"
+          if echo "$changed" | grep -qE '^toolkit/engines/(malaria/|contract\.py$)'; then
+            echo "malaria_engine=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "malaria_engine=false" >> "$GITHUB_OUTPUT"
+          fi
+          if echo "$changed" | grep -q '^tools/'; then
+            echo "tools=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "tools=false" >> "$GITHUB_OUTPUT"
+          fi
+
   self-tests:
+    needs: changes
+    if: always() && (needs.changes.result == 'success' || needs.changes.result == 'skipped')
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false     # one failing shard must not hide another's failures
       matrix:
         shard: [1, 2, 3, 4, 5, 6, 7, 8]
-    # A guard against a hung job, not a duration budget: a shard takes about 10 min (the whole
-    # suite took 25-40 min unsharded; 40 cancelled healthy runs on 2026-11-03).
+    # A guard against a hung job, not a duration budget: 8 shards keep each job fast.
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
@@ -32,10 +61,13 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.14"
-          cache: pip
-          cache-dependency-path: |
-            requirements.txt
-            requirements-agent.txt
+
+      - name: Cache .venv
+        id: cache-venv
+        uses: actions/cache@v4
+        with:
+          path: .venv
+          key: venv-${{ runner.os }}-3.14-${{ hashFiles('requirements.txt') }}
 
       # A project venv, as in local use: main.py's self-test checks that
       # agents get the venv interpreter first on PATH.
@@ -43,18 +75,67 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq bubblewrap
-          python -m venv .venv
-          .venv/bin/pip install --upgrade pip
-          .venv/bin/pip install -r requirements.txt
+          if [ "${{ steps.cache-venv.outputs.cache-hit }}" != "true" ]; then
+            python -m venv .venv
+            .venv/bin/pip install --upgrade pip
+            .venv/bin/pip install -r requirements.txt
+          fi
 
-      # One discovery rule, shared with CLAUDE.md: every tracked module under scripts/, toolkit/
-      # and cloud/, main.py and the v2 harness modules named in scripts/self_tests.py. A module in
-      # scope with no --self-test fails this step unless it has an EXEMPT entry with a reason.
+      # One discovery rule, shared with CLAUDE.md: every tracked module under scripts/, toolkit/,
+      # cloud/, tools/, and tests/, main.py and the v2 harness modules named in scripts/self_tests.py.
       # --shard: each self-test runs in exactly one of the 8 shards, balanced by measured CI time.
       - name: Self-tests, shard ${{ matrix.shard }} of 8 (every module with --self-test, found by scripts/self_tests.py)
-        # --per-test-timeout: a hung self-test is killed with its process group, named, and failed;
-        # the others still run (the job timeout above would cancel the whole step with no name).
-        run: .venv/bin/python scripts/self_tests.py --python .venv/bin/python --jobs 2 --per-test-timeout 1800 --shard ${{ matrix.shard }}/8
+        run: |
+          EXCLUDES=""
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            if [ "${{ needs.changes.outputs.malaria_engine }}" != "true" ]; then
+              EXCLUDES="$EXCLUDES --exclude-prefix toolkit/engines/malaria/"
+            fi
+            if [ "${{ needs.changes.outputs.tools }}" != "true" ]; then
+              EXCLUDES="$EXCLUDES --exclude-prefix tools/"
+            fi
+          fi
+          .venv/bin/python scripts/self_tests.py --python .venv/bin/python --jobs 2 --per-test-timeout 1800 $EXCLUDES --shard ${{ matrix.shard }}/8
+        env:
+          OPENBLAS_NUM_THREADS: "2"
+          OMP_NUM_THREADS: "2"
+          MA_REQUIRE_SANDBOX: "1"
+
+  slow-engine-tests:
+    needs: changes
+    if: always() && (needs.changes.result == 'success' || needs.changes.result == 'skipped') && (github.event_name != 'pull_request' || needs.changes.outputs.malaria_engine == 'true')
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+
+      - name: Cache .venv
+        id: cache-venv
+        uses: actions/cache@v4
+        with:
+          path: .venv
+          key: venv-${{ runner.os }}-3.14-${{ hashFiles('requirements.txt') }}
+
+      - name: Install
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq bubblewrap
+          if [ "${{ steps.cache-venv.outputs.cache-hit }}" != "true" ]; then
+            python -m venv .venv
+            .venv/bin/pip install --upgrade pip
+            .venv/bin/pip install -r requirements.txt
+          fi
+
+      - name: Slow engine self-tests (malaria engine + selftest_late)
+        run: |
+          .venv/bin/python toolkit/engines/malaria/engine.py --self-test
+          .venv/bin/python toolkit/engines/malaria/selftest_late.py --self-test
         env:
           OPENBLAS_NUM_THREADS: "2"
           OMP_NUM_THREADS: "2"
@@ -71,10 +152,13 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.14"
-          cache: pip
-          cache-dependency-path: |
-            requirements.txt
-            requirements-agent.txt
+
+      - name: Cache .venv
+        id: cache-venv
+        uses: actions/cache@v4
+        with:
+          path: .venv
+          key: venv-${{ runner.os }}-3.14-${{ hashFiles('requirements.txt') }}
 
       # A project venv, as in local use: main.py's self-test checks that
       # agents get the venv interpreter first on PATH.
@@ -82,9 +166,11 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq bubblewrap
-          python -m venv .venv
-          .venv/bin/pip install --upgrade pip
-          .venv/bin/pip install -r requirements.txt
+          if [ "${{ steps.cache-venv.outputs.cache-hit }}" != "true" ]; then
+            python -m venv .venv
+            .venv/bin/pip install --upgrade pip
+            .venv/bin/pip install -r requirements.txt
+          fi
 
       # HEAD is the PR's merge commit; its first parent is the base branch. --upstream:
       # a PR into a long-lived branch (v2) that merges main brings main's checked rows.

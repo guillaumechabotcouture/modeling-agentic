@@ -11,7 +11,7 @@ tag is refused unless it keeps the name to a-z, 0-9 and -. Neither amount is a h
 budget guard admits a launch over the scope with an alert (owner 2026-11-17), and the scope
 counts Coiled spend only, not model spend.
 
-Limits (so cloud/launch_watch.py watches these configs unattended): main.py is stopped after
+Limits: main.py is stopped after
 RUN_TIMEOUT_HOURS, the protocol's 24 h cut-off, and every cluster of the launch is shut down
 by Coiled after CLUSTER_TIMEOUT, busy or not.
 

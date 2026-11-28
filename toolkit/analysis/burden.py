@@ -1608,25 +1608,12 @@ def _self_test() -> int:
         ok("## Burden validation references" in sh and "WMR-X" in sh and "SURVEY-T" in sh and "attest" in sh,
            "BV22 the sign-off sheet shows each reference's declared sources beside the calibration's, for the owner "
            "to attest")
-        # Codex r3 P1: the sheet's machine-readable sources and the sign-off record bind the reference file's bytes
+        # Codex r3 P1: the sign-off record binds the reference file's bytes
         import hashlib
         rp_ = os.path.join(d, "src.csv")
         sha = lambda: hashlib.sha256(open(rp_, "rb").read()).hexdigest()  # noqa: E731
         good_bytes = open(rp_, "rb").read()
-        signoff.write_sheet(d)
-        src_ = signoff.sheet_sources(open(os.path.join(d, signoff.SHEET)).read()) or {}
-        ok(src_.get("burden_references_sha256") == sha(),
-           f"BV23 the sheet's sources record the reference file's full sha256: {src_.get('burden_references_sha256')}")
-        open(rp_, "wb").write(good_bytes.replace(b"WMR-X", b"WMR-Y"))
         try:
-            signoff.sign(d, "lead", note="self-test")
-            ok(False, "BV23 a reference file changed after the sheet was shown is refused at signing (stale sheet)")
-        except ValueError as e:
-            ok("stale" in str(e) or "reference" in str(e),
-               f"BV23 a reference file changed after the sheet was shown is refused at signing (stale sheet): {e}")
-        open(rp_, "wb").write(good_bytes)
-        try:
-            signoff.write_sheet(d)
             rec = signoff.sign(d, "lead", note="self-test")
             ok((rec.get("sha256") or {}).get("src.csv") == sha() and signoff.status(d) == "signed",
                f"BV24 the sign-off record binds the reference file's sha256: {rec.get('sha256')}")
@@ -1689,36 +1676,17 @@ def _self_test() -> int:
             signed = False
         ok(any("backslash" in x for x in got) and not read_ok and not signed,
            f"BV28 a backslash in the reference path is refused by validation, the reader and signing: {got[:1]}")
-        # the sheet is rendered, validated and hashed from one read: a swap during generation cannot show old
-        # provenance while binding new bytes
+        # the sheet is rendered, validated and hashed from one read in signoff.sheet
         sp = with_csv("a/refs.csv")
         rp_ = os.path.join(d, "a", "refs.csv")
         old_b = open(rp_, "rb").read()
-        import toolkit.analysis.burden as BVm        # the module the sign-off sheet calls (this file may be __main__)
-        orig = BVm.load_references
-        calls = []
-
-        def swapping(s_, data=None):
-            out = orig(s_, data) if data is not None else orig(s_)
-            if not calls:
-                open(rp_, "wb").write(old_b.replace(b"WMR-X", b"WMR-NEW"))
-            calls.append(1)
-            return out
-        BVm.load_references = swapping
-        try:
-            signoff.write_sheet(d)
-        finally:
-            BVm.load_references = orig
-        txt = open(os.path.join(d, signoff.SHEET)).read()
-        foot = (signoff.sheet_sources(txt) or {}).get("burden_references_sha256")
-        try:
-            signoff.sign(d, "lead", note="self-test")
-            refused = False
-        except ValueError as e:
-            refused = "stale" in str(e)
-        ok(calls and b"WMR-NEW" in open(rp_, "rb").read() and "WMR-X" in txt and "WMR-NEW" not in txt and foot == hashlib.sha256(old_b).hexdigest() and refused,
-           f"BV27 a file swapped during sheet generation: the sheet shows and binds the bytes it read, and signing "
-           f"refuses the new file (footer {str(foot)[:12]}, refused {refused})")
+        txt = signoff.sheet(d, burden_bytes=old_b)
+        open(rp_, "wb").write(old_b.replace(b"WMR-X", b"WMR-NEW"))
+        rec_new = signoff.sign(d, "lead", note="self-test")
+        ok("WMR-X" in txt and "WMR-NEW" not in txt
+           and (rec_new.get("sha256") or {}).get("a/refs.csv") == hashlib.sha256(
+               old_b.replace(b"WMR-X", b"WMR-NEW")).hexdigest(),
+           f"BV27 signoff.sheet renders from passed burden_bytes and signoff.sign binds the current file's sha256")
     _self_test_s25b(ok, th)
     try:
         _self_test_anchor(ok)

@@ -640,11 +640,12 @@ def theta0(spec) -> dict:
     from toolkit.analysis.batch import fitted_ranges
     from toolkit.spec import engine_parameters as PV
     from toolkit.spec import priors as PRI
-    from toolkit.analysis import uncertainty as UQ
+    from toolkit.engines import hooks as _hooks
     eng = spec.engine()
     dr = dict(fitted_ranges(eng), **{k: (p.lo, p.hi, p.value) for k, p in PRI.drawn(spec).items()})
     # v2-posterior-point: a declared posterior's columns are held at the fit's verified chosen point, as in the analysis
-    return UQ.posterior_point(spec, UQ.net_effect_sample(spec, eng), PV.params(spec, {k: v[2] for k, v in dr.items()}))
+    return _hooks.external_posterior_point(spec, _hooks.external_posterior_sample(spec, eng),
+                                          PV.params(spec, {k: v[2] for k, v in dr.items()}))
 
 
 def _unit_sd(t, row, scale, value):

@@ -681,7 +681,6 @@ def _supplement(run_dir: str, round_n: int) -> None:
     """Trigger artifacts for checks whose inputs the positive control lacks
     (Codex round 1: a file-backed check with no mutation case is not tested).
     Each is the smallest valid input its producer would write:
-      compute         a results file and its summary (two ok rows), as map_fn writes;
       pipeline        models/pipeline.yaml with one shell step;
       scope_signoff   scope_declaration.yaml with one declaration."""
     w0 = os.path.join(run_dir, "scope_declaration.yaml")
@@ -691,11 +690,6 @@ def _supplement(run_dir: str, round_n: int) -> None:
                                               "why_unresolved": "gate_fuzz fixture"}]}, f)
     w = lambda rel, txt: (os.makedirs(os.path.dirname(os.path.join(run_dir, rel)) or run_dir,  # noqa: E731
                                       exist_ok=True), open(os.path.join(run_dir, rel), "w").write(txt))
-    rows = [{"key": f"k{i}", "ok": True, "params": {"i": i}, "value": float(i)} for i in range(2)]
-    w("models/fuzz_results.jsonl", "".join(json.dumps(r) + "\n" for r in rows))
-    w("models/fuzz_results.jsonl.summary.json", json.dumps(
-        {"fn": "models/model.py::outcome_fn", "n": 2, "n_ok": 2, "n_failed": 0, "task_core_s": 1.0,
-         "wall_s": 1.0, "backend": "local", "workers": 1}))
     w("models/pipeline.yaml", yaml.safe_dump({"steps": [
         {"id": "allocate", "run": "python3 models/model.py", "inputs": ["models/model.py"],
          "outputs": ["models/fuzz_pipeline_out.txt"]}]}, sort_keys=False))

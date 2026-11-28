@@ -171,9 +171,9 @@ class Analysis:
         self.pr = PRI.drawn(spec)             # prior parameters, drawn in every uncertainty draw
         # owner, 14 Nov (f6-posterior-ranges): a declared net-effect posterior's hull is its columns' range in every step
         # that reads one (draws, sensitivity ends, automatic range tests), as in the design box (batch.design_box)
-        from toolkit.analysis import uncertainty as UQ
-        self.ne = UQ.net_effect_sample(spec, self.eng, fitted=self.fr, priors=self.pr)
-        self.fr, self.pr = UQ.with_posterior_ranges(self.ne, self.fr, self.pr)
+        from toolkit.engines import hooks as _hooks
+        self.ne = _hooks.external_posterior_sample(spec, self.eng, fitted=self.fr, priors=self.pr)
+        self.fr, self.pr = _hooks.external_posterior_with_ranges(self.ne, self.fr, self.pr)
         self.dr = dict(self.fr, **{k: (p.lo, p.hi, p.value) for k, p in self.pr.items()})   # every drawn parameter
         from toolkit.spec import engine_parameters as PV
         # the spec's engine parameter values under every parameter set built from here (point, draws, decision tests,
@@ -181,7 +181,7 @@ class Analysis:
         self.theta0 = PV.params(spec, {k: v[2] for k, v in self.dr.items()})
         # v2-posterior-point: a declared posterior's columns sit at the fit's verified chosen point (as set_joint moves the
         # shared parameters to the joint calibration's best point); a differing spec value is refused
-        self.theta0 = UQ.posterior_point(spec, self.ne, self.theta0)
+        self.theta0 = _hooks.external_posterior_point(spec, self.ne, self.theta0)
         self.dfac = discount_factor(spec)
         self.method = spec["calibration"].get("method", "none")
         self.lik = None

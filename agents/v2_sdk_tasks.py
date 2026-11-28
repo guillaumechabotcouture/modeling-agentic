@@ -32,13 +32,12 @@ OUT = "_task_output.json"
 SPEC_MAX_TURNS = 60
 ACQUIRE_MAX_TURNS = 40
 BUILD_ENGINE_MAX_TURNS = 150
-BUILD_REFERENCE_MAX_TURNS = 80
 # Files only the harness writes in a v2 run.
 HARNESS_FILES = ("run_state.json", "findings.jsonl", "impact_ledger.jsonl", "metadata.json", "final_gate.json",
                  "decision_spec.signoff.json", "engine_choice.json", "validator_history.jsonl", "done_when_registry.json",
                  "report.md", "allocation_optimized.csv", "data/inputs_provenance.json", "declared_findings.yaml",
-                 "data/derivations_record.json", "decision_spec.signoff_sheet.md",
-                 "data/input_checks.json", "data/geometry_signoff.json")
+                 "data/derivations_record.json",
+                 "data/input_checks.json")
 # data/derived/ (v2-derived-inputs): the tables the spec reads are written only by the harness's derivation runner.
 HARNESS_PREFIXES = ("analysis/", "models/pipeline", "gate_r", "fix_plan_r", "evidence/", "data/inputs/", "data/derived/",
                     "engine_build/", "acquire/")
@@ -235,29 +234,6 @@ Rules:
   access; no `scipy.integrate`.
 - Never attempt to read `engine_build/.hidden/`, `engine_build/reference/`, `analysis/`, or any other run.
 When `mcp__engine__try(checks="all")` passes cleanly, write {out} = {{"ok": true, "notes": "<summary>"}} and stop.""",
-    "build_reference": COMMON + """
-
-Task: build an independent reference oracle for agent-built engine `{engine_id}` into
-`engine_build/reference/reference.py` from the signed request in {out_in} and `engine_build/request.json`
-(plus `evidence_dossier.yaml` if present). You work ONLY from the request and dossier — you cannot read
-the candidate working copy (`models/ext/engine_*`) or its snapshots, and you have no shell or MCP tools.
-You may read `{repo}/toolkit/engines/contract.py` (use that full repo path, not a relative path).
-Write ONLY `engine_build/reference/reference.py`:
-- Import `from toolkit.engines.contract import EngineCard, ParamSpec, Outcomes` directly at top level
-  (the sandbox always provides `toolkit.engines.contract`; NEVER wrap imports in module-level `try/except`).
-- Define `class Model` implementing `describe(self) -> EngineCard`, `parameters(self) -> list[ParamSpec]`, and
-  `evaluate(self, params, unit, package, horizon) -> Outcomes` matching the exact signed request schema
-  (`EngineCard` requires `name, version, mechanisms, components, unit_attributes, outputs, age_groups, valid_ranges`;
-  `ParamSpec(name=..., value=..., kind=..., units=..., lo=..., hi=..., source=...)`; `unit.attributes`,
-  `package.components`, `horizon.window = (t0, t1)` where duration is `t1 - t0` whether calendar or relative years).
-- You may use plain loops, `numpy`, `math`, `scipy.special`, `scipy.stats`, and `scipy.integrate`
-  (this reference is a test oracle for admission check A11, never exposed to the analysis).
-- Obey static checks S1-S3 strictly: module top level may contain ONLY imports, simple constant assignments,
-  `def`, and `class` (NO module-level `try/except`, `if`, `for`, or bare expression calls — put helper calls
-  inside functions/methods); no dynamic `getattr(obj, var_name)`; no file/process/network/interpreter access.
-- Follow every signed mechanism, parameter, unit attribute, compartment rule, reduction, and output
-  independently from first principles.
-When `engine_build/reference/reference.py` is complete, write {out} = {{"ok": true, "notes": "<summary>"}} and stop.""",
     "critique_engine": COMMON + """
 
 Task: engine review (`critique-engine`), round {round}. Inspect the admitted built engine's snapshot files
@@ -336,7 +312,6 @@ OWNS = {"acquire": (),
         "draft_spec": ("decision_spec.yaml", "analysis_settings.yaml", "data/derive/", "data/derivations.yaml",
                        "data/README.md"), "pick_engine": (), "plan_fixes": (),
         "critique": (), "critique_engine": ("critique_engine.yaml",),
-        "build_reference": ("engine_build/reference/reference.py",),
         "fix": FIX_EDITABLE, "write": ("manuscript.md",),
         # v2 autonomy 1B-ii: the dossier the spec names (draft_evidence(rel=...)); this is the default name
         "draft_evidence": ("evidence_dossier.yaml",)}
@@ -551,16 +526,9 @@ class PathPolicy:
             or (target and any(c in target for c in "*?[") and ".." in target.replace("\\", "/").split("/"))
         ):
             return f"{tool} pattern with '..' path traversal is refused"
-        ref_self = False
-        if kind == "build_reference":
-            cand_p = os.path.realpath(os.path.join(run_dir, os.path.expanduser(target))) if target else root
-            ref_file = os.path.realpath(os.path.join(root, "engine_build", "reference", "reference.py"))
-            ref_self = (tool == "Read" and bool(target) and cand_p == ref_file)
-        if not ref_self and (
-            (target and cls.engine_secret_path(target)) or any(f and cls.engine_secret_path(f) for f in filters)
-        ):
+        if (target and cls.engine_secret_path(target)) or any(f and cls.engine_secret_path(f) for f in filters):
             return "engine_build/.hidden, hidden_reveal.json, and reference/ are not readable by any task"
-        if not ref_self and cls.engine_secret_path(base):
+        if cls.engine_secret_path(base):
             return "engine_build/.hidden, hidden_reveal.json, and reference/ are not readable by any task"
         if cls.outside_runs_tree(base, root, tool):
             return f"{tool} outside the current run directory into another run ({base}) is refused"
@@ -570,26 +538,6 @@ class PathPolicy:
                 for sub in (".hidden", "reference", "hidden_reveal.json"):
                     if os.path.lexists(os.path.join(eb, sub)) and not cls.within(base, os.path.join(eb, "try")):
                         return f"{tool} from {base} would reach engine_build/{sub}"
-        if kind == "build_reference":
-            repo = os.path.realpath(_REPO)
-            if cls.within(base, root):
-                rel = os.path.relpath(base, root).replace(os.sep, "/")
-                doss_rel = cls.declared_dossier_rel(run_dir)
-                allowed_ref = (
-                    rel in ("decision_spec.yaml", "evidence_dossier.yaml", doss_rel, "_task_input.json",
-                            "engine_build/request.json", "engine_build/reference/reference.py")
-                    or rel.startswith(("data/derived/", "data/inputs/acquired/_views/"))
-                )
-                if not allowed_ref:
-                    return (f"build_reference may not read {rel} (works only from request, spec, dossier, schema views, "
-                            "and its own reference.py; candidate code and snapshots are withheld)")
-            elif cls.within(base, repo):
-                rel = os.path.relpath(base, repo).replace(os.sep, "/")
-                if rel not in ("toolkit/engines/contract.py", "toolkit/engines/built/oracles.py"):
-                    return (f"build_reference may read only toolkit/engines/contract.py and built/oracles.py in the repo, "
-                            f"not {rel}")
-            else:
-                return f"build_reference may not read {base} outside the run directory and contract/oracles"
         if kind == "build_engine":
             repo = os.path.realpath(_REPO)
             if cls.within(base, root):
@@ -716,10 +664,7 @@ class PathPolicy:
             return "outside the run directory"
         rel = os.path.relpath(p, root).replace(os.sep, "/")
         low = rel.lower()
-        ref_write_ok = (kind == "build_reference" and rel == "engine_build/reference/reference.py")
-        if not ref_write_ok and (
-            low in {h.lower() for h in HARNESS_FILES} or low.startswith(tuple(h.lower() for h in HARNESS_PREFIXES))
-        ):
+        if (low in {h.lower() for h in HARNESS_FILES} or low.startswith(tuple(h.lower() for h in HARNESS_PREFIXES))):
             return f"{rel} is written by the harness"
         if low.startswith("models/ext/engine_") and kind != "build_engine":
             return f"{rel} is an agent-built engine working copy: only build_engine may write models/ext/engine_*"
@@ -1061,14 +1006,11 @@ class SdkTasks:
 
     def turns_for(self, kind: str) -> int:
         """The turn cap of one session: the caller's cap when it gave one; else BUILD_ENGINE_MAX_TURNS for
-        build_engine, BUILD_REFERENCE_MAX_TURNS for build_reference, SPEC_MAX_TURNS for draft_spec,
-        ACQUIRE_MAX_TURNS for acquire, and the default of 30 for the others."""
+        build_engine, SPEC_MAX_TURNS for draft_spec, ACQUIRE_MAX_TURNS for acquire, and the default of 30."""
         if self.turns_explicit:
             return self.turns
         if kind == "build_engine":
             return BUILD_ENGINE_MAX_TURNS
-        if kind == "build_reference":
-            return BUILD_REFERENCE_MAX_TURNS
         if kind == "draft_spec":
             return SPEC_MAX_TURNS
         if kind == "acquire":
@@ -1303,25 +1245,6 @@ class SdkTasks:
             enforcement.MODEL_DEEP,
             mcp_servers={"engine": srv},
             extra_tools=list(ENGINE_MCP_TOOLS),
-            force_no_cloud=True,
-            stage="ENGINE_BUILD",
-        )
-
-    def build_reference(self, run_dir, packet, engine_id):
-        """Bounded `build_reference` task (§4.4): writes ONLY `engine_build/reference/reference.py`
-        from the signed request and dossier; cannot read candidate code or snapshots; no shell/MCP/cloud."""
-        inp = self._input(packet)
-        msg = f"Write the independent A11 reference oracle for `{engine_id}` into `engine_build/reference/reference.py` from `{inp}`."
-        if isinstance(packet, dict) and packet.get("feedback"):
-            msg += "\n\nFeedback from the previous attempt (fix every problem):\n- " + "\n- ".join(
-                map(str, packet["feedback"][:20])
-            )
-        return self._session(
-            "build_reference",
-            PROMPTS["build_reference"].format(engine_id=engine_id, repo=_REPO, out_in=inp, out=OUT),
-            msg,
-            OWNS["build_reference"],
-            enforcement.MODEL_DEEP,
             force_no_cloud=True,
             stage="ENGINE_BUILD",
         )
@@ -1682,22 +1605,12 @@ def _self_test() -> int:
            and mcp_check.get("mcp__engine__run") is False and mcp_check.get("Bash") is True
            and other_mcp == {"mcp__engine__try": True, "mcp__engine__run": True},
            f"BE20b mcp__engine__* allowed only for build_engine (150 turns, no cloud); refused for other tasks ({mcp_check}, {other_mcp})")
-        # BE20c (§4.4): bidirectional build_engine <-> build_reference read/write isolation + custom dossier path
-        with open(os.path.join(d, "decision_spec.yaml"), "w", encoding="utf-8") as _sf:
-            _sf.write("schema_version: 1\nevidence:\n  dossier: supporting_evidence.yaml\n")
-        ref_iso = {
-            "ref_writes_self": PathPolicy.write_allowed("engine_build/reference/reference.py", d, OWNS["build_reference"], kind="build_reference") is None,
-            "ref_write_cand_denied": PathPolicy.write_allowed("models/ext/engine_mod1/engine.py", d, OWNS["build_reference"], kind="build_reference") is not None,
+        # BE20c: build_engine cannot write or read engine_build/reference/
+        eng_iso = {
             "eng_write_ref_denied": PathPolicy.write_allowed("engine_build/reference/reference.py", d, ("models/ext/engine_mod1/",), kind="build_engine") is not None,
-            "ref_read_cand_denied": PathPolicy.engine_read_denied("Read", {"file_path": "models/ext/engine_mod1/engine.py"}, d, kind="build_reference") is not None,
-            "ref_read_snap_denied": PathPolicy.engine_read_denied("Read", {"file_path": "engine_build/snapshots/abc/engine.py"}, d, kind="build_reference") is not None,
-            "ref_read_hidden_denied": PathPolicy.engine_read_denied("Read", {"file_path": "engine_build/.hidden/seed.json"}, d, kind="build_reference") is not None,
-            "ref_read_self_ok": PathPolicy.engine_read_denied("Read", {"file_path": "engine_build/reference/reference.py"}, d, kind="build_reference") is None,
-            "ref_read_req_ok": PathPolicy.engine_read_denied("Read", {"file_path": "engine_build/request.json"}, d, kind="build_reference") is None,
-            "ref_read_custom_dossier_ok": PathPolicy.engine_read_denied("Read", {"file_path": "supporting_evidence.yaml"}, d, kind="build_reference") is None,
             "eng_read_ref_denied": PathPolicy.engine_read_denied("Read", {"file_path": "engine_build/reference/reference.py"}, d, kind="build_engine", engine_id="mod1") is not None,
         }
-        ok(all(ref_iso.values()), f"BE20c build_engine and build_reference are strictly isolated ({ref_iso})")
+        ok(all(eng_iso.values()), f"BE20c build_engine read/write isolation from engine_build/reference ({eng_iso})")
         # DI1 (docs/design/v2-derived-inputs.md §3.1): the planner writes code, never tables. A Write to the derived
         # tables (or anywhere else in data/) is refused; the derivation scripts, their declaration and the note are
         # the task's own.
@@ -1746,7 +1659,6 @@ def _self_test() -> int:
             "draft_spec": lambda: t.draft_spec("Q?", d, ["e1"]),
             "pick_engine": lambda: t.pick_engine({}, {"eligible": ["e"]}),
             "build_engine": lambda: t.build_engine(d, {"request": {"id": "e1"}}, "e1"),
-            "build_reference": lambda: t.build_reference(d, {"request": {"id": "e1"}}, "e1"),
             "critique_engine": lambda: t.critique_engine(d, 1, ["err1"]),
             "critique": lambda: t.critique(d, "critique-domain", 1, ["fb"]),
             "plan_fixes": lambda: t.plan_fixes({"round": 1, "findings": [{"id": "R-001"}]}),

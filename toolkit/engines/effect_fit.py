@@ -953,8 +953,18 @@ def _self_test() -> int:
             mod = IG.module("engine", f"toolkit.engines.{eng_mod_name}.engine")
             eng_cls = next(getattr(mod, a) for a in dir(mod) if a.endswith("Engine") and a != "Engine")
             hb_ec = hard_bounds(eng_cls(), [pname])
-            ok(pname in hb_ec and hb_ec[pname][0] >= box[0] and hb_ec[pname][1] <= box[1],
-               f"EF_EDGE_BOUNDS: {pname} hard_bounds {hb_ec.get(pname)} respects edge_checks box {box}")
+        ok(
+            pname in hb_ec and hb_ec[pname][0] >= box[0] and hb_ec[pname][1] <= box[1],
+            f"EF_EDGE_BOUNDS: {pname} hard_bounds {hb_ec.get(pname)} respects edge_checks box {box}",
+        )
+    try:
+        _self_test_exception(ok)
+    except Exception as e:  # noqa: BLE001 -- a missing feature is a failing case
+        ok(False, f"UE1 the posterior exception ({type(e).__name__}: {e})")
+    try:
+        _self_test_posterior(ok)
+    except Exception as e:  # noqa: BLE001 -- a missing feature is a failing case
+        ok(False, f"NP1-NP9 the external posterior in the draws ({type(e).__name__}: {e})")
 
     print("OK: all self-test cases passed." if not fails else f"FAILED: {len(fails)} case(s)")
     return 1 if fails else 0
@@ -1401,6 +1411,326 @@ def _fixture_placeholder(path: str, eng, rows: list, box: dict, gate_ok: bool = 
     }, eng)
     from toolkit.analysis.artifacts import _safe_io
     _safe_io().publish(path, yaml.safe_dump(doc, sort_keys=False).encode(), os.path.dirname(os.path.abspath(path)))
+
+
+POINT_TOL = 1e-6           # v2-posterior-point: a value within the fit file's 6-decimal rounding of the chosen point
+EXCEPTION_KEYS = ("failed_points", "rule", "evidence", "reason", "draws")
+
+
+def posterior_exception(spec) -> dict | None:
+    """uncertainty.net_effect_posterior.exception: the owner-signed acceptance of an external posterior sample whose
+    verification recorded failures. {failed_points: [{point: {parameter: value}, targets: [id, ...]}], rule, evidence,
+    reason, draws: keep | exclude}. None without it; a malformed one is refused (ValueError)."""
+    e = ((spec.raw.get("uncertainty") or {}).get("net_effect_posterior") or {}).get("exception")
+    if e is None:
+        return None
+    pts = e.get("failed_points") if isinstance(e, dict) else None
+    good = (isinstance(e, dict) and set(e) == set(EXCEPTION_KEYS) and isinstance(pts, list) and pts
+            and all(isinstance(e[k], str) and e[k].strip() for k in ("rule", "evidence", "reason"))
+            and e["draws"] in ("keep", "exclude")
+            and all(isinstance(x, dict) and set(x) == {"point", "targets"} and isinstance(x["point"], dict)
+                    and x["point"] and all(isinstance(v, (int, float)) and not isinstance(v, bool)
+                                           for v in x["point"].values())
+                    and isinstance(x["targets"], list) and x["targets"]
+                    and all(isinstance(t, str) and t for t in x["targets"]) for x in pts))
+    if not good:
+        raise ValueError(f"uncertainty.net_effect_posterior.exception: {{{', '.join(EXCEPTION_KEYS)}}}; failed_points "
+                         f"a non-empty list of {{point: {{parameter: number}}, targets: [benchmark id, ...]}}, draws "
+                         f"keep or exclude, the rest non-empty text (got {e!r})")
+    return e
+
+
+def exception_sheet_lines(raw: dict) -> list:
+    """The sign-off sheet's HIGH line for a declared net-effect posterior exception (owner-signed departure)."""
+    post = ((raw.get("uncertainty") or {}).get("net_effect_posterior") or {})
+    e = post.get("exception") if isinstance(post, dict) else None
+    if not isinstance(e, dict):
+        return []
+    pts = [f"{', '.join(map(str, x.get('targets') or []))} at {x.get('point')}" for x in e.get("failed_points") or []
+           if isinstance(x, dict)]
+    return ["## Net-effect posterior exception (owner-signed departure)",
+            f"- **HIGH**: the net-effect posterior `{post.get('path')}` (sha256 {str(post.get('sha256'))[:12]}…) is "
+            f"accepted although its verification failed ({e.get('rule')}): {'; '.join(pts)}. Evidence: "
+            f"{e.get('evidence')}. Reason: {e.get('reason')}. The failed point(s) are "
+            f"{'kept in' if e.get('draws') == 'keep' else 'excluded from'} the draws.", ""]
+
+
+def posterior_input(spec) -> dict | None:
+    """{path, sha256, data, margin, exception} of the spec's uncertainty.net_effect_posterior {path, sha256}, read once
+    per spec and refused unless its sha256 matches the signed one. None without the field; empty is refused."""
+    u = spec.raw.get("uncertainty") or {}
+    if "net_effect_posterior" not in u:
+        return None
+    p = u["net_effect_posterior"]
+    if not isinstance(p, dict) or not isinstance(p.get("path"), str) or not p["path"].strip() \
+            or not isinstance(p.get("sha256"), str) or set(p) - {"path", "sha256", "margin", "exception"}:
+        raise ValueError("uncertainty.net_effect_posterior: {path: effect_fit.py's output file, sha256: its signed "
+                         "digest, margin (optional): a share of the sample's hull width in [0, 1], exception "
+                         "(optional): an owner-signed acceptance of recorded verification failures}")
+    exc = posterior_exception(spec)
+    m = p.get("margin", 0.0)
+    if isinstance(m, bool) or not isinstance(m, (int, float)) or not np.isfinite(m) or not 0 <= m <= 1:
+        raise ValueError(f"uncertainty.net_effect_posterior.margin {m!r}: a share of the sample's hull width in [0, 1]")
+    path, dig = spec.resolve(p["path"]), p["sha256"].lower()
+    got = getattr(spec, "_net_effect_posterior", None)
+    if got is None or (got["path"], got["sha256"]) != (path, dig):
+        got = {"path": path, "sha256": dig, "data": read_signed(path, dig)}
+        spec._net_effect_posterior = got
+    return dict(got, margin=float(m), exception=exc)
+
+
+def chosen_point(post: dict, names) -> dict:
+    """{column: value} of the fit's verified chosen point (joint_region.verified.chosen.point in the signed bytes)."""
+    doc = yaml.safe_load(post["data"])
+    pt = ((((doc.get("joint_region") or {}).get("verified") or {}).get("chosen") or {}).get("point"))
+    if not isinstance(pt, dict) or sorted(pt) != sorted(names) or any(
+            isinstance(pt[k], bool) or not isinstance(pt[k], (int, float)) or not np.isfinite(pt[k]) for k in names):
+        raise PosteriorRefused(f"net-effect posterior {post['path']}: no verified chosen point whose coordinates are "
+                               f"the sample's columns {list(names)}, each a finite number "
+                               f"(joint_region.verified.chosen.point: {pt!r})")
+    fp = doc.get("parameters") if isinstance(doc.get("parameters"), dict) else {}
+    off = sorted(set(fp) - set(names)) + [
+        k for k in names if not isinstance(fp.get(k), dict) or isinstance(fp[k].get("value"), bool)
+        or not isinstance(fp[k].get("value"), (int, float)) or not float(fp[k]["value"]) == float(pt[k])]
+    if off:
+        raise PosteriorRefused(f"net-effect posterior {post['path']}: the chosen point of {off} is not the fit's "
+                               f"recorded parameter values (parameters: {[fp.get(k) for k in off]}; chosen point: "
+                               f"{[pt.get(k) for k in off]})")
+    return {k: float(pt[k]) for k in names}
+
+
+def net_effect_sample(spec, eng, fitted: dict | None = None, priors: dict | None = None, held=()) -> dict | None:
+    """Load and verify the spec's external posterior (load_posterior, posterior_ranges, chosen_point), cached per spec."""
+    post = posterior_input(spec)
+    if post is None:
+        return None
+    if fitted is None:
+        from toolkit.analysis.batch import fitted_ranges
+        fitted = fitted_ranges(eng)
+    if priors is None:
+        from toolkit.spec import priors as PRI
+        priors = PRI.drawn(spec)
+    src = {s.get("kind") for s in (spec["uncertainty"].get("sources") or []) if isinstance(s, dict)}
+    cal = spec["calibration"]
+    held = set(held) | set(cal.get("parameters") or []) | set((cal.get("joint") or {}).get("shared") or [])
+    varied = {k: (p.lo, p.hi) for k, p in priors.items()}
+    if "engine_parameters" in src:
+        varied.update({k: tuple(v[:2]) for k, v in fitted.items()})
+    varied = {k: v for k, v in varied.items() if k not in held}
+    from toolkit.engines.identity import engine_identity
+    key = (post["sha256"], post["margin"], tuple(sorted(varied)), tuple(sorted(engine_identity(eng).items())),
+           json.dumps(post.get("exception"), sort_keys=True))
+    cache = getattr(spec, "_net_effect_sample", None)
+    if cache is not None and cache[0] == key:
+        return cache[1]
+    ne = load_posterior(post["path"], eng, varied, post["sha256"], post["data"], exception=post.get("exception"))
+    ne["margin"] = post["margin"]
+    ne["ranges"] = posterior_ranges(ne, post["margin"], hard_bounds(eng, ne["names"]))
+    ne["point"] = chosen_point(post, ne["names"])
+    spec._net_effect_sample = (key, ne)
+    return ne
+
+
+def posterior_point(spec, ne: dict | None, theta: dict) -> dict:
+    """`theta` with every posterior column at the fit's chosen point; refuses conflicting spec values or incompatible
+    likelihood/posterior calibrations."""
+    if ne is None:
+        return theta
+    m = (spec.raw.get("calibration") or {}).get("method")
+    if m in ("likelihood", "posterior"):
+        raise ValueError(f"uncertainty.net_effect_posterior with calibration.method {m}: that calibration evaluates the "
+                         "engine at its default values, not at the posterior's chosen point; not supported")
+    from toolkit.spec import engine_parameters as PV
+    sv = PV.values(spec)
+    bad = {k: (sv[k], v) for k, v in ne["point"].items() if k in sv
+           and abs(sv[k] - v) > POINT_TOL + 4 * float(np.spacing(max(abs(sv[k]), abs(v))))}
+    if bad:
+        raise ValueError("engine_parameters: " + "; ".join(
+            f"{k} is set to {a}, but the net-effect posterior's verified chosen point is {b}; the chosen point is the "
+            f"point value of a posterior column: set the spec value to it or remove the value" for k, (a, b) in
+            sorted(bad.items())))
+    return dict(theta, **ne["point"])
+
+
+def point_source(ne: dict | None) -> dict:
+    """The manifest's record of where each posterior column's point value came from ({} without a posterior)."""
+    return {k: "posterior_chosen_point" for k in (ne or {}).get("point", {})}
+
+
+def with_posterior_ranges(ne: dict | None, fitted: dict, priors: dict | None = None) -> tuple:
+    """(fitted, priors) copies with each posterior column's range replaced by net_effect_sample's `ranges`."""
+    if ne is None:
+        return fitted, priors
+    import dataclasses
+    rg = ne["ranges"]
+    fr = {k: ((*rg[k], *v[2:]) if k in rg else v) for k, v in fitted.items()}
+    pr = None if priors is None else {k: (dataclasses.replace(p, lo=rg[k][0], hi=rg[k][1], dist="uniform")
+                                          if k in rg else p) for k, p in priors.items()}
+    return fr, pr
+
+
+def posterior_range_record(ne: dict) -> dict:
+    """What the manifest and the uncertainty report record of the ranges the sample set."""
+    return dict({"sha256": ne["sha256"], "range_source": "posterior_hull", "margin": ne["margin"],
+                 "ranges": {k: [float(lo), float(hi)] for k, (lo, hi) in ne["ranges"].items()}},
+                **({"exception": ne["exception"]} if ne.get("exception") else {}))
+
+
+def _self_test_exception(ok):
+    """UE1 (owner, 2026-11-20): uncertainty.net_effect_posterior.exception is validated with the posterior field, is
+    passed to the loader, recorded with the posterior's ranges (manifest and report) and shown as a HIGH owner-signed
+    departure on the sign-off sheet."""
+    class Sp:
+        def __init__(s, raw):
+            s.raw = raw
+
+        def resolve(s, p):
+            return p
+    exc = {"failed_points": [{"point": {"a": 0.1}, "targets": ["T1"]}], "rule": "the 14 Nov acceptance rule",
+           "evidence": "13 of 14 verified points pass", "reason": "a narrow miss", "draws": "keep"}
+    got = {}
+    for label, e in (("good", exc), ("no reason", {k: v for k, v in exc.items() if k != "reason"}),
+                     ("bad draws", dict(exc, draws="maybe")), ("no points", dict(exc, failed_points=[])),
+                     ("a target not a string", dict(exc, failed_points=[{"point": {"a": 0.1}, "targets": [3]}]))):
+        try:
+            got[label] = posterior_exception(Sp({"uncertainty": {"net_effect_posterior": {
+                "path": "p.yaml", "sha256": "0" * 64, "exception": e}}}))
+        except ValueError as ex:
+            got[label] = str(ex)
+    lines = exception_sheet_lines({"uncertainty": {"net_effect_posterior": {"path": "p.yaml", "sha256": "ab" * 32,
+                                                                             "exception": exc}}})
+    rec = posterior_range_record({"sha256": "s", "margin": 0.0, "ranges": {"a": (0.0, 1.0)}, "exception": exc})
+    ok(got["good"] == exc and all(isinstance(got[k], str) for k in got if k != "good")
+       and any("**HIGH**" in x and "T1" in x and "a narrow miss" in x for x in lines)
+       and exception_sheet_lines({"uncertainty": {}}) == [] and rec.get("exception") == exc,
+       f"UE1 the posterior exception: validated ({sorted(k for k in got if isinstance(got[k], str))} refused), on the "
+       f"sheet as HIGH, in the range record ({lines[:2]})")
+
+
+def _self_test_posterior(ok):
+    """NP1-NP9: uncertainty.net_effect_posterior draws whole rows of the net-effect fit's verified joint sample."""
+    import tempfile
+    import types
+    from toolkit.analysis.uncertainty import Drawer
+    from toolkit.engines.malaria.engine import MalariaEngine
+    from toolkit.spec import priors as PRI
+    e = MalariaEngine()
+    card = PRI.load_card(e)["priors"]
+
+    class Sp:
+        def __init__(s, raw, base):
+            s.raw, s.base = raw, base
+
+        def __getitem__(s, k):
+            return s.raw[k]
+
+        def resolve(s, p):
+            return p if os.path.isabs(p) else os.path.join(s.base, p)
+
+    def signed(d, name, digest=None):
+        p = os.path.join(d, name)
+        return {"path": name, "sha256": digest or (hashlib.sha256(open(p, "rb").read()).hexdigest()
+                                                   if os.path.exists(p) else "0" * 64)}
+
+    def fake(d, post=None, sources=("engine_parameters",), cal=()):
+        post = signed(d, post) if isinstance(post, str) else post
+        u = dict({"sources": [{"kind": k} for k in sources]}, **({"net_effect_posterior": post} if post else {}))
+        A = types.SimpleNamespace(spec=Sp({"uncertainty": u, "calibration": {"method": "none", "parameters": list(cal)}},
+                                          d), eng=e, region=None, method="none", joint=None, lik=None, model=None,
+                                  ids=["u1"], anchor=None, fr={"cfp_kill": (0.3, 0.7, 0.485)},
+                                  pr={k: card[k] for k in ("net_kill_shift", "use_rate")},
+                                  theta0={"net_kill_shift": 0.0, "use_rate": 0.871, "cfp_kill": 0.485})
+        A.calibrate = lambda theta, shifts=None, ids=None: {"u1": (1.0, False)}
+        return A
+
+    x = [float(v) for v in np.random.default_rng(3).uniform(0, 1, 30)]
+    rows = [{"net_kill_shift": round(-0.5 + v, 6), "cfp_kill": round(0.35 + 0.3 * v, 6)} for v in x]
+    box = {"net_kill_shift": [-0.618, 0.66], "cfp_kill": [0.0, 0.8]}
+    with tempfile.TemporaryDirectory() as d:
+        _fixture_placeholder(os.path.join(d, "net_effect_fit.yaml"), e, rows, box)
+        th0 = {"net_kill_shift": 0.11657722739764786, "use_rate": 0.87768660115964, "cfp_kill": 0.6480996815880338}
+        D0, D1 = Drawer(fake(d), 9), Drawer(fake(d, "net_effect_fit.yaml"), 9)
+        t0, t1 = [D0.draw()[0] for _ in range(60)], [D1.draw()[0] for _ in range(60)]
+        pairs = {(r["net_kill_shift"], r["cfp_kill"]) for r in rows}
+        c1 = np.corrcoef([t["net_kill_shift"] for t in t1], [t["cfp_kill"] for t in t1])[0, 1]
+        c0 = np.corrcoef([t["net_kill_shift"] for t in t0], [t["cfp_kill"] for t in t0])[0, 1]
+        ok(D0.ne is None and th0 == t0[0] and all((t["net_kill_shift"], t["cfp_kill"]) in pairs for t in t1)
+           and [t["use_rate"] for t in t0] == [t["use_rate"] for t in t1] and c1 > 0.999 and abs(c0) < 0.5,
+           f"NP1 with uncertainty.net_effect_posterior each draw takes one whole row of the fit's joint sample (corr "
+           f"{c1:.3f}; independent draws {c0:.3f}); a parameter without a sample (use_rate) is drawn from its prior "
+           "exactly as without it, and without the field the draws are unchanged")
+        pv = D1.posterior_provenance()
+        sig = signed(d, "net_effect_fit.yaml")
+        ok(pv["sha256"] == sig["sha256"] and len(pv["rows"]) == 60 and pv["names"] == list(box)
+           and posterior_input(fake(d).spec) is None,
+           "NP2 the uncertainty report records the signed sha256, the names and the row of every draw")
+        A5 = fake(d, sig)
+        i1 = posterior_input(A5.spec)
+        _fixture_placeholder(os.path.join(d, "net_effect_fit.yaml"), e, rows[1:], box)
+        D5 = Drawer(A5, 9)
+        try:
+            posterior_input(fake(d, sig).spec)
+            fresh = "accepted"
+        except PosteriorRefused as ex:
+            fresh = str(ex)
+        ok(i1["sha256"] == sig["sha256"] == D5.posterior_provenance()["sha256"] and len(D5.ne["rows"]) == 30
+           and "signed sha256" in fresh,
+           f"NP3 the sample is read once: the drawer uses the bytes whose signed sha256 the manifest records (30 rows, "
+           f"not the replacement's {len(rows) - 1}); a file whose bytes differ from the signed sha256 is refused "
+           f"({fresh[:90]})")
+        from toolkit.engines import hooks as _hooks, effect_fit as _ef
+        refused_l = []
+        for label, A, why in (("a missing file", fake(d, "absent.yaml"), "unreadable"),
+                              ("a calibrated parameter", fake(d, "net_effect_fit.yaml", cal=("cfp_kill",)),
+                               "not varied"),
+                              ("a fitted parameter without the engine_parameters source",
+                               fake(d, "net_effect_fit.yaml", sources=("costs",)), "not varied")):
+            try:
+                Drawer(A, 9)
+            except (_ef.PosteriorRefused, PosteriorRefused) as ex:
+                refused_l += [label] if why in str(ex) else []
+        ok(len(refused_l) == 3, f"NP4 the draws refuse the sample, each for its reason, for {refused_l} (fail closed)")
+        wide = [{"net_kill_shift": round(-0.5 + v, 6), "cfp_kill": round(0.2 + 0.6 * v, 6)} for v in x]
+        _fixture_placeholder(os.path.join(d, "wide.yaml"), e, wide, box)
+        hull = {k: (min(r[k] for r in wide), max(r[k] for r in wide)) for k in box}
+        D6 = Drawer(fake(d, "wide.yaml"), 9)
+        t6 = [D6.draw()[0] for _ in range(40)]
+        pv6 = D6.posterior_provenance()
+        ok(D6.ranges["cfp_kill"] == hull["cfp_kill"] and D6.ranges["net_kill_shift"] == hull["net_kill_shift"]
+           and D6.ranges["use_rate"] == (card["use_rate"].lo, card["use_rate"].hi)
+           and all(hull[k][0] <= t[k] <= hull[k][1] for t in t6 for k in hull)
+           and pv6["ranges"] == {k: list(v) for k, v in hull.items()} and pv6["range_source"] == "posterior_hull"
+           and pv6["sha256"] == signed(d, "wide.yaml")["sha256"] and pv6["margin"] == 0.0,
+           f"NP5 a sample whose hull exceeds the fitted range loads; its hull sets its columns' draw ranges "
+           f"({ {k: D6.ranges[k] for k in hull} }), recorded with its sha256 in the uncertainty report")
+        D7 = Drawer(fake(d, dict(signed(d, "wide.yaml"), margin=0.1)), 9)
+        w7 = {k: hull[k][1] - hull[k][0] for k in hull}
+        ok(all(abs(D7.ranges[k][0] - max(hull[k][0] - 0.1 * w7[k], card[k].lo if k in card else 0.0)) < 1e-12
+               for k in hull) and D7.posterior_provenance()["margin"] == 0.1,
+           f"NP6 a stated margin widens the hull (within hard bounds): { {k: D7.ranges[k] for k in hull} }")
+        ok(D0.ranges == {"cfp_kill": (0.3, 0.7), "net_kill_shift": (card["net_kill_shift"].lo, card["net_kill_shift"].hi),
+                         "use_rate": (card["use_rate"].lo, card["use_rate"].hi)},
+           f"NP7 without the field every draw range is the fitted or prior range, as before: {D0.ranges}")
+        A8 = fake(d, "wide.yaml")
+        A8.pr = dict(A8.pr, net_kill_shift=PRI.Prior("net_kill_shift", 0.1, 0.01, 0.66, "loguniform", "s"))
+        try:
+            A8.fr, A8.pr = _hooks.external_posterior_with_ranges(
+                _hooks.external_posterior_sample(A8.spec, e, fitted=A8.fr, priors=A8.pr), A8.fr, A8.pr)
+            D8 = Drawer(A8, 9)
+            t8 = [D8.draw()[0]["net_kill_shift"] for _ in range(5)]
+            why8 = "" if all(v in {r["net_kill_shift"] for r in wide} for v in t8) else f"not sample values {t8}"
+        except Exception as ex:  # noqa: BLE001
+            why8 = f"{type(ex).__name__}: {ex}"
+        ok(not why8, f"NP8 a log-uniform prior whose posterior hull crosses zero is drawn without error ({why8 or 'ok'})")
+        from toolkit.engines.contract import ToyEngine
+        A9 = fake(d, "wide.yaml")
+        _hooks.external_posterior_sample(A9.spec, e, fitted=A9.fr, priors=A9.pr)
+        try:
+            _hooks.external_posterior_sample(A9.spec, ToyEngine(), fitted=A9.fr, priors=A9.pr)
+            why9 = "accepted"
+        except (_ef.PosteriorRefused, PosteriorRefused) as ex:
+            why9 = str(ex)
+        ok("fitted under engine" in why9, f"NP9 the cached sample does not bypass another engine's check: {why9[:100]}")
 
 
 if __name__ == "__main__":

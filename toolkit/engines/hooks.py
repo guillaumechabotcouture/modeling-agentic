@@ -124,6 +124,81 @@ def _unsupported(hook, engine):
     return HookUnsupported(hook, engine)
 
 
+def supports_external_posterior(engine) -> bool:
+    """Whether `engine` declares an effect-fit declaration (benchmarks/effect_fit.yaml) or is a test toy engine."""
+    import inspect
+    if (
+        getattr(engine, "is_toy", False)
+        or type(engine).__module__ in ("toolkit.engines.contract", "toolkit.engines.hooks", "toolkit.spec.toy_engines")
+        or type(engine).__name__.startswith("Toy")
+        or any(
+            c.__module__ in ("toolkit.engines.contract", "toolkit.engines.hooks", "toolkit.spec.toy_engines")
+            and c.__name__.startswith("Toy")
+            for c in type(engine).__mro__
+        )
+    ):
+        return True
+    try:
+        eng_file = inspect.getfile(type(engine))
+    except TypeError:
+        return False
+    bdir = os.path.join(os.path.dirname(os.path.abspath(eng_file)), "benchmarks")
+    return os.path.isfile(os.path.join(bdir, "effect_fit.yaml")) or os.path.isfile(os.path.join(bdir, "pack.yaml"))
+
+
+def external_posterior_input(spec) -> dict | None:
+    """Generic hook for reading and digest-verifying a spec's declared external joint posterior."""
+    from toolkit.engines import effect_fit as EF
+    return EF.posterior_input(spec)
+
+
+def external_posterior_exception(spec) -> dict | None:
+    """Generic hook for reading a spec's owner-signed external posterior exception."""
+    from toolkit.engines import effect_fit as EF
+    return EF.posterior_exception(spec)
+
+
+def external_posterior_sheet_lines(raw: dict) -> list:
+    """Generic hook for sign-off sheet summary lines of an owner-signed external posterior exception."""
+    from toolkit.engines import effect_fit as EF
+    return EF.exception_sheet_lines(raw)
+
+
+def external_posterior_sample(spec, eng, fitted: dict | None = None, priors: dict | None = None,
+                            held=()) -> dict | None:
+    """Generic hook: load, replay-verify, and bound-check an external joint posterior if declared on `spec`."""
+    from toolkit.engines import effect_fit as EF
+    if EF.posterior_input(spec) is None:
+        return None
+    if not supports_external_posterior(eng):
+        raise EF.PosteriorRefused(f"engine {type(eng).__name__} has no effect_fit benchmark pack")
+    return EF.net_effect_sample(spec, eng, fitted=fitted, priors=priors, held=held)
+
+
+def external_posterior_point(spec, ne: dict | None, theta: dict) -> dict:
+    """Generic hook: place external posterior columns at the fit's verified chosen point."""
+    from toolkit.engines import effect_fit as EF
+    return EF.posterior_point(spec, ne, theta)
+
+
+def external_posterior_point_source(ne: dict | None) -> dict:
+    """Generic hook: manifest point_source mapping for external posterior columns."""
+    from toolkit.engines import effect_fit as EF
+    return EF.point_source(ne)
+
+
+def external_posterior_with_ranges(ne: dict | None, fitted: dict, priors: dict | None = None) -> tuple:
+    """Generic hook: return copies of (fitted, priors) with posterior column ranges set from `ne`."""
+    from toolkit.engines import effect_fit as EF
+    return EF.with_posterior_ranges(ne, fitted, priors)
+
+
+def external_posterior_range_record(ne: dict) -> dict:
+    """Generic hook: manifest/report range record for a verified external posterior."""
+    from toolkit.engines import effect_fit as EF
+    return EF.posterior_range_record(ne)
+
+
 def window_mean(t, v, w0: float, w1: float, end: float | None = None, step: float = 1 / 12) -> float:
     """Mean of a step series (values on the contract's monthly grid) over the half-open window [w0, w1): each step
     [t_k, t_k + step) (the last one cut at `end`, the window end of the grid) weighted by its overlap. NaN when no
@@ -457,6 +532,11 @@ def _self_test() -> int:
             lambda: schedule(sched([ev(t0=0.9999995)]), {}, u, pa, hd), "delivery period")
     ok(len(schedule(sched([ev(kind="history", charged=False, t0=0.9999995)]), {}, u, pa, hd)) == 1,
        "H15d a history event just before d0 is accepted")
+    from toolkit.engines.contract import ToyEngine
+    class _BareEngine:
+        pass
+    ok(supports_external_posterior(ToyEngine()) and not supports_external_posterior(_BareEngine()),
+       "H16 external posterior hook detection works generically without disease names")
     print("OK: all self-test cases passed." if not fails else f"FAILED: {len(fails)} case(s)")
     return 1 if fails else 0
 

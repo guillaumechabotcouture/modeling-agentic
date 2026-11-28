@@ -162,9 +162,10 @@ def _same(vals) -> bool:
 
 def tested_by(raw, row) -> list:
     """The unit_attribute decision tests on a column bound to the attribute that reach the units outside."""
-    from toolkit.spec import perturb as PT       # W0-B: a perturb test in its per-target form
     out = []
-    for t in PT.tests(raw.get("analysis")):
+    for t in (((raw.get("analysis") or {}).get("decision_tests") or []) if isinstance(raw, dict) else []):
+        if not isinstance(t, dict):
+            continue
         ua = t.get("unit_attribute") if t.get("type") == "unit_attribute" else None
         if not isinstance(ua, dict) or str(ua.get("column")) != row["column"]:
             continue

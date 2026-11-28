@@ -1418,7 +1418,7 @@ def _run_dir(label):
 
 
 def sign_side(label, answers_yaml, note, run_name=None, expect_spec_sha256=None, _runner=None, action=None,
-              expect_derivations_sha256=None, expect_sheet_sha256=None):
+              expect_derivations_sha256=None):
     """The owner's answer for the newest run on `label`. `run_name` (the run console passes it): the run dir the
     owner was shown; another newest run is refused. `action` is explicit when given: "spec" signs the spec through
     agents/stage_machine.py sign with the expected hashes (no sha: refused), "scope" answers the pending scope
@@ -1448,10 +1448,8 @@ def sign_side(label, answers_yaml, note, run_name=None, expect_spec_sha256=None,
                                     "(--expect-spec-sha256)"}
         cmd = [sys.executable, "agents/stage_machine.py", "sign", rd, "--by", "owner", "--note", note,
                "--expect-sha256", expect_spec_sha256]
-        for flag, v in (("--expect-derivations-sha256", expect_derivations_sha256),
-                        ("--expect-sheet-sha256", expect_sheet_sha256)):
-            if v:
-                cmd += [flag, v]
+        if expect_derivations_sha256:
+            cmd += ["--expect-derivations-sha256", expect_derivations_sha256]
         r = run(cmd, cwd=f"{WORK}/{label}", env=env, capture_output=True, text=True)
         return {"rc": r.returncode, "out": (r.stdout + r.stderr).strip()}
     fd, p = tempfile.mkstemp(suffix=".yaml")

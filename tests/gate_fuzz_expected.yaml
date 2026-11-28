@@ -2,20 +2,6 @@
 # fail-closed I/O decision. CI fails on a failure missing here and on an entry here
 # that no longer fails. Regenerate with: python3 scripts/gate_fuzz.py --write-expected
 expected_failures:
-  compute:
-    models/fuzz_results.jsonl:
-      symlink_escape: [fails_open]
-      wrong_type: [raises]
-    models/fuzz_results.jsonl.summary.json:
-      big_int_str: [fails_open]
-      corrupt: [fails_open]
-      empty: [fails_open]
-      inf: [raises]
-      nan: [raises]
-      symlink_escape: [fails_open]
-      truncated: [fails_open]
-      undecodable: [fails_open]
-      wrong_type: [fails_open]
   pipeline:
     models/pipeline.yaml:
       bad_date: [raises]

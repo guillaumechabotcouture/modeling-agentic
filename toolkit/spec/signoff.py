@@ -26,32 +26,20 @@ from toolkit.spec import schema  # noqa: E402
 
 SPEC = "decision_spec.yaml"
 SPEC_SIGNOFF = "decision_spec.signoff.json"
-BRIEF_SIGNOFF = "decision_brief.signoff.json"
 SIGNED_DIR = "decision_brief.signed"
 # docs/design/v2-derived-inputs.md: the harness's record of the derivations that made the spec's data. The sign-off
 # freezes its hash next to the spec's, and the derived files it lists, so a later change to either breaks it.
 DERIVATIONS_RECORD = "data/derivations_record.json"
-SHEET = "decision_spec.signoff_sheet.md"
-
-
-def _brief_signoff(run_dir: str) -> dict | None:
-    try:
-        with open(os.path.join(run_dir, BRIEF_SIGNOFF), encoding="utf-8") as f:
-            doc = json.load(f)
-        return doc if isinstance(doc, dict) else None
-    except (OSError, ValueError):
-        return None
 
 
 def _spec_record(run_dir: str) -> dict | None:
-    """The sign-off that covers the spec: legacy brief signoff when it hashed the spec, else the spec-only record."""
-    so = _brief_signoff(run_dir)
-    if so is not None and (so.get("sha256") or {}).get(SPEC) is not None:
-        return so
+    """The canonical sign-off record covering the spec (`decision_spec.signoff.json`), or None."""
     try:
         with open(os.path.join(run_dir, SPEC_SIGNOFF), encoding="utf-8") as f:
             doc = json.load(f)
-        return doc if isinstance(doc, dict) else None
+        if isinstance(doc, dict) and ((doc.get("sha256") or {}).get(SPEC) is not None or doc.get("spec_sha256") is not None):
+            return doc
+        return None
     except (OSError, ValueError):
         return None
 
@@ -223,13 +211,13 @@ def signed_sha(run_dir: str) -> str | None:
     return (rec.get("sha256") or {}).get(SPEC) if rec else None
 
 
-def sign(run_dir: str, by: str, note: str = "", answers: dict | None = None, accept_proposed: bool = False,
-         expect_sha256: str | None = None, expect_derivations_sha256: str | None = None,
-         expect_sheet_sha256: str | None = None) -> dict:
-    """Sign the spec. The expect_* hashes are what the owner was shown (the run console's approval snapshot): the
-    spec, the derivation record ("none": there was none) and the sign-off sheet; a mismatch is refused. The spec is
-    read once: validated, hashed and copied from those bytes; nothing is read or written through a link; the record
-    is published atomically."""
+def _prepare_sign(run_dir: str, by: str, note: str = "", expect_sha256: str | None = None,
+                  expect_derivations_sha256: str | None = None,
+                  expect_geometry_sha256: str | None = None) -> tuple[bytes, dict, dict]:
+    """Validate everything required to sign the spec and build `(spec_bytes, record, spec_doc)` without writing."""
+    import yaml
+    from agents import acquire as ACQ
+    from toolkit.spec import geometry
     try:
         data = read_nofollow(run_dir, SPEC)[0]
     except FileNotFoundError:
@@ -237,7 +225,6 @@ def sign(run_dir: str, by: str, note: str = "", answers: dict | None = None, acc
     except LinkRefused as e:
         raise ValueError(f"{SPEC}: {e}") from None
     sha = hashlib.sha256(data).hexdigest()
-    import yaml
     try:
         doc0 = yaml.safe_load(data.decode("utf-8")) or {}
     except (yaml.YAMLError, UnicodeDecodeError):
@@ -252,29 +239,8 @@ def sign(run_dir: str, by: str, note: str = "", answers: dict | None = None, acc
                          "read it again before signing")
     dsha = _sha_nofollow(run_dir, DERIVATIONS_RECORD)
     if expect_derivations_sha256 is not None and (dsha or "none") != expect_derivations_sha256:
-        raise ValueError(f"{DERIVATIONS_RECORD} changed since the sheet was shown: read it again before signing")
-    try:
-        sheet_bytes = read_nofollow(run_dir, SHEET)[0]
-    except FileNotFoundError:
-        sheet_bytes = None
-    except LinkRefused as e:
-        raise ValueError(f"{SHEET}: {e}") from None
-    sheet_sha = hashlib.sha256(sheet_bytes).hexdigest() if sheet_bytes is not None else "none"
-    if expect_sheet_sha256 is not None and sheet_sha != expect_sheet_sha256:
-        raise ValueError(f"{SHEET} changed since it was shown: read it again before signing")
-    src = sheet_sources(sheet_bytes.decode("utf-8", "replace")) if sheet_bytes is not None else None
-    if sheet_bytes is not None and src is None:
-        # Codex on 4d20e23: a sheet without its sources footer cannot show which spec, record and geometry evidence
-        # it was generated from; it is refused, never skipped
-        raise ValueError(f"{SHEET} predates source binding (no sources line); regenerate the sheet (python3 "
-                         "toolkit/spec/signoff.py sheet <run_dir> --write) and read it again")
-    extra = {DERIVATIONS_RECORD: dsha, SHEET: sheet_sha, **({brel: bsha} if brel else {})}
-    if sheet_bytes is not None and (
-            src.get("spec_sha256") != sha or src.get("derivations_sha256") != (dsha or "none")
-            or (brel is not None and src.get("burden_references_sha256") != bsha)):
-        raise ValueError(f"{SHEET} was generated from another spec, derivation record or reference file (it is "
-                         "stale): the sheet is regenerated before the owner signs; read the new one")
-    from agents import acquire as ACQ
+        raise ValueError(f"{DERIVATIONS_RECORD} changed since it was shown: read it again before signing")
+    extra = {DERIVATIONS_RECORD: dsha, **({brel: bsha} if brel else {})}
     acq_inv_sha = None
     if ACQ.has_acquired(run_dir):
         try:
@@ -286,16 +252,6 @@ def sign(run_dir: str, by: str, note: str = "", answers: dict | None = None, acc
             _, mbytes = ACQ.read_manifest(run_dir)
             if mbytes is not None:
                 extra[ACQ.MANIFEST_REL] = hashlib.sha256(mbytes).hexdigest()
-            if sheet_bytes is not None and src is not None and src.get("acquired_inventory_sha256") != acq_inv_sha:
-                raise ValueError(f"{SHEET} was generated from another acquired inventory (it is stale): "
-                                 "regenerate the sheet and read it again")
-    # Codex on 08f96a9: the geometry evidence the sheet showed must still be current when the freeze approves
-    geo_expect = None
-    if src is not None:
-        geo_expect = src.get("geometry_evidence_sha256")
-        if not isinstance(geo_expect, str):
-            raise ValueError(f"{SHEET} records no geometry evidence (it predates the geometry check): the sheet is "
-                             "regenerated before the owner signs; read the new one")
     sp = schema.load(os.path.join(run_dir, SPEC), data=data)
     sp.burden_bytes = bdata             # validation reads the reference bytes that were hashed
     errs = schema.validate(sp, pending_ok=True)
@@ -306,28 +262,52 @@ def sign(run_dir: str, by: str, note: str = "", answers: dict | None = None, acc
                 for e in PC.problems(run_dir, data, by, spec=sp)]
     if errs:
         raise ValueError("spec not ready: " + "; ".join(errs[:10]))
-    _refuse_held_out(data, run_dir)     # also in decision_brief.sign: every entry point, whoever signs
-    # every registered precondition (toolkit/spec/preconditions.py), recomputed from the files, whoever signs; the
-    # evidence check hands back the binding to record (its dossier read once, the sheet's dossier sha256 compared)
+    _refuse_held_out(data, run_dir)     # every entry point, whoever signs
     evidence = sign_preconditions(run_dir, data)
     extra.update(evidence["files"])
     if _spec_record(run_dir) is not None:
         raise ValueError("the spec is already signed; a change needs a new sign-off by the owner")
-    # The geometry part of the unsigned presentation file and its input hashes are frozen with the spec; an owner's
-    # sign-off also approves the HIGH geometry exceptions the spec proposes (docs/design/v2-input-geometry.md §2).
-    # The spec is the bytes read, validated and hashed above, never read again (#129: SG15).
-    import yaml
-    from toolkit.spec import geometry
     try:
         spec_doc = yaml.safe_load(data.decode("utf-8")) or {}
     except (yaml.YAMLError, UnicodeDecodeError) as e:
         raise ValueError(f"{SPEC} does not parse: {e}") from None
-    geometry.freeze(run_dir, by, spec=spec_doc if isinstance(spec_doc, dict) else {}, expect_evidence=geo_expect)
+    spec_doc = spec_doc if isinstance(spec_doc, dict) else {}
+    geo_rec = geometry.freeze(run_dir, by, spec=spec_doc, expect_evidence=expect_geometry_sha256, write_record=False)
     record = {"signed_by": by, "signed_at": _dt.datetime.now(_dt.timezone.utc).isoformat(), "note": note,
-              "sha256": {SPEC: sha, **extra}, "evidence": evidence["record"],
+              "sha256": {SPEC: sha, **extra}, "evidence": evidence["record"], "geometry": geo_rec,
               **({"acquired_inventory_sha256": acq_inv_sha} if acq_inv_sha is not None else {}),
               "producer": "toolkit/spec/signoff.py",
               "schema_version": schema.SCHEMA_VERSION}
+    return data, record, spec_doc
+
+
+def check_signable(run_dir: str, by: str, *, expect_sha256: str | None = None,
+                   expect_derivations_sha256: str | None = None,
+                   expect_geometry_sha256: str | None = None) -> dict:
+    """Zero-copy read-only check that `run_dir` can be signed by `by` (including no pending owner geometry exceptions
+    for a lead sign-off). Returns {ok, by, status} or {ok: False, by, error}."""
+    from toolkit.spec import geometry
+    try:
+        _, _, spec_doc = _prepare_sign(run_dir, by, "check_signable", expect_sha256=expect_sha256,
+                                       expect_derivations_sha256=expect_derivations_sha256,
+                                       expect_geometry_sha256=expect_geometry_sha256)
+        if by == "lead":
+            pend = geometry.owner_pending(geometry.check(run_dir, spec=spec_doc, use_signoff=False))
+            if pend:
+                return {"ok": False, "by": by, "error": f"geometry exceptions wait for the owner: {pend[:5]}"}
+        return {"ok": True, "by": by, "status": "signed"}
+    except ValueError as e:
+        return {"ok": False, "by": by, "error": str(e)[:3000]}
+
+
+def sign(run_dir: str, by: str, note: str = "", answers: dict | None = None, accept_proposed: bool = False,
+         expect_sha256: str | None = None, expect_derivations_sha256: str | None = None,
+         expect_geometry_sha256: str | None = None) -> dict:
+    """Sign the spec into `decision_spec.signoff.json`. The expect_* hashes bind what the owner was shown; a
+    mismatch is refused. The spec is read once, validated, hashed, and published atomically without following links."""
+    data, record, _ = _prepare_sign(run_dir, by, note, expect_sha256=expect_sha256,
+                                    expect_derivations_sha256=expect_derivations_sha256,
+                                    expect_geometry_sha256=expect_geometry_sha256)
     try:
         write_nofollow(run_dir, f"{SIGNED_DIR}/{SPEC}", data, atomic=True)   # the bytes that were hashed
         write_nofollow(run_dir, SPEC_SIGNOFF, json.dumps(record, indent=1).encode(), atomic=True)
@@ -349,91 +329,6 @@ def _refuse_held_out(spec_bytes: bytes, run_dir: str) -> None:
     bad = PV.signoff_refusals(doc if isinstance(doc, dict) else {}, run_dir=run_dir)
     if bad:
         raise ValueError("spec not signable (engine_parameters): " + "; ".join(bad[:10]))
-
-
-SHEET_SOURCES = "<!-- signoff-sheet-sources: "
-
-
-def sheet_sources(text) -> dict | None:
-    """The source hashes the sheet writer recorded in the sheet ({spec_sha256, derivations_sha256}), or None."""
-    if not isinstance(text, str):
-        return None
-    for line in reversed(text.splitlines()):
-        if line.startswith(SHEET_SOURCES) and line.endswith(" -->"):
-            try:
-                d = json.loads(line[len(SHEET_SOURCES):-4])
-            except ValueError:
-                return None
-            return d if isinstance(d, dict) else None
-    return None
-
-
-def write_sheet(run_dir: str, candidates: list | None = None) -> str:
-    """Generate the sign-off sheet and publish it (no link followed, atomic), with the hashes of the spec and the
-    derivation record it was generated from recorded in its last line. The spec and the record are each read once;
-    the sheet is rendered from those bytes and records their hashes (review round 4, P1-4). The console disables
-    approval and the signer refuses when they no longer match."""
-    try:
-        spec_bytes = read_nofollow(run_dir, SPEC)[0]
-    except (FileNotFoundError, LinkRefused) as e:
-        raise ValueError(f"{SPEC}: {e}") from None
-    try:
-        rec_bytes = read_nofollow(run_dir, DERIVATIONS_RECORD)[0]
-    except FileNotFoundError:
-        rec_bytes = None
-    except LinkRefused as e:
-        raise ValueError(f"{DERIVATIONS_RECORD}: {e}") from None
-    # The input geometry check, re-run on the spec bytes read above, then shown from the record it wrote; its evidence
-    # hash (declaration plus boundary, crosswalk and units sha256: what an approval binds to) is a recorded source,
-    # so the signer refuses when the geometry inputs changed after the owner saw the sheet (Codex on 08f96a9).
-    import yaml
-    from toolkit.spec import geometry
-    try:
-        spec_doc = yaml.safe_load(spec_bytes.decode("utf-8"))
-    except (yaml.YAMLError, UnicodeDecodeError):
-        spec_doc = None
-    if isinstance(spec_doc, dict):
-        geometry.run(run_dir, spec_doc)
-    section = geometry.sheet_section(run_dir)
-    brel = burden_reference(spec_doc)
-    try:                                # F6 S2-5 (Codex r4): one read, shown and hashed
-        bbytes = _burden_bytes(run_dir, brel) if brel else None
-        bsha = (hashlib.sha256(bbytes).hexdigest() if bbytes is not None else "none") if brel else "none"
-    except ValueError:
-        bbytes, bsha = None, "unreadable"
-    from toolkit.spec import evidence_dossier as ED
-    erel = ED.dossier_reference(spec_doc)
-    try:                                # F6 evidence dossier: one read, shown and hashed
-        ebytes = ED.read_dossier(run_dir, erel) if erel else None
-        esha = ED.sha(ebytes)
-    except ValueError:
-        ebytes, esha = None, "unreadable"
-    # #218 round 5: the input closure the signature will bind, recorded on the sheet (the files listed, its digest)
-    st_ = ED.state(run_dir, spec_bytes=spec_bytes, signing=True, require_sheet=False)
-    closure = ((st_.get("binding") or {}).get("record") or {}).get("closure") or {}
-    owners = ((st_.get("binding") or {}).get("record") or {}).get("closure_owners") or {}
-    from agents import acquire as ACQ
-    mbytes, acq_inv_sha = None, None
-    if ACQ.has_acquired(run_dir):
-        try:
-            v_acq = ACQ.verify_inventory(run_dir)
-            acq_inv_sha = v_acq.get("inventory_sha256")
-            _, mbytes = ACQ.read_manifest(run_dir)
-        except (ACQ.ArtifactTampered, LinkRefused, OSError):
-            acq_inv_sha = "unreadable"
-    text = sheet(run_dir, candidates, spec_bytes=spec_bytes, record_bytes=rec_bytes, geometry_section=section,
-                 burden_bytes=bbytes, dossier_bytes=ebytes, closure=closure, manifest_bytes=mbytes)
-    src = json.dumps({"spec_sha256": hashlib.sha256(spec_bytes).hexdigest(),
-                      "burden_references_sha256": bsha,
-                      "evidence_dossier_sha256": esha,
-                      "input_closure_sha256": ED.closure_digest(closure),
-                      "input_closure": closure, "input_closure_owners": owners,
-                      "derivations_sha256": hashlib.sha256(rec_bytes).hexdigest() if rec_bytes is not None else "none",
-                      "geometry_evidence_sha256": section[1],
-                      **({"acquired_inventory_sha256": acq_inv_sha} if acq_inv_sha is not None else {})},
-                     sort_keys=True)
-    write_nofollow(run_dir, SHEET, (text.rstrip("\n") + f"\n\n{SHEET_SOURCES}{src} -->\n").encode(), atomic=True)
-    return os.path.join(run_dir, SHEET)
 
 
 def sheet(run_dir: str, candidates: list | None = None, spec_bytes: bytes | None = None,
@@ -528,8 +423,8 @@ def sheet(run_dir: str, candidates: list | None = None, spec_bytes: bytes | None
     out += ACQ.acquired_sheet_lines(run_dir, manifest_bytes=manifest_bytes, spec_doc=raw, dossier_bytes=dossier_bytes)
     from toolkit.engines import benchmark_coverage as BC
     out += BC.sheet_lines(raw, candidates)              # owner decision 2026-11-12: departures the signature accepts
-    from toolkit.analysis import uncertainty as UQ
-    out += UQ.exception_sheet_lines(raw)                # owner, 2026-11-20: a net-effect posterior exception, HIGH
+    from toolkit.engines import hooks as _hooks
+    out += _hooks.external_posterior_sheet_lines(raw)   # owner, 2026-11-20: external posterior exception, HIGH
     from toolkit.engines import effect_settings as ES
     out += ES.sheet_lines(raw, run_dir)                 # units outside the trials' settings, and what covers each
     if schema.engine_has_build(raw.get("engine")):
@@ -591,13 +486,6 @@ def _self_test() -> int:
             ok(False, "SG7 an invalid spec cannot be signed")
         except ValueError as e:
             ok("not ready" in str(e), "SG7 an invalid spec cannot be signed")
-    with tempfile.TemporaryDirectory() as d:
-        p = schema.toy_spec(d)
-        json.dump({"signed_by": "owner", "sha256": {SPEC: _sha(p)}}, open(os.path.join(d, BRIEF_SIGNOFF), "w"))
-        ok(status(d) == "signed", "SG8 legacy decision_brief.signoff.json covering the spec shows signed")
-        with open(p, "a") as f:
-            f.write("\n# edited\n")
-        ok(status(d) == "changed", "SG9 a spec edit after legacy brief sign-off shows as changed")
     with tempfile.TemporaryDirectory() as d:
         p = schema.toy_spec(d)
         raw = yaml.safe_load(open(p))
@@ -685,20 +573,14 @@ def _self_test() -> int:
         ok(len(opens) == 1, f"SG15 the spec is read once: validated, hashed and copied from the same bytes ({opens})")
     with tempfile.TemporaryDirectory() as d:
         p = schema.toy_spec(d)
-        write_sheet(d)        # round 3: the sheet records the sources it was made from
         sh = _sha(p)
-        res = []
-        for kw in ({"expect_derivations_sha256": "0" * 64}, {"expect_sheet_sha256": "0" * 64}):
-            try:
-                sign(d, "owner", note="n", expect_sha256=sh, **kw)
-                res.append(False)
-            except (ValueError, TypeError) as e:
-                res.append(isinstance(e, ValueError))
-        ok(all(res) and status(d) == "awaiting",
-           f"SG16 the sign-off checks the derivation record's and the sheet's sha256 too ({res})")
         try:
-            sign(d, "owner", note="n", expect_sha256=sh, expect_derivations_sha256="none",
-                 expect_sheet_sha256=_sha(os.path.join(d, SHEET)))
+            sign(d, "owner", note="n", expect_sha256=sh, expect_derivations_sha256="0" * 64)
+            ok(False, "SG16 the sign-off checks the derivation record's sha256 too")
+        except ValueError:
+            ok(status(d) == "awaiting", "SG16 the sign-off checks the derivation record's sha256 too")
+        try:
+            sign(d, "owner", note="n", expect_sha256=sh, expect_derivations_sha256="none")
             ok(status(d) == "signed", "SG17 with every sha matching the spec is signed")
         except (ValueError, TypeError) as e:
             ok(False, f"SG17 with every sha matching the spec is signed ({e})")
@@ -716,35 +598,6 @@ def _self_test() -> int:
         ok(os.listdir(out) == [] and len(opens) <= 1,
            f"SG18 sign hashes and copies the same bytes, never through a linked signed dir "
            f"({os.listdir(out)}, {len(opens)} opens)")
-    # SG19-SG22 (run console review round 3)
-    with tempfile.TemporaryDirectory() as d:
-        p = schema.toy_spec(d)
-        try:
-            write_sheet(d)
-            src = sheet_sources(open(os.path.join(d, SHEET)).read())
-            ok(src and src.get("spec_sha256") == _sha(p) and src.get("derivations_sha256") == "none",
-               f"SG19 the sheet writer records the source hashes it was generated from ({src})")
-            with open(p, "a") as f:
-                f.write("\n# a newer spec\n")
-            try:
-                sign(d, "owner", note="n", expect_sha256=_sha(p),
-                     expect_sheet_sha256=_sha(os.path.join(d, SHEET)), expect_derivations_sha256="none")
-                ok(False, "SG20 a sheet generated from an older spec cannot authorise the newer one")
-            except ValueError as e:
-                ok("sheet" in str(e) and status(d) == "awaiting",
-                   f"SG20 a sheet generated from an older spec cannot authorise the newer one ({e})")
-        except NameError as e:
-            ok(False, f"SG19-SG20 sheet sources: {e}")
-    with tempfile.TemporaryDirectory() as d, tempfile.TemporaryDirectory() as out:
-        schema.toy_spec(d)
-        victim = os.path.join(out, "victim")
-        open(victim, "w").write("untouched")
-        os.symlink(victim, os.path.join(d, SHEET))
-        try:
-            write_sheet(d)
-        except (ValueError, OSError, NameError):
-            pass
-        ok(open(victim).read() == "untouched", "SG21 the sheet is not written through a link")
     with tempfile.TemporaryDirectory() as d, tempfile.TemporaryDirectory() as out:
         schema.toy_spec(d)
         open(os.path.join(out, "x.csv"), "w").write("secret\n")
@@ -761,17 +614,16 @@ def _self_test() -> int:
             g["_sha"], os.path.realpath = real_sha, real_rp
         ok(not isinstance(bad, NameError) and "data/x.csv" in bad and not any("x.csv" in str(h) for h in hashed),
            f"SG23 derivation outputs are hashed through no-follow fds: a linked data/ is a change, never read ({bad})")
-    # SG24 (round 4, P1-4): the sheet is rendered from the same captured spec bytes it records the hash of
     with tempfile.TemporaryDirectory() as d:
         schema.toy_spec(d)
         opens, real_open, real_osopen = [], builtins.open, os.open
         builtins.open = lambda f, *a, **k: (opens.append(f) if str(f).endswith(SPEC) else None) or real_open(f, *a, **k)
         os.open = lambda f, *a, **k: (opens.append(f) if str(f).endswith(SPEC) else None) or real_osopen(f, *a, **k)
         try:
-            write_sheet(d)
+            sheet(d)
         finally:
             builtins.open, os.open = real_open, real_osopen
-        ok(len(opens) == 1, f"SG24 write_sheet reads the spec once and renders and hashes those bytes ({len(opens)})")
+        ok(len(opens) == 1, f"SG24 sheet() reads the spec once in memory ({len(opens)})")
     from toolkit import import_guard as _G
     from toolkit.spec import toy_engines as _TOYS
     _G.allow_test_refs("engine", _TOYS.REFS)       # the self-test toy engines (refused in production)
@@ -892,12 +744,12 @@ def _self_test() -> int:
             ok(rec["sha256"].get(DERIVATIONS_RECORD) and status(d) == "signed",
                f"DI6c the sign-off freezes the derivation record's hash next to the spec's: {sorted(rec['sha256'])}")
             try:
-                g = json.load(open(os.path.join(d, "data", "geometry_signoff.json")))
+                g = (json.load(open(os.path.join(d, SPEC_SIGNOFF))) or {}).get("geometry") or {}
             except (OSError, ValueError):
                 g = {}
             ok(g.get("signed_by") == "owner" and (g.get("declaration") or {}).get("enabled") is False,
-               f"IG-S2 the sign-off also freezes the geometry declaration (here: no boundaries, check not enabled) in "
-               f"the harness's geometry record ({g.get('declaration')})")
+               f"IG-S2 the sign-off embeds the geometry declaration (here: no boundaries, check not enabled) in "
+               f"{SPEC_SIGNOFF} ({g.get('declaration')})")
             out = os.path.join(d, "data", "derived", "units.csv")
             with open(out, "a") as f:
                 f.write("99,r0,g0,0,1000,0,0.1,x\n")
@@ -929,48 +781,24 @@ def _self_test() -> int:
                "open ones")
     except Exception as e:  # noqa: BLE001 -- before the record and the sheet exist (step α) this is the failure
         ok(False, f"DI6/DI7/DI10 sign-off: {type(e).__name__}: {e}")
-    # IG-S3 (Codex on 08f96a9, P1): the sheet records the geometry evidence it shows; a boundary change after the
-    # sheet was generated refuses the sign-off, so no HIGH exception is approved against evidence nobody saw
+    # IG-S3: expect_geometry_sha256 refuses a stale geometry hash and approves matching evidence inside SPEC_SIGNOFF
     try:
         from toolkit.spec import geometry
         with tempfile.TemporaryDirectory() as d:
             geometry.toy_spec_with_boundaries(d, accept={"reciprocal_swap:0+1": "rows checked by the owner"})
-            write_sheet(d)
-            src = sheet_sources(open(os.path.join(d, SHEET)).read()) or {}
-            has = src.get("geometry_evidence_sha256") not in (None, "none")
-            bpath = os.path.join(d, "b.geojson")
-            orig = open(bpath).read()
-            g = json.loads(orig)
-            g["features"][5]["properties"]["note"] = "changed after the sheet"
-            open(bpath, "w").write(json.dumps(g))
+            ev_sha = geometry.check(d).get("evidence_sha256")
             try:
-                sign(d, "owner", note="n", expect_sheet_sha256=_sha(os.path.join(d, SHEET)))
+                sign(d, "owner", note="n", expect_geometry_sha256="0" * 64)
                 refused = ""
             except ValueError as e:
                 refused = str(e)
-            open(bpath, "w").write(orig)
-            rec = sign(d, "owner", note="n", expect_sheet_sha256=_sha(os.path.join(d, SHEET)))
-            appr = json.load(open(os.path.join(d, geometry.SIGNOFF_FILE))).get("approvals") or {}
-            ok(has and "geometry" in refused and rec and sorted(appr) == ["reciprocal_swap:0+1"],
-               f"IG-S3 the sheet records the geometry evidence; a boundary change after it refuses the sign-off, and the "
-               f"unchanged evidence signs with the approval ({has}; {refused[:90]}; {sorted(appr)})")
-    except Exception as e:  # noqa: BLE001 -- before the evidence is recorded (step α)
-        ok(False, f"IG-S3 the sheet binds the geometry evidence: {type(e).__name__}: {e}")
-    # IG-S4 (Codex on 4d20e23, P2): a sheet with no sources footer is refused, not skipped
-    try:
-        from toolkit.spec import geometry
-        with tempfile.TemporaryDirectory() as d:
-            geometry.toy_spec_with_boundaries(d, accept={"reciprocal_swap:0+1": "rows checked by the owner"})
-            geometry.toy_write_sheet(d, footer=False)
-            try:
-                sign(d, "owner", note="n")
-                why = ""
-            except ValueError as e:
-                why = str(e)
-            ok("predates source binding" in why and status(d) == "awaiting",
-               f"IG-S4 a sheet without its sources footer is refused: it predates source binding ({why[:90]})")
+            rec = sign(d, "owner", note="n", expect_geometry_sha256=ev_sha)
+            appr = ((json.load(open(os.path.join(d, SPEC_SIGNOFF))).get("geometry") or {}).get("approvals") or {})
+            ok(bool(ev_sha) and "geometry" in refused and rec and sorted(appr) == ["reciprocal_swap:0+1"],
+               f"IG-S3 expect_geometry_sha256 refuses mismatched geometry evidence and embeds approvals in "
+               f"{SPEC_SIGNOFF} ({refused[:90]}; {sorted(appr)})")
     except Exception as e:  # noqa: BLE001
-        ok(False, f"IG-S4 a sheet without its sources footer is refused: {type(e).__name__}: {e}")
+        ok(False, f"IG-S3 geometry evidence binding: {type(e).__name__}: {e}")
     # ED1-ED9 (F6 evidence dossier, owner decision 2026-11-12): no sign-off until every input that drives an option's
     # effect has a checked, sourced entry; the sheet shows the dossier and the signature binds its bytes
     from toolkit.spec import evidence_dossier as ED
@@ -1013,19 +841,12 @@ def _self_test() -> int:
             ok("evidence_dossier.yaml" in why and "parse" in why, f"ED9 an unparseable dossier is refused: {why}")
         with tempfile.TemporaryDirectory() as d:
             ED.toy_dossier_spec(d)
-            write_sheet(d)
-            md = open(os.path.join(d, SHEET)).read()
+            md = sheet(d)
             sec = md.split("## Evidence dossier")[-1].split("\n## ")[0] if "## Evidence dossier" in md else ""
             ok(sec and "| parameter:eff_a" in sec and "0.42" in sec and "Toy trial 2020" in sec and "0.3, 0.7" in sec
                and "fitted_range_eff_a" in sec and "no data" in sec and "0.5" in sec,
                f"ED5 the sheet shows the dossier table (input, model value, field value, source, chosen range, "
                f"test): {sec[:600]!r}")
-            src = sheet_sources(md) or {}
-            open(os.path.join(d, "evidence_dossier.yaml"), "a").write("# edited after the sheet\n")
-            why = refusal(d)
-            ok(isinstance(src.get("evidence_dossier_sha256"), str) and "stale" in why and status(d) == "awaiting",
-               f"ED7 a sheet generated before a dossier edit cannot authorise the sign-off: {why}")
-            write_sheet(d)
             rec = sign(d, "owner", note="n")
             ok(status(d) == "signed" and rec["sha256"].get("evidence_dossier.yaml"),
                f"ED4 a complete dossier (with a 'no data' entry and its borrowing rule) signs and its hash is recorded: "
@@ -1054,10 +875,9 @@ def _self_test() -> int:
                f"ED11a the stage machine's sign-off refuses it too: {why}")
         with tempfile.TemporaryDirectory() as d:
             ED.toy_dossier_spec(d)
-            write_sheet(d)                  # the stage machine signer, too, binds what the sheet showed
             rec = SM.sign(d, "owner", "n")
             ok((rec.get("evidence") or {}).get("dossier") == "evidence_dossier.yaml"
-               and (rec.get("evidence_sha256") or rec.get("sha256") or {}).get("evidence_dossier.yaml"),
+               and (rec.get("sha256") or rec.get("evidence_sha256") or {}).get("evidence_dossier.yaml"),
                f"ED11b the stage machine's sign-off binds the dossier: {rec}")
         with tempfile.TemporaryDirectory() as d:
             p = ED.toy_dossier_spec(d, dossier=False)
@@ -1109,7 +929,6 @@ def _self_test_run_dir_forms(ok):
                 schema.toy_spec(os.path.join(top, rel))
                 form = {"rel": rel, "abs": os.path.join(top, rel)}
                 try:
-                    write_sheet(form[sign_as])
                     sign(form[sign_as], "lead", note="self-test")
                     st = (status(form[sign_as]), status(form[check_as]))
                     cl = [((ED.state(form[f]).get("binding") or {}).get("record") or {}).get("closure") or {}
@@ -1139,7 +958,6 @@ def _self_test_run_dir_forms(ok):
         schema.toy_spec(os.path.join(a, rel))
         try:
             os.chdir(a)
-            write_sheet(rel)
             sign(rel, "lead", note="self-test")
             os.chdir(cwd)
             shutil.copytree(a, b)
@@ -1150,15 +968,14 @@ def _self_test_run_dir_forms(ok):
             os.chdir(cwd)
     ok(st3 == ("signed", "signed"), f"SG-RD3 a spec signed through a relative path in one tree is signed in a copy of "
                                     f"the tree under another root, checked through its absolute path: {st3}")
-    # BE26: the persisted sign-off record binds the sign-off sheet's sha256
+    # BE26: the persisted sign-off record binds spec and geometry inside decision_spec.signoff.json
     import yaml
     with tempfile.TemporaryDirectory() as d_sh:
-        schema.toy_spec(d_sh)
-        sp_sheet = write_sheet(d_sh)
-        want_sh = hashlib.sha256(open(sp_sheet, "rb").read()).hexdigest()
-        rec_sh = sign(d_sh, "owner", note="be26", expect_sheet_sha256=want_sh)
-        ok(rec_sh["sha256"].get(SHEET) == want_sh,
-           f"BE26 sign-off record persists {SHEET} sha256 ({rec_sh['sha256'].get(SHEET)} vs {want_sh})")
+        p_sh = schema.toy_spec(d_sh)
+        want_sp = _sha(p_sh)
+        rec_sh = sign(d_sh, "owner", note="be26", expect_sha256=want_sp)
+        ok(rec_sh["sha256"].get(SPEC) == want_sp and isinstance(rec_sh.get("geometry"), dict),
+           f"BE26 sign-off record persists {SPEC} sha256 and embedded geometry ({rec_sh['sha256'].get(SPEC)} vs {want_sp})")
     # Build-spec sheet renders the "Engine to be built" section with check plan, uncovered outputs, and full-registry
     # eligibility check even when regenerated via CLI (candidates=None)
     from toolkit.engines.built import requested as BREQ
@@ -1182,8 +999,6 @@ def main(argv=None) -> int:
     ap.add_argument("run_dir")
     ap.add_argument("--by", default=None, choices=["owner", "lead"])
     ap.add_argument("--note", default="")
-    ap.add_argument("--write", action="store_true", help="sheet: regenerate and publish the sheet (with its sources "
-                                                         "line) instead of printing it")
     a = ap.parse_args(argv)
     if a.action == "sign" and a.by is None:
         ap.error("sign needs --by owner or --by lead")
@@ -1191,7 +1006,7 @@ def main(argv=None) -> int:
         print(status(a.run_dir))
         return 0
     if a.action == "sheet":
-        print(write_sheet(a.run_dir) if a.write else sheet(a.run_dir))
+        print(sheet(a.run_dir))
         return 0
     print(json.dumps(sign(a.run_dir, a.by, a.note), indent=1))
     return 0

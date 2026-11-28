@@ -7,11 +7,9 @@ move_rel_floor: 1.0e-4
 move_ci_level: 0.95
 
 stochastic_seeds_init: 8
-stochastic_seeds_max: 64
 
 mass_balance_rel_tol: 1.0e-9
 transition_count_rel_tol: 1.0e-6
-batch_vs_run_rel_tol: 1.0e-12
 invariance_rel_tol: 1.0e-12
 
 reference_rel_ceiling: 0.05

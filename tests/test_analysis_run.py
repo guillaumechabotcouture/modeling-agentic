@@ -1,0 +1,3141 @@
+#!/usr/bin/env python3
+"""Tests extracted from toolkit/analysis/run.py."""
+from __future__ import annotations
+
+import csv
+import json
+import math
+import os
+import sys
+import time
+
+TESTS_DIR = os.path.dirname(os.path.abspath(__file__))
+REPO = os.path.dirname(TESTS_DIR)
+ROOT = REPO
+if REPO not in sys.path:
+    sys.path.insert(0, REPO)
+
+from toolkit.analysis import run as R
+from toolkit.analysis.run import (
+    Analysis, AnalysisBlocked, Bt, C, CL, DT, DirectModel, EmulatorModel, FD, Store, _direct_toy, _toy_bench, _toy_pack, plain, run, schema, signoff,
+)
+
+
+def main(argv=None) -> int:
+    import argparse
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--self-test", action="store_true")
+    ap.parse_args(argv)
+    return _self_test()
+
+
+def _self_test() -> int:
+    import copy
+    import math
+    import tempfile
+    import yaml
+    fails = []
+
+    def ok(cond, msg):
+        print(("PASS " if cond else "FAIL ") + msg)
+        if not cond:
+            fails.append(msg)
+
+    q = lambda *a, **k: None  # noqa: E731
+    with tempfile.TemporaryDirectory() as d:
+        # ---------------- emulator path, emulator-inversion calibration (the spike's chain)
+        bench, v_ok, v_bad = _toy_bench(d)
+        p = schema.toy_spec(d, n=24, bench=bench, dt_values=(v_ok, v_bad))
+        try:
+            run(d, log=q)
+            ok(False, "R1 an unsigned spec is refused")
+        except PermissionError:
+            ok(True, "R1 an unsigned spec is refused")
+        signoff.sign(d, "lead", note="self-test")
+        R = run(d, log=q, compute_kw={"max_workers": 2})
+        acc = R["emulator_accuracy"]
+        ok(acc["reduction_r2_median"] > 0.9 or acc["reduction_mae_median"] < 0.01,
+           f"R2 emulator held-out accuracy on the toy engine ({acc})")
+        spec = schema.load(p)
+        errs = []
+        for i, v in R["calibration"]["units"].items():
+            t = float(next(u for u in spec.units() if u["id"] == i)["tgt"])
+            errs.append(abs(v["z"] - math.log(-math.log(1 - t) / 0.5) / 0.8))
+        ok(max(errs) < 0.1, f"R3 calibration by emulator inversion recovers the toy attribute (max error {max(errs):.3f})")
+        pt = R["point"]
+        ok(pt["solver"]["status"] == "optimal" and pt["cost_allocated"] <= 9000 * (1 + 1e-9),
+           "R4 the plan is a proven optimum within the budget (toolkit/alloc ILP)")
+        from toolkit.engines.identity import engine_identity as _eid
+        ok(pt.get("engine_identity") == _eid(spec.engine()),
+           "R4b the point artifact records the analysis's full engine identity (emulator path; Codex r3 P1)")
+        # F6 S2-4b: ranking near package switches, against engine runs at the calibrated values
+        from toolkit.analysis import contract
+        bd = yaml.safe_load(open(os.path.join(d, R["artifacts"]["emulator_boundary"])))["data"]
+        ok(bd["status"] == "judged" and 0 < bd["units"] <= 20 and bd["units"] == len(bd["rows"])
+           and bd["matched"] == sum(r["match"] for r in bd["rows"])
+           and os.path.exists(os.path.join(d, "analysis", "boundary", "results.jsonl"))
+           and "Ranking near package switches" in open(os.path.join(d, "results.md")).read()
+           and not [f for f in contract.gate_findings(d) if f["kind"].startswith("emulator_boundary_")
+                    and f["kind"] != "emulator_boundary_ranking"],
+           f"BD-R1 the boundary artifact, its engine rows and its results line ({bd['matched']} of {bd['units']})")
+        _self_test_boundary_engine(ok, R)
+        from toolkit.analysis.model import DirectModel
+        Ab, r0 = R["_A"], bd["rows"][0]
+        zb = {i: v["z"] for i, v in R["calibration"]["units"].items()}
+        saved_m = Ab.model
+        try:
+            Ab.model = DirectModel(Ab.spec, log=q)
+            _o, bb, cb = Ab.evaluate(Ab.theta0, zb, ids=[r0["unit"]])
+        finally:
+            Ab.model = saved_m
+        want = [bb[r0["unit"]][k] / cb[r0["unit"]][k] for k in (r0["chosen"], r0["runner_up"])]
+        got = [r0["engine"]["ratio_chosen"], r0["engine"]["ratio_runner_up"]]
+        ok(all(abs(g / w - 1) < 1e-9 for g, w in zip(got, want)),
+           f"BD-R2 the engine side equals the engine evaluated directly at the calibrated values ({got} vs {want})")
+        import shutil                     # Codex r1 P1-2: the signed evaluation mode requires the artifact
+        d3 = os.path.join(d, "..", os.path.basename(d) + "_nobd")
+        shutil.copytree(d, d3)
+        try:
+            mp3 = os.path.join(d3, "analysis", "manifest.json")
+            man3 = json.load(open(mp3))
+            man3["artifacts"] = {k: v for k, v in man3["artifacts"].items() if v.get("kind") != "emulator_boundary"}
+            man3["expected"]["kinds"] = [k for k in man3["expected"]["kinds"] if k != "emulator_boundary"]
+            json.dump(man3, open(mp3, "w"))
+            ok("emulator_boundary" in {f.get("key") for f in contract.gate_findings(d3)},
+               "BD-R3 an emulator-path run without the boundary artifact is a finding, whatever its manifest expects")
+        finally:
+            shutil.rmtree(d3, ignore_errors=True)
+        fp = R["uncertainty"]["fixed_plan"]["dalys"]
+        ok(fp["ci_low"] <= fp["median"] <= fp["ci_high"] and "not covered" in R["uncertainty"]["label"],
+           f"R5 the interval is computed and labelled with what it covers ({R['uncertainty']['label']})")
+        # hb1 fix 11 (L): uncertainty_report.yaml and analysis/uncertainty.yaml use one estimator for the same draws
+        # (an even number of draws here, where the order statistics and numpy's interpolation differ)
+        rep_ = (yaml.safe_load(open(os.path.join(d, "uncertainty_report.yaml"))) or {}).get("scalar_outputs") or {}
+        hd_ = spec["deliverable"]["headline"]
+        pairs_ = [(rep_.get(hd_["name"]) or {}, R["uncertainty"]["fixed_plan"][hd_["outcome"]])] + [
+            (rep_.get(f"{o}_averted") or {}, R["uncertainty"]["fixed_plan"][o]) for o in R["uncertainty"]["fixed_plan"]]
+        ok(R["uncertainty"]["draws"] % 2 == 0
+           and all(a.get(k) == b[k] for a, b in pairs_ for k in ("mean", "median", "ci_low", "ci_high")),
+           f"R5L the uncertainty report gives the same mean, median and interval as uncertainty.yaml "
+           f"({[(a.get('median'), b['median']) for a, b in pairs_]})")
+        af = R["uncertainty"].get("affordability") or {}
+        ok(af.get("draws") == R["uncertainty"]["draws"] and 0.0 <= af.get("share_over_budget", -1) <= 1.0
+           and (af.get("fixed_plan_cost") or {}).get("median") is not None
+           and abs(af.get("budget_allocatable", 0) - 9000) < 1e-6,
+           f"R5b the fixed plan's cost is recorded in every draw and its share over budget reported (F6 S1-1): {af}")
+        rep0 = yaml.safe_load(open(os.path.join(d, "uncertainty_report.yaml")))
+        ok("fixed_plan_cost" not in (rep0.get("scalar_outputs") or {}) and rep0.get("affordability") == af,
+           "R5c one cost summary: the report carries affordability, not a second scalar summary (Codex S1-1 P2)")
+        cs = {c["id"]: c for c in (yaml.safe_load(open(os.path.join(d, CL.SPEC_REL))) or {}).get("claims", [])}
+        ok("uq.share_over_budget" in cs and (cs.get("uq.fixed_plan_cost.median") or {}).get("interval")
+           == R["uncertainty"]["interval"],
+           "R5d claims: the share over budget, and cost quantiles labelled with the interval (Codex S1-1 P2)")
+        # Codex S1-1 P2: costs that move in each draw (a drawn cost multiplier), checked draw by draw against an
+        # independent replay of the same draws
+        import numpy as np
+        from toolkit.analysis import uncertainty as U
+        A5 = R["_A"]
+        saved = copy.deepcopy(A5.spec.raw["uncertainty"])
+        try:
+            A5.spec.raw["uncertainty"]["sources"] = list(saved["sources"]) + [{"kind": "costs",
+                                                                                "items": {"ca": [0.5, 2.0]}}]
+            A5.spec.raw["uncertainty"]["excluded"] = [x for x in saved.get("excluded") or [] if x.get("kind") != "costs"]
+            A5.spec.raw["uncertainty"]["affordability"] = {"max_share_over_budget": 0.2}
+            u5 = U.run(A5, R["point"]["plan"], "total_dalys_averted", draws=8, seed=3)["data"]["affordability"]
+            D5 = U.Drawer(A5, 3)
+            D5.prepare(8)
+            want = []
+            for _ in range(8):
+                th, zs, noise, mult, _s = D5.draw()
+                _o, _b, c5 = A5.evaluate(th, zs, noise=noise, cost_mult=mult)
+                want.append(sum(c5[i][R["point"]["plan"][i]] for i in A5.ids))
+            n_over = sum(c > A5.budget * (1 + 1e-9) for c in want)
+            fq = u5.get("fixed_plan_cost") or {}
+            ok(abs(fq.get("median", -1) - float(np.median(want))) <= 1e-9 * max(want)
+               and abs(fq.get("ci_high", -1) - float(np.percentile(want, 97.5))) <= 1e-9 * max(want),
+               "R5f the cost quantiles are the replayed draws' own quantiles")
+            ok(u5.get("per_draw_cost") == want and len(set(round(c, 6) for c in want)) > 1
+               and u5["draws_over_budget"] == n_over and u5["rule_met"] == (n_over / 8 <= 0.2)
+               and u5["budget_allocatable"] == A5.budget,
+               f"R5e with drawn cost multipliers each draw's cost equals an independent replay, and the rule is judged "
+               f"on those draws ({u5.get('draws_over_budget')} of 8 over)")
+            _self_test_reserve(ok, A5, R, u5)
+        finally:
+            A5.spec.raw["uncertainty"] = saved
+            if hasattr(A5, "set_reserve"):
+                A5.set_reserve(None)
+            A5.plan_budget = None
+        _self_test_cost_structure(ok, A5, R)
+        _self_test_direct_decision_tests(ok, A5, R)
+        stb = R["stability"]
+        ok(stb["n_folds"] == 4 and stb["value_verdict"] in ("ROBUST", "FRAGILE", "UNSTABLE")
+           and "total_benefit_loss_pct_worst_fold" in stb["metrics"],
+           "R6 leave-one-group-out runs every fold and reports value lost beside package identity (lesson 5)")
+        dt = R["decision_tests"][0]
+        res = yaml.safe_load(open(os.path.join(d, dt["path"])))
+        r1 = dt["results"][0]
+        ok(abs(r1["achieved_interaction"] - v_ok) <= 1e-9 * v_ok and [x["value"] for x in dt["rejected_values"]] == [v_bad]
+           and res["produced_by"] == "harness" and isinstance(res["decision_changes"], bool)
+           and "verified benchmark results" in res["arm_source"],
+           "R7 interaction rescale: arms from verified benchmark results, the achieved interaction equals the requested "
+           "one, an unreachable value is rejected (Codex P1-12, P1-13)")
+        # F6 S1-4: every fitted engine parameter gets an automatic test at each end of its range; an excluded scenario
+        # parameter is listed as not run, with the spec's reason
+        byid = {t.get("test_id"): t for t in R["decision_tests"]}
+        fa = byid.get("fitted_range_eff_a") or {}
+        ok("fitted_range_eff_b" in byid and fa.get("status") == "run"
+           and [round(r["value"], 9) for r in fa.get("results", [])] == [0.3, 0.7] and fa.get("automatic") is True,
+           f"R7b fitted parameters get automatic tests at their range ends: {sorted(k for k in byid if k)}")
+        sx = byid.get("scenario_excluded_synergy") or {}
+        ok(sx.get("status") == "not_run" and "no interaction" in str(sx.get("reason")),
+           f"R7c an excluded scenario parameter is listed as a test not run, with the spec's reason: {sx}")
+        from toolkit.analysis import contract as MM
+        got, probs = MM.load_test_result(d, dt["path"])
+        ok(got is not None and not probs, f"R8 the result file passes the Phase 49 loader: {probs}")
+        rows = list(csv.DictReader(open(os.path.join(d, "allocation_optimized.csv"))))
+        ok(len(rows) == 24 and set(rows[0]) >= {"unit", "package", "dalys_averted"}, "R9 the deliverable CSV is written")
+        rep = yaml.safe_load(open(os.path.join(d, "uncertainty_report.yaml")))
+        ok("total_dalys_averted" in rep["scalar_outputs"] and rep["interval_label"] == R["uncertainty"]["label"]
+           and rep["interval"] == R["uncertainty"]["interval"],
+           "R10 uncertainty_report.yaml carries the headline output and the structured interval")
+        txt = open(os.path.join(d, "results.md")).read()
+        ok("[CLAIM:" not in txt and R["uncertainty"]["label"] in txt, "R11 results.md is fully rendered from the ledger")
+        sv_ = (json.load(open(os.path.join(d, "analysis", "manifest.json"))).get("solver") or {})
+        ok((sv_.get("headline") or {}).get("solves", 0) >= 1 and (sv_.get("auxiliary_total") or {}).get("solves", 0) > 0
+           and sv_["auxiliary_total"]["not_solved"] == 0 and "relative gap" in txt,
+           f"R11b (1C-c) the manifest records the solver settings and counts, and results.md states the gap the plan "
+           f"is proven within: {sv_.get('auxiliary_total')}")
+        dsec = txt[txt.index("## Decision tests"):]
+        ok(all(not ch.isdigit() for ch in dt["statement"]) and "[CLAIM" not in dsec,
+           "R11b decision-test statements are words; their numbers are claims (Codex P1-4)")
+        ok(all(os.path.exists(os.path.join(d, f["path"]) + ".provenance.json") for f in
+               yaml.safe_load(open(os.path.join(d, "analysis", "figures.yaml")))["data"]["figures"]),
+           "R12 every figure has a provenance sidecar")
+        from toolkit.analysis import contract
+        # figure sources relative to the run dir: a run whose outputs moved off the VM (/tmp/...) still checks
+        figs = yaml.safe_load(open(os.path.join(d, "analysis", "figures.yaml")))["data"]["figures"]
+        rels = [all(not os.path.isabs(s) for s in json.load(open(os.path.join(d, f["path"]) + ".provenance.json"))
+                    ["source_hashes"]) for f in figs]
+        moved = d + "_moved"
+        os.rename(d, moved)
+        try:
+            fk = [x["claim"] for x in contract.gate_findings(moved) if x["kind"] == "analysis_contract_figure"]
+        finally:
+            os.rename(moved, d)
+        ok(figs and all(rels) and fk == [],
+           f"R12b figure sources are recorded relative to the run dir, and a moved run dir checks clean: {fk[:2]}")
+        _self_test_moves(ok, d, R)
+        ok(contract.gate_findings(d) == [], f"R13 the contract checks pass on a harness run: {contract.gate_findings(d)}")
+        rel = os.path.join("analysis", "point.yaml")
+        with open(os.path.join(d, rel), "a") as f:
+            f.write("# hand edit\n")
+        kinds = {x["kind"] for x in contract.gate_findings(d)}
+        ok("analysis_contract_tampered" in kinds, f"R14 a hand-edited artifact is caught: {kinds}")
+        ok(DT._lowers_only_unchosen({"u": {"p": 1.0, "q": 2.0}}, {"u": {"p": 0.5, "q": 2.0}}, {"u": "q"})
+           and not DT._lowers_only_unchosen({"u": {"p": 1.0, "q": 2.0}}, {"u": {"p": 3.0, "q": 2.0}}, {"u": "q"}),
+           "R15 lesson 8: lowering only unchosen packages' benefits is recognised as unable to move the plan")
+        # Codex P1-6: extrapolation outside the design domain and clips are recorded and bear on the plan
+        A, M = R["_A"], R["_model"]
+        i0 = A.ids[0]
+        far = {i: (5.0 if i == i0 else R["calibration"]["units"][i]["z"]) for i in A.ids}
+        A.evaluate(A.theta0, far)
+        ev = A.last_events
+        ok(any(e["kind"] == "extrapolation" and e["unit"] == i0 for e in ev)
+           and A.plan_corrections(ev, R["point"]["plan"]),
+           "R16 a unit outside the design domain is recorded as extrapolation and bears on the plan (Codex P1-6)")
+        # Codex P1-3: stored results without provenance are refused
+        design, jobs = Bt.design(spec)
+        stored = os.path.join(d, "stored.jsonl")
+        with open(os.path.join(d, "analysis", "batch", "results.jsonl")) as f:
+            rows_c = [json.loads(x) for x in f if x.strip()]
+        res_by = {jobs[r["i"]]["id"]: r["result"]["result"] for r in rows_c if r.get("ok")}
+        with open(stored, "w") as f:
+            for j in jobs:
+                f.write(json.dumps({"id": j["id"], "ok": True, "result": res_by[j["id"]]}) + "\n")
+        got, probs = Bt.load_results(stored, jobs, spec.engine())
+        ok(not got and probs and "no provenance" in probs[0], "R17 stored results without provenance are refused (P1-3)")
+        from toolkit.analysis.model import _driver
+        try:
+            _driver({"cost_drivers": {"x": 1.0}}, "treated", "t")
+            ok(False, "R21 a missing cost driver fails closed (Codex P1-7)")
+        except ValueError:
+            ok(True, "R21 a missing cost driver fails closed (Codex P1-7)")
+        run(d, log=q, compute_kw={"max_workers": 2}, draws=2)
+        ok(contract.gate_findings(d) == [], "R22 a rerun publishes a fresh complete manifest")
+        orig = EmulatorModel.predict
+
+        def clipped(self, zs, theta, ids, noise=None):
+            out = orig(self, zs, theta, ids, noise)
+            self.last_events = self.last_events + [{"unit": ids[0], "package": "*", "kind": "reduction_clip"}]
+            return out
+        EmulatorModel.predict = clipped
+        try:
+            run(d, log=q, compute_kw={"max_workers": 2}, draws=2)
+            ok(False, "R23 a correction bearing on the plan blocks the run (Codex P1-6)")
+        except AnalysisBlocked:
+            ok({x["kind"] for x in contract.gate_findings(d)} == {"analysis_contract_blocked"}
+               and os.path.exists(os.path.join(d, "analysis", "blocked.yaml")),
+               "R23 a correction bearing on the plan blocks the run before anything is published (Codex P1-6)")
+        finally:
+            EmulatorModel.predict = orig
+        # F6 S1-2: fitted values fitted against other band declarations of the engine's pack block the analysis
+        from toolkit.engines.contract import ToyEngine
+        from toolkit.spec import engine_parameters as EPm
+        fpath = os.path.join(d, "stale_fitted.yaml")
+        yaml.safe_dump({"parameters": {}, "band_declarations": {"T2": "an older declaration"}}, open(fpath, "w"))
+        stale_pack = dict(_toy_pack(), fit_joint={"targets": ["T2"]})
+        orig_bp = EPm.benchmark_pack
+        try:
+            ToyEngine.fitted_path = fpath
+            EPm.benchmark_pack = lambda e: (stale_pack, "pack.yaml")
+            run(d, log=q, compute_kw={"max_workers": 2}, draws=2)
+            ok(False, "R23b stale fitted values block the analysis")
+        except AnalysisBlocked as e:
+            blk = yaml.safe_load(open(os.path.join(d, "analysis", "blocked.yaml")))["data"]
+            ok(e.where == "fitted_values" and blk["reason"].startswith("refit required: T2, fit_rule"),
+               f"R23b stale fitted values block the analysis before the joint calibration or batch: {blk['reason']}")
+        finally:
+            del ToyEngine.fitted_path
+            EPm.benchmark_pack = orig_bp
+        _self_test_stop_records(ok, d, q)
+        _self_test_round2(ok, d, q)
+        _self_test_reserve_e2e(ok, d, q)
+        _self_test_floors_e2e(ok, d, q)
+        _self_test_burden_e2e(ok, d, q)
+        _self_test_anchor_e2e(ok, d, q)
+    with tempfile.TemporaryDirectory() as d:
+        # ---------------- direct path, likelihood calibration (a cheap engine fitted to a panel)
+        _direct_toy(d)
+        signoff.sign(d, "lead")
+        R = run(d, log=q)
+        th = R["calibration"]["theta"]
+        ok(abs(th["lrr:a"] - math.log(0.6)) < 0.05 and abs(th["lrr:a+b"] - math.log(0.5)) < 0.05,
+           f"D1 likelihood calibration recovers the planted package effects ({th})")
+        from toolkit.engines.identity import engine_identity as _eid
+        ok((R["point"].get("engine_identity") or {}).get("code_sha256")
+           == _eid(schema.load(os.path.join(d, "decision_spec.yaml")).engine())["code_sha256"],
+           "D1b the point artifact records the analysis's full engine identity (direct path; Codex r3 P1)")
+        ident = R["calibration"]["identifiability"]["parameters"]
+        ok(all(v["status"] in ("well_identified", "weakly_identified", "unidentified") for v in ident.values())
+           and ident["lrr:a"]["status"] == "well_identified", f"D2 identifiability from scripts/identifiability.py: "
+           f"{ {k: v['status'] for k, v in ident.items()} }")
+        inter = {(r["a"], r["b"]): r for r in R["point"]["interactions"]}
+        ok(abs(inter[("a", "b")]["interaction_ratio"] - 0.5 / (0.6 * 0.7)) < 0.05,
+           f"D3 the interaction ratio is computed from the point outcomes ({inter[('a', 'b')]['interaction_ratio']:.3f})")
+        ok(R["stability"]["n_folds"] == 3 and R["uncertainty"]["covers"] == ["calibration"],
+           "D4 likelihood path: refit-based stability and calibration-covariance uncertainty")
+        uv = R["uncertainty"].get("unit_values_drawn") or {}
+        ok((uv.get("calibration") or {}).get("units") == 6 and uv["calibration"].get("attribute") == "log_rate"
+           and uv.get("n_varied") == 6,
+           f"D4b hb3 fix 5: the report counts the 6 per-unit log rates drawn with the ratios from the covariance: {uv}")
+        gr = next(x for x in R["decision_tests"] if x["type"] == "group_rule")
+        ok(gr["can_move_plan"] and gr["recommendation"]["with"], "D5 a group-rule decision test re-solves the plan")
+        from toolkit.analysis import contract
+        ok(contract.gate_findings(d) == [], f"D6 contract checks pass on the direct path: {contract.gate_findings(d)}")
+    _self_test_priors(ok, q)
+    _self_test_posterior(ok, q)
+    _self_test_joint(ok, q)
+    _self_test_stability_flagged(ok)
+    _self_test_variants(ok, q)
+    _self_test_voi(ok, q)
+    _self_test_plan_rule(ok, q)
+    _self_test_unit_attr(ok, q)
+    # AR-RW1 (run console review round 4, P1-2): artifacts and the manifest never follow a link or a planted .tmp
+    import tempfile as _tf
+    with _tf.TemporaryDirectory() as d, _tf.TemporaryDirectory() as out:
+        open(os.path.join(out, "v"), "w").write("untouched")
+        os.makedirs(os.path.join(d, "analysis"))
+        os.symlink(os.path.join(out, "v"), os.path.join(d, "analysis", "point.yaml"))
+        st_ = Store(d, None, False, {})
+        os.symlink(os.path.join(out, "v"), os.path.join(d, "analysis", "manifest.json.tmp"))
+        from toolkit.analysis.artifacts import KINDS as _KINDS
+        for fn in (lambda: st_.write("point", {k: 0 for k in _KINDS["point"]}, "t"),
+                   lambda: st_.finalize("blocked", "t")):
+            try:
+                fn()
+            except (ValueError, OSError):
+                pass
+        ok(open(os.path.join(out, "v")).read() == "untouched",
+           "AR-RW1 an analysis artifact and the manifest are not written through a link or a planted .tmp")
+    if fails:
+        print(f"FAILED: {len(fails)} case(s)")
+        return 1
+    print("OK: all self-test cases passed.")
+    return 0
+
+
+def _self_test_stop_records(ok, d, q):
+    """v2 autonomy 1C-a (item 4.7): every stop the toolkit declares (a refused calibration, calibration input, anchor,
+    batch, or a solver defect) leaves analysis/blocked.yaml and a manifest with status blocked, then raises as before;
+    any other error leaves no manifest."""
+    import yaml
+    from toolkit.alloc.optimize import OptimizerError
+    from toolkit.analysis import contract
+    from toolkit.analysis.burden import AnchorError
+    from toolkit.calibration.history_matching import CalibrationInputError
+    cases = [(None, lambda: KeyError("planted")),
+             ("calibration", lambda: C.CalibrationRefused("posterior_ess", "planted")),
+             ("calibration", lambda: CalibrationInputError(["planted"])),
+             ("burden_anchor", lambda: AnchorError("planted")),
+             ("optimizer", lambda: OptimizerError("planted")),
+             ("calibration", lambda: setattr(e_ab := C.CalibrationRefused("calibration_ridge", "planted"), "at_bound",
+                                             ["x"]) or e_ab),
+             ("batch", lambda: Bt.BatchRefused("batch_stale", "planted"))]
+    orig = EmulatorModel.predict
+    bp = os.path.join(d, "analysis", "blocked.yaml")
+    # Codex r1: a record that cannot be written, with a log that fails too, never replaces the stop the caller sees
+    exc = Bt.BatchRefused("batch_stale", "planted")
+
+    def planted2(self, zs, theta, ids, noise=None):
+        raise exc
+
+    def no_final(self, status, reason=""):
+        raise OSError("planted: no space")
+
+    def bad_log(*a, **k):
+        if "could not be recorded" in " ".join(str(x) for x in a):
+            raise OSError("planted: log")
+    orig_fin = Store.finalize
+    EmulatorModel.predict, Store.finalize = planted2, no_final
+    try:
+        run(d, log=bad_log, compute_kw={"max_workers": 2}, draws=2)
+        got = None
+    except Exception as e:  # noqa: BLE001 -- the planted stop
+        got = e
+    finally:
+        EmulatorModel.predict, Store.finalize = orig, orig_fin
+    ok(got is exc and {x["kind"] for x in contract.gate_findings(d)} == {"analysis_contract_missing"},
+       f"RUN_BLOCKED_UNRECORDED a stop whose record and log both fail is still the error raised, with no manifest "
+       f"({type(got).__name__}: {got})")
+    for where, make in cases:       # the last case is a declared stop: the rerun below starts from its blocked record
+        exc = make()
+
+        def planted(self, zs, theta, ids, noise=None, _e=exc):
+            raise _e
+        EmulatorModel.predict = planted
+        try:
+            run(d, log=q, compute_kw={"max_workers": 2}, draws=2)
+            got = None
+        except Exception as e:  # noqa: BLE001 -- the planted stop, raised again by run()
+            got = e
+        finally:
+            EmulatorModel.predict = orig
+        name = type(exc).__name__
+        kinds = {x["kind"] for x in contract.gate_findings(d)}
+        blk = (yaml.safe_load(open(bp))["data"] if os.path.exists(bp) else {})
+        if where is None:
+            ok(got is exc and kinds == {"analysis_contract_missing"} and blk.get("exception") != name,
+               f"RUN_BLOCKED_OTHER an error that is not a declared stop ({name}) leaves no manifest and no blocked "
+               f"record of its own ({kinds})")
+            continue
+        ok(got is exc and kinds == {"analysis_contract_blocked"} and blk.get("exception") == name
+           and blk.get("where") == where and "planted" in str(blk.get("reason")),
+           f"RUN_BLOCKED_CAL {name} is raised again after analysis/blocked.yaml and a blocked manifest record it "
+           f"({kinds}, {({k: blk.get(k) for k in ('where', 'exception', 'reason')})})")
+        # Codex r2 of #334 P1-8: at_bound only when the exception carries the diagnostic (absent is not "none at a bound")
+        ok(("at_bound" in blk) == hasattr(exc, "at_bound") and blk.get("at_bound") == getattr(exc, "at_bound", None),
+           f"RUN_BLOCKED_AB {name}: at_bound is recorded only when the exception assessed it "
+           f"({blk.get('at_bound', '<absent>')}, {getattr(exc, 'at_bound', '<none>')})")
+    run(d, log=q, compute_kw={"max_workers": 2}, draws=2)
+    ok(contract.gate_findings(d) == [], "RUN_BLOCKED_RERUN a rerun after a recorded stop publishes a complete manifest")
+
+
+def _self_test_moves(ok, d, R):
+    """F6 S1-5 on the toy: decision tests, stability folds and sensitivity ends report what moves."""
+    import copy
+    import yaml
+    keys = {"regret", "regret_share", "population_changed", "dollars_moved", "dollars_moved_share",
+            "dollars_by_component", "units_changed_by_group", "triggered_by", "decision_changes"}
+    run_ = [x for x in R["decision_tests"] if x.get("status") == "run"]
+    files = [yaml.safe_load(open(os.path.join(d, x["path"]))) for x in run_]
+    ok(run_ and all(keys <= set(f) and {"regret_threshold", "dollars_threshold"} <= set(f)
+                    and isinstance(f["units_changed_by_group"], list) and all(keys <= set(r) for r in f["results"])
+                    for f in files),
+       f"MS1 every decision-test result file and row reports regret, population, dollars by component, units by "
+       f"group and the criterion that triggered: {sorted(keys - set(files[0]) if files else keys)}")
+    art = yaml.safe_load(open(os.path.join(d, "analysis", "decision_tests.yaml")))["data"]["tests"]
+    ok(all({"regret_pct", "dollars_moved_pct", "population_changed", "triggered_by"} <= set(t) for t in art
+           if t["status"] == "run"), "MS2 the decision_tests artifact carries regret, dollars and population")
+    st = R["stability"]
+    ok(all(keys <= set(f) for f in st["folds"]) and {"stable_provision", "stable_absence", "by_component"}
+       <= set(st.get("components") or {}) and "regret_pct_worst_fold" in st["metrics"],
+       f"MS3 stability folds report what moves; stable provision apart from stable absence: {st.get('components')}")
+    ends = [r[e] for r in R["sensitivity"]["rows"] for e in ("low", "high")]
+    ok(ends and all(keys <= set(e) for e in ends), "MS4 each sensitivity end reports what moves and what triggered")
+    cs = {c["id"] for c in (yaml.safe_load(open(os.path.join(d, CL.SPEC_REL))) or {}).get("claims", [])}
+    tid = CL._cid(run_[0]["test_id"])
+    need = {f"dt.{tid}.regret_pct", f"dt.{tid}.dollars", f"dt.{tid}.population", "stability.stable_provision",
+            "stability.stable_absence"}
+    ok(need <= cs, f"MS5 claims for regret, dollars, population and stable provision/absence: {sorted(need - cs)}")
+    txt = open(os.path.join(d, "results.md")).read()
+    ok("stable absence" in txt and "moves between components" in txt and "[CLAIM:" not in txt,
+       "MS6 results.md reports dollars moved and stable provision apart from stable absence")
+    figs = yaml.safe_load(open(os.path.join(d, "analysis", "figures.yaml")))["data"]["figures"]
+    e = next((f for f in figs if f["figure"] == "decision_tests"), None)
+    cols = set(next(csv.DictReader(open(os.path.join(d, e["table"]))), {})) if e else set()
+    ok({"regret_pct", "dollars_moved_pct", "triggered_by"} <= cols, f"MS7 the decision-test figure table: {cols}")
+    # a test below the share threshold changes the plan on regret when the regret threshold is low, and says so
+    A = R["_A"]
+    saved = copy.deepcopy(A.spec.raw["analysis"])
+    t = next(x for x in R["decision_tests"] if x.get("test_id") == "fitted_range_eff_a")
+    dt = {"id": t["test_id"], "type": "fitted_range", "parameter": "eff_a", "values": [0.3, 0.7], "automatic": True}
+    z0 = {i: v["z"] for i, v in R["calibration"]["units"].items()}
+    out0, ben0, cost0 = A.evaluate(A.theta0, z0)
+    plan = R["point"]["plan"]
+    try:
+        A.spec.raw["analysis"].update(share_threshold=1.0, regret_threshold=0.0, dollars_threshold=1.0)
+        rec = DT.run_one(A, dt, z0, ben0, cost0, plan, R["uncertainty"], out0)
+        pos = max(r.get("regret", 0) for r in rec["results"]) > 1e-9
+        ok(pos and rec["decision_changes"] is True and rec["triggered_by"] == ["regret"],
+           f"MS8 a positive regret above its threshold changes the plan on regret alone: {rec.get('triggered_by')}")
+        p = os.path.join(d, "models", "decision_tests", "ms8.yaml")
+        yaml.safe_dump(plain(rec), open(p, "w"), sort_keys=False)
+        from toolkit.analysis import contract as MM
+        got, probs = MM.load_test_result(d, "models/decision_tests/ms8.yaml")
+        ok(got is not None and not probs, f"MS9 the Phase 49 loader accepts a verdict set by regret: {probs}")
+        os.remove(p)
+        A.spec.raw["analysis"] = copy.deepcopy(saved)
+        A.set_reserve(0.8)      # enforce: re-optimisations stay within the reserved budget
+        rec = DT.run_one(A, dt, z0, ben0, cost0, plan, R["uncertainty"], out0)
+        spent = sum(cost0[i][plan[i]] for i in A.ids)
+        ok(all(spent + sum(r["dollars_by_component"].values()) <= A.plan_budget * (1 + 1e-9) for r in rec["results"]),
+           "MS10 with a reserve the re-solved plans' costs (point cost plus dollars by component) stay within it")
+        # Codex r1 P2-1: a smaller envelope makes the point plan unaffordable: a change, never NO_CHANGE
+        A.set_reserve(None)
+        env = {"id": "env_small", "type": "envelope", "values": [0.5 * float(A.budget)], "text": "a smaller envelope"}
+        rec = DT.run_one(A, env, z0, ben0, cost0, plan, R["uncertainty"], out0)
+        r0 = rec["results"][0]
+        ok(r0["point_plan_feasible"] is False and r0["regret"] is None and "infeasible" in rec["triggered_by"]
+           and rec["decision_changes"] is True and r0["objective_gap"] < 0,
+           f"MS11 an envelope the point plan does not fit is a change ({rec.get('triggered_by')})")
+        ok(set(rec.get("worst_by_criterion") or {}) >= {"share", "regret", "dollars", "population"}
+           and all("value" in w for w in rec["worst_by_criterion"].values()),
+           "MS12 the result file names, for each criterion, its worst tested value with its own breakdown")
+    except Exception as e:  # noqa: BLE001 -- a failing case, not a crash of the self-test
+        ok(False, f"MS8-MS12 the criteria on the toy ({type(e).__name__}: {e})")
+    finally:
+        A.spec.raw["analysis"] = saved
+        A.set_reserve(None)
+    es = next((f for f in figs if f["figure"] == "sensitivity"), None)
+    scols = set(next(csv.DictReader(open(os.path.join(d, es["table"]))), {})) if es else set()
+    ok("triggered_by" in scols, f"MS13 the sensitivity figure table names the criterion that changed the plan: {scols}")
+
+
+def _self_test_variants(ok, q):
+    """F6 S1-6 on the toy: operational plan variants beside the unconstrained plan, then one of them as the headline."""
+    import tempfile
+    import yaml
+    from toolkit.analysis import contract
+    with tempfile.TemporaryDirectory() as d:
+        p = schema.toy_spec(d, n=24)
+        r = yaml.safe_load(open(p))
+        r["constraints"]["envelope_usd"] = 32000
+        r["analysis"]["decision_tests"] = []
+        r["analysis"]["plan_variants"] = {"variants": [
+            {"id": "service", "type": "minimum_service", "components": ["a", "b"], "text": "a service in every unit"},
+            {"id": "one_b", "type": "group_rule", "components": ["b"], "by": "region",
+             "text": "one decision on b per region"},
+            {"id": "given", "type": "fixed_plan", "column": "given", "text": "the plan as funded"}]}
+        yaml.safe_dump(r, open(p, "w"), sort_keys=False)
+        _given_column(d, lambda i: "b" if i % 6 == 0 else "a+b" if i % 2 else "none")  # even units: b ineligible
+        _fixed_refusals(ok, d, r)
+        signoff.sign(d, "lead", note="self-test")
+        try:
+            R = run(d, log=q, compute_kw={"max_workers": 2}, draws=2)
+        except Exception as e:  # noqa: BLE001 -- a failing case, not a crash of the self-test
+            ok(False, f"PV-R1 a run with plan variants completes ({type(e).__name__}: {str(e)[:200]})")
+            return
+        art = os.path.join(d, "analysis", "plan_variants.yaml")
+        pv = (yaml.safe_load(open(art))["data"] if os.path.exists(art) else {})
+        v = {x["id"]: x for x in pv.get("variants") or []}
+        A = R["_A"]
+        reg = {i: A.by_id[i]["region"] for i in A.ids}
+        sv, ob = v.get("service") or {}, v.get("one_b") or {}
+        ok(pv.get("headline") == "unconstrained" and sv.get("status") == "solved" and sv.get("units_no_package") == 0
+           and sv.get("value_lost", -1) >= -1e-9 and sv.get("cost", 1e9) <= A.budget * (1 + 1e-9)
+           and pv["unconstrained"]["plan"] == R["point"]["plan"],
+           f"PV-R1 minimum service is solved beside the unconstrained (headline) plan: {sv.get('status')}, "
+           f"{sv.get('units_no_package')} unfunded, value lost {sv.get('value_lost')}")
+        ok(ob.get("status") == "solved" and all(len({"b" in A.pk[ob["plan"][i]] for i in A.ids if reg[i] == g}) == 1
+                                                for g in set(reg.values()))
+           and {"dollars_by_component", "dollars_moved", "value_lost_pct", "population_changed"} <= set(ob),
+           f"PV-R2 the group-rule variant takes one decision on b per region, with its value lost and dollars moved")
+        cs = {c["id"] for c in (yaml.safe_load(open(os.path.join(d, CL.SPEC_REL))) or {}).get("claims", [])}
+        need = {"variant.service.value_lost", "variant.service.value_lost_pct", "variant.service.dollars",
+                "variant.service.no_package", "variant.one_b.value_lost"}
+        txt = open(os.path.join(d, "results.md")).read()
+        ok(need <= cs and "## Plan variants" in txt and "[CLAIM:" not in txt,
+           f"PV-R3 claims and results.md report the variants: {sorted(need - cs)}")
+        gv = v.get("given") or {}
+        ok(gv.get("status") == "evaluated" and [x["unit"] for x in gv.get("ineligible_units") or []] == ["0", "6", "12", "18"]
+           and all(gv["plan"][x] == "b" for x in ("0", "6", "12", "18"))
+           and abs(gv["cost_minus_budget"] - (gv["cost"] - A.budget)) < 1e-6
+           and (gv.get("uncertainty") or {}).get("draws") == 2
+           and (gv["uncertainty"].get("affordability") or {}).get("draws") == 2,
+           f"PV-R9 the given plan is evaluated as given: ineligible units reported and kept, cost against the budget, "
+           f"quantiles over the draws ({gv.get('status')}, {gv.get('units_ineligible')}, {gv.get('uncertainty_note')})")
+        need9 = {"variant.given.cost", "variant.given.budget_difference", "variant.given.ineligible",
+                 "variant.given.value_lost", "variant.given.averted_median", "variant.given.cost_median"}
+        ok(need9 <= cs and "evaluated as given" in txt,
+           f"PV-R10 claims and results.md report the given plan: {sorted(need9 - cs)}")
+        afv = {k: ((x.get("uncertainty") or {}).get("affordability") or {}) for k, x in (("service", sv), ("one_b", ob))}
+        need11 = {f"variant.{k}.{n}" for k in afv for n in ("cost_median", "draws_over_budget")}
+        ok(all(a.get("draws") == 2 and a.get("budget_allocatable") == A.budget for a in afv.values()) and need11 <= cs
+           and "draws over budget [CLAIM:" not in txt and txt.count("draws over budget") >= 3,
+           f"PV-R13 each solved variant's cost is counted against the budget over the uncertainty draws, with claims "
+           f"and a line in results.md ({ {k: (a.get('draws_over_budget'), a.get('draws')) for k, a in afv.items()} }, "
+           f"{sorted(need11 - cs)})")
+        ss = gv.get("same_spend") or {}      # review A2: the given plan against the optimum at its own cost
+        led = {c["id"]: c for c in (yaml.safe_load(open(os.path.join(d, "models", "claims_ledger.yaml"))) or {})
+               .get("claims", [])}
+        g14, p14 = led.get("variant.given.same_spend_gain") or {}, led.get("variant.given.same_spend_gain_pct") or {}
+        rc = CL._scripts()[1].render_claim
+        ln = [x for x in txt.splitlines() if x.startswith("given at the same spend")]
+        ok(ss.get("status") == "solved" and abs(ss.get("budget", -1) - gv.get("cost", 0)) < 1e-6
+           and ss.get("cost", 1e18) <= ss["budget"] * (1 + 1e-9) and g14.get("value") == ss.get("value_gain")
+           and p14.get("value") == ss.get("value_gain_pct") and len(ln) == 1 and rc(g14) in ln[0] and rc(p14) in ln[0],
+           f"PV-R14 the given plan is compared with the optimum at its own cost, with claims and a results.md line "
+           f"({ss.get('status')}, {ss.get('value_gain')}, {g14.get('value')}, {ln})")
+        ok(contract.gate_findings(d) == [], f"PV-R4 the contract checks pass with variants: {contract.gate_findings(d)}")
+        _resign(d, lambda x: x["analysis"]["plan_variants"].update(headline="service"))
+        try:
+            R2 = run(d, log=q, compute_kw={"max_workers": 2}, draws=2)
+        except Exception as e:  # noqa: BLE001
+            ok(False, f"PV-R5 a run whose headline is a variant completes ({type(e).__name__}: {str(e)[:200]})")
+            return
+        pv2 = yaml.safe_load(open(art))["data"]
+        s2 = {x["id"]: x for x in pv2["variants"]}["service"]
+        ok(pv2["headline"] == "service" and R2["point"]["plan"] == s2["plan"] == sv.get("plan")
+           and R2["point"].get("headline_variant") == "service" and R2["point"]["mix"]["no_package"] == 0
+           and pv2["unconstrained"]["plan"] == R["point"]["plan"],
+           f"PV-R5 headline: <variant> makes the variant's plan the headline; the unconstrained plan is still reported "
+           f"({R2['point'].get('headline_variant')})")
+        A2 = R2["_A"]
+        ok(all(not A2.feas["feasible"][i][A2.comp] for i in A2.ids) and A2.base_feas["feasible"][A2.ids[0]][A2.comp],
+           "PV-R6 with a variant headline every re-optimisation (draws, stability, sensitivity, tests) solves under its "
+           "rule: the analysis's feasibility excludes the comparator package, the unconstrained one is kept")
+        st = R2["stability"]
+        ok(st["components"]["by_component"] and all(x["units_changed"] >= 0 for x in st["folds"])
+           and contract.gate_findings(d) == [],
+           f"PV-R7 the contract checks pass with a variant headline: {contract.gate_findings(d)}")
+        # Codex S1-6 r1 P2-4: the spec's headline and point.yaml's marker must agree in the contract
+        _resign(d, lambda x: x["analysis"]["plan_variants"].pop("headline"))
+        kinds = {f["kind"] for f in contract.gate_findings(d)}
+        ok("analysis_contract_plan_variants" in kinds,
+           f"PV-R8 a point plan marked as a variant headline the spec no longer names is refused ({sorted(kinds)})")
+
+
+def _self_test_voi(ok, q):
+    """F6 value of information on the toy: the artifact, its claims and results line, the contract checks, and the
+    switch (off: no artifact, the uncertainty step's data unchanged)."""
+    import tempfile
+    import yaml
+    from toolkit.analysis import contract
+    with tempfile.TemporaryDirectory() as d:
+        p = schema.toy_spec(d, n=12)
+        r = yaml.safe_load(open(p))
+        r["analysis"]["decision_tests"] = []
+        r["analysis"]["plan_variants"] = {"variants": [{"id": "given", "type": "fixed_plan", "column": "given",
+                                                        "text": "the plan as funded"}]}
+        yaml.safe_dump(r, open(p, "w"), sort_keys=False)
+        _given_column(d, lambda i: "b" if i % 2 == 0 else "a")      # b is not eligible in even units
+        signoff.sign(d, "lead", note="self-test")
+        try:
+            R = run(d, log=q, compute_kw={"max_workers": 2}, draws=32)
+        except Exception as e:  # noqa: BLE001 -- a failing case, not a crash of the self-test
+            ok(False, f"VR1 a run with 32 draws completes ({type(e).__name__}: {str(e)[:200]})")
+            return
+        art = os.path.join(d, "analysis", "value_of_information.yaml")
+        doc = yaml.safe_load(open(art))["data"] if os.path.exists(art) else {}
+        ids = {c["id"] for c in (doc.get("candidates") or {}).get("list") or []}
+        gv = {c["id"]: c for c in (doc.get("candidates") or {}).get("list") or []}.get("variant:given") or {}
+        ok(doc.get("status") == "indicative" and doc.get("draws") == 32 and {"point", "variant:given", "robust"} <= ids
+           and (doc.get("evpi") or {}).get("value", -1) >= 0 and doc.get("decide_now") != "variant:given"
+           and gv.get("eligible") is False and "not feasible" in str(gv.get("excluded")) and gv.get("regret") is not None,
+           f"VR1 the run writes value_of_information.yaml: indicative at 32 draws; the point plan, the plan decided "
+           f"under the affordability rule and the declared variant among the candidates; the variant breaks the "
+           f"signed eligibility, so it is reported with its regret, never chosen ({doc.get('status')}, "
+           f"{doc.get('decide_now')}, {gv})")
+        names = {x["input"] for x in doc.get("inputs") or []}
+        nd = {x.get("input") for x in doc.get("not_drawn") or []}
+        ok({"shift:r0", "shift:r1", "shift:r2", "calibration shifts"} <= names and {"synergy", "costs"} <= nd,
+           f"VR2 every drawn input and the calibration-shift group are valued; inputs not drawn are listed "
+           f"({sorted(names)}, {sorted(nd)})")
+        cs = {c["id"] for c in (yaml.safe_load(open(os.path.join(d, CL.SPEC_REL))) or {}).get("claims", [])}
+        txt = open(os.path.join(d, "results.md")).read()
+        sup = sum(bool(x.get("supported")) for x in doc.get("inputs") or [])
+        ok({"voi.evpi", "voi.status"} <= cs and "## Value of information" in txt
+           and len([x for x in cs if x.startswith("voi.top") and x.endswith(".evppi")]) == min(sup, 5)
+           and "[CLAIM:" not in txt, f"VR3 claims and a results.md section ({sorted(x for x in cs if 'voi' in x)})")
+        ok(contract.gate_findings(d) == [], f"VR4 the contract checks pass: {contract.gate_findings(d)}")
+        mp = os.path.join(d, "analysis", "manifest.json")
+        man = json.load(open(mp))
+        man2 = dict(man, artifacts={k: v for k, v in man["artifacts"].items() if v.get("kind") != "value_of_information"},
+                    expected=dict(man["expected"], kinds=[k for k in man["expected"]["kinds"]
+                                                         if k != "value_of_information"]))
+        json.dump(man2, open(mp, "w"))
+        ok(any(f["kind"] == "analysis_contract_value_of_information" for f in contract.gate_findings(d)),
+           "VR5 a run without the artifact the spec asks for is a finding, whatever its manifest expects")
+        json.dump(man, open(mp, "w"))
+        unc_on = yaml.safe_load(open(os.path.join(d, "analysis", "uncertainty.yaml")))["data"]
+        rep_on = open(os.path.join(d, "uncertainty_report.yaml")).read()
+        _resign(d, lambda x: x["analysis"].update(value_of_information={"enabled": False}))
+        R2 = run(d, log=q, compute_kw={"max_workers": 2}, draws=32)
+        unc_off = yaml.safe_load(open(os.path.join(d, "analysis", "uncertainty.yaml")))["data"]
+        kinds = {v.get("kind") for v in json.load(open(mp))["artifacts"].values()}
+        txt2 = open(os.path.join(d, "results.md")).read()
+        checks = {"no artifact recorded": "value_of_information" not in R2["artifacts"]
+                  and "value_of_information" not in kinds,
+                  "no results section": "## Value of information" not in txt2,
+                  "uncertainty data identical": unc_off == unc_on,
+                  "uncertainty report identical": open(os.path.join(d, "uncertainty_report.yaml")).read() == rep_on,
+                  "checks pass": contract.gate_findings(d) == []}
+        ok(all(checks.values()), f"VR6 switched off: no artifact, the uncertainty data and report identical, checks "
+                                 f"pass ({[k for k, v in checks.items() if not v]})")
+        _resign(d, lambda x: x["analysis"].pop("value_of_information"))
+        run(d, log=q, compute_kw={"max_workers": 2}, draws=8)
+        few = yaml.safe_load(open(art))["data"] if os.path.exists(art) else {}
+        ok(few.get("status") == "too_few_draws" and few.get("draws") == 8 and few.get("evpi") is None
+           and contract.gate_findings(d) == [],
+           f"VR7 below the minimum draws the artifact records too_few_draws and the count, not silence "
+           f"({few.get('status')}, {few.get('draws')}, {contract.gate_findings(d)})")
+
+
+def _given_column(d, pkg):
+    """Add the column `given` (unit i's package: pkg(i)) to the toy units table."""
+    rows = list(csv.DictReader(open(os.path.join(d, "units.csv"))))
+    with open(os.path.join(d, "units.csv"), "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=list(rows[0]) + ["given"])
+        w.writeheader()
+        for k, x in enumerate(rows):
+            w.writerow(dict(x, given=pkg(k)))
+
+
+def _fixed_refusals(ok, d, r):
+    """F6 S2-6: the signed spec refuses a fixed plan as the headline, on a missing column, or with an unknown package."""
+    import copy
+
+    def errs(mut, units=None):
+        x = copy.deepcopy(r)
+        mut(x)
+        s = schema.Spec(x, d)
+        if units is not None:
+            s._units = units        # the units table as read, with one cell changed (no file written)
+        return schema.validate(s)
+    fx = lambda x: x["analysis"]["plan_variants"]["variants"][2]  # noqa: E731
+    e1 = errs(lambda x: x["analysis"]["plan_variants"].update(headline="given"))
+    e2 = errs(lambda x: fx(x).update(column="nocol"))
+    ok(any("cannot be the headline" in e for e in e1) and any("nocol" in e for e in e2)
+       and errs(lambda x: None) == [],
+       f"PV-R11 the spec refuses a fixed plan as headline or on a missing column ({e1[:2]}, {e2[:2]})")
+    rows = list(csv.DictReader(open(os.path.join(d, "units.csv"))))
+    e3 = errs(lambda x: None, [dict(rows[0], given="zz")] + rows[1:])
+    ok(any("zz" in e for e in e3), f"PV-R12 the spec refuses a unit given an unknown package ({e3[:2]})")
+
+
+def _self_test_plan_rule(ok, q):
+    """EV-R (hb1 fix 11, J): deliverable.plan: expected_value delivers the plan with the best mean over the
+    uncertainty draws, per-unit means in the CSV and a fixed-plan mean claim; absent or `point`, nothing changes."""
+    _self_test_plan_rule_runs(ok, q)
+
+
+def _self_test_plan_rule_runs(ok, q):
+    import tempfile
+    import yaml
+    from toolkit.analysis import contract
+    with tempfile.TemporaryDirectory() as d:
+        p = schema.toy_spec(d, n=12)
+        r = yaml.safe_load(open(p))
+        r["analysis"]["decision_tests"] = []
+        yaml.safe_dump(r, open(p, "w"), sort_keys=False)
+        signoff.sign(d, "lead", note="self-test")
+        csvp = os.path.join(d, "allocation_optimized.csv")
+        unc = lambda: yaml.safe_load(open(os.path.join(d, "analysis", "uncertainty.yaml")))["data"]  # noqa: E731
+        R0 = run(d, log=q, compute_kw={"max_workers": 2}, draws=32)
+        R0_frontier = os.path.exists(os.path.join(d, "figures", "frontier.png"))
+        csv0, unc0, rep0 = open(csvp).read(), unc(), open(os.path.join(d, "uncertainty_report.yaml")).read()
+        _resign(d, lambda x: x["deliverable"].update(plan="point"))
+        R1 = run(d, log=q, compute_kw={"max_workers": 2}, draws=32)
+        ok(open(csvp).read() == csv0 and unc() == unc0 and R1["point"]["plan"] == R0["point"]["plan"]
+           and open(os.path.join(d, "uncertainty_report.yaml")).read() == rep0
+           and "plan_rule" not in R0["point"] and "plan_rule" not in R1["point"],
+           "EV-R1 deliverable.plan: point is the default: the plan, the CSV and both uncertainty files are unchanged")
+        _resign(d, lambda x: x["deliverable"].update(plan="expected_value"))
+        keep_p = os.path.join(d, "figures", "comparison.csv")      # a file no earlier render published
+        open(keep_p, "w").write("kept\n")
+        try:
+            R = run(d, log=q, compute_kw={"max_workers": 2}, draws=32)
+        except Exception as e:  # noqa: BLE001 -- a failing case, not a crash of the self-test
+            ok(False, f"EV-R2 a run with deliverable.plan: expected_value completes ({type(e).__name__}: {str(e)[:200]})")
+            return
+        pr = R["point"].get("plan_rule") or {}
+        voi = yaml.safe_load(open(os.path.join(d, "analysis", "value_of_information.yaml")))["data"]
+        cand = {c["id"]: c["expected_value"] for c in voi["candidates"]["list"]}
+        ok(pr.get("rule") == "expected_value" and pr.get("draws") == 32 and pr.get("point_plan") == R0["point"]["plan"]
+           and cand["point"] >= max(cand.values()) - 1e-9 * max(1.0, abs(max(cand.values()))),
+           f"EV-R2 the delivered plan has the best mean over the draws of every candidate; the point-value plan is "
+           f"recorded beside it ({pr.get('rule')}, {cand.get('point')} vs {max(cand.values()) if cand else None})")
+        u = R["uncertainty"]["fixed_plan"]
+        pu = R["point"]["per_unit"]
+        sums = {o: sum((pu[i].get("averted_mean") or {}).get(o, float("nan")) for i in pu) for o in u}
+        ok(all(abs(sums[o] - u[o]["mean"]) <= 1e-9 * max(1.0, abs(u[o]["mean"])) for o in u),
+           f"EV-R3 the per-unit means add up to the fixed plan's mean over the draws ({sums} vs "
+           f"{ {o: u[o]['mean'] for o in u} })")
+        hl = r["deliverable"]["headline"]["outcome"]
+        rows = list(csv.DictReader(open(csvp)))
+        vc = r["deliverable"]["columns"]["value"]
+        ok(all(abs(float(x[vc]) - round((pu[x["unit"]].get("averted_mean") or {}).get(hl, float("nan")), 4)) < 1e-9 for x in rows)
+           and [x["package"] for x in rows] == [R["point"]["plan"][x["unit"]] for x in rows],
+           "EV-R4 the CSV carries the delivered plan and each unit's mean over the draws")
+        cs = {c["id"]: c for c in (yaml.safe_load(open(os.path.join(d, CL.SPEC_REL))) or {}).get("claims", [])}
+        txt = open(os.path.join(d, "results.md")).read()
+        ok((cs.get("headline.mean") or {}).get("source_field") == f"data.fixed_plan.{hl}.mean"
+           and "plan_rule.units_differ" in cs and "[CLAIM:" not in txt and "expected" in txt.split("## ")[1],
+           f"EV-R5 a fixed-plan mean claim and the plan rule in the results' recommendation "
+           f"({sorted(k for k in cs if k.startswith(('headline', 'plan_rule')))})")
+        ok(contract.gate_findings(d) == [], f"EV-R6 the contract checks pass: {contract.gate_findings(d)}")
+        vk = lambda R_: [(x["test_id"], x["status"], x.get("decision_changes"), x.get("recommendation"))  # noqa: E731
+                         for x in R_["decision_tests"]]
+        ok(R["decision_tests"] and vk(R) == vk(R0) and R["stability"].get("verdict") == R0["stability"].get("verdict"),
+           f"EV-R7 the decision tests and stability re-solve at the point values and compare with the point-value "
+           f"plan: the same records as the default run ({len(R['decision_tests'])} tests)")
+        # Codex r1 of #343: what reads the delivered plan elsewhere
+        dtf = contract.decision_test_findings(d)
+        ok(all("solved at the point values" in f["claim"] for f in dtf)
+           and yaml.safe_load(open(os.path.join(d, "analysis", "decision_tests.yaml")))["data"].get("reference_plan")
+           == "point_plan", f"EV-R8 the decision tests name their reference plan, and each owner finding says it is "
+                            f"the point-value plan ({len(dtf)} findings; P1-3)")
+        figs = yaml.safe_load(open(os.path.join(d, "analysis", "figures.yaml")))["data"]
+        fr_np = [x for x in figs.get("not_produced") or [] if x.get("figure") == "frontier"]
+        stale = [e for e in (".png", ".svg", ".csv") if os.path.exists(os.path.join(d, "figures", "frontier" + e))]
+        ok(fr_np and "expected-value" in str(fr_np[0].get("reason")) and not fr_np[0].get("render_failed")
+           and not stale and R0_frontier and os.path.exists(keep_p),
+           f"EV-R9 the frontier is not drawn, with the reason, and no earlier run's frontier file is left, while a "
+           f"file no render published is kept (P1-8, r2 P1-5, r3 P1-1) ({fr_np}, {stale})")
+        pp = os.path.join(d, "analysis", "point.yaml")
+        keep = open(pp).read()
+        try:
+            doc = yaml.safe_load(keep)
+            doc["data"].pop("plan_rule")
+            from toolkit.analysis import plan_rule as PRm
+            miss = PRm.contract_findings(r_ev := yaml.safe_load(open(os.path.join(d, "decision_spec.yaml"))),
+                                         doc["data"], R["uncertainty"])
+        finally:
+            open(pp, "w").write(keep)
+        ok(r_ev["deliverable"]["plan"] == "expected_value" and len(miss) == 1 and "no expected-value plan" in miss[0],
+           f"EV-R10 a completed run without the plan rule its spec asks for is a finding (P1-10): {miss}")
+
+
+def _self_test_posterior(ok, q):
+    """v2d β: the direct toy panel calibrated by `posterior` (declared priors, joint posterior sample)."""
+    import tempfile
+    import yaml
+    from toolkit.analysis import contract
+    with tempfile.TemporaryDirectory() as d:
+        _direct_toy(d)
+        sp = os.path.join(d, "decision_spec.yaml")
+        spec = yaml.safe_load(open(sp))
+        lrr = {"dist": "uniform", "range": [-2.0, 1.0], "source": "toy: a wide declared range"}
+        spec["calibration"].update(method="posterior", priors={
+            "lrr:a": lrr, "lrr:b": lrr, "lrr:a+b": lrr,
+            "log_rate": {"dist": "uniform", "range": [-8.0, 2.0], "source": "toy: the calibration range"}},
+            observation={"model": "poisson"})
+        yaml.safe_dump(spec, open(sp, "w"), sort_keys=False)
+        signoff.sign(d, "lead")
+        try:
+            R = run(d, log=q)
+        except Exception as e:      # noqa: BLE001 -- a failing case, not a crash of the self-test
+            ok(False, f"AN-b7 a posterior-calibrated allocation runs ({type(e).__name__}: {e})")
+            return
+        st = R["stability"]
+        ok(st.get("n_folds") == 3 and st.get("calibration_method") == "posterior" and st.get("method") != "skipped",
+           f"AN-b7 a posterior-calibrated allocation runs its stability folds instead of reporting 'nothing "
+           f"calibrated' ({st.get('method')}, {st.get('n_folds')} folds)")
+        cal = R["calibration"]
+        th = cal.get("theta") or {}
+        ok(cal.get("method") == "posterior" and abs(th.get("lrr:a", 9) - math.log(0.6)) < 0.1
+           and set((cal.get("identifiability") or {}).get("classes", {})) >= {"lrr:a", "z:u0"},
+           f"AN-b7b the posterior recovers the planted effects and classes every estimated name ({th})")
+        u = R["uncertainty"]
+        ok(u.get("draw_provenance", {}).get("findings") == [] and u.get("draw_provenance", {}).get("draws") == 8
+           and "calibration" in u["covers"],
+           f"AN-b7c uncertainty draws are rows of the canonical posterior sample (provenance recorded and checked): "
+           f"{u.get('draw_provenance', {}).get('findings')}")
+        ok(contract.gate_findings(d) == [], f"AN-b7d contract checks pass on the posterior path: "
+                                            f"{contract.gate_findings(d)}")
+
+
+def _self_test_joint(ok, q):
+    """Joint calibration in ANALYZE (toolkit/analysis/joint_calibration.py): it runs before the outcome batch, an
+    unmatched unit stops the run there (no batch), a matched one feeds the region into the draws; a clamped emulator
+    inversion stops at the calibration step."""
+    import tempfile
+    import yaml
+    from toolkit.analysis import joint_calibration as JC
+    from toolkit.analysis import contract
+    with tempfile.TemporaryDirectory() as d:
+        JC._toy_joint(d, unreachable="5", group=False)
+        signoff.sign(d, "lead", note="self-test")
+        try:
+            run(d, log=q, compute_kw={"max_workers": 2})
+            ok(False, "JR1 a unit the joint calibration cannot match blocks the run")
+        except AnalysisBlocked as e:
+            b = yaml.safe_load(open(os.path.join(d, "analysis", "blocked.yaml")))["data"]
+            ok(e.where == "calibration" and any(h["unit"] == "5" for h in e.hits) and "joint calibration" in b["reason"]
+               and not os.path.exists(os.path.join(d, "analysis", "batch", "results.jsonl"))
+               and os.path.exists(os.path.join(d, "analysis", "joint_calibration.yaml")),
+               "JR1 a unit the joint calibration cannot match stops the run at the calibration step, before the "
+               "outcome batch (blocked.yaml names it; the joint calibration artifact is written)")
+    with tempfile.TemporaryDirectory() as d:     # F6 S1-2 (Codex r2 P2-7): stale fitted values, joint calibration spec
+        from toolkit.engines.contract import ToyEngine
+        from toolkit.spec import engine_parameters as EPm
+        JC._toy_joint(d, group=False)
+        signoff.sign(d, "lead", note="self-test")
+        fpath = os.path.join(d, "stale_fitted.yaml")
+        yaml.safe_dump({"parameters": {}, "band_declarations": {"T2": "an older declaration"}}, open(fpath, "w"))
+        orig_bp = EPm.benchmark_pack
+        try:
+            ToyEngine.fitted_path = fpath
+            EPm.benchmark_pack = lambda e: (dict(_toy_pack(), fit_joint={"targets": ["T2"]}), "pack.yaml")
+            run(d, log=q, compute_kw={"max_workers": 2})
+            ok(False, "JR0 stale fitted values block a joint-calibration run")
+        except AnalysisBlocked as e:
+            b = yaml.safe_load(open(os.path.join(d, "analysis", "blocked.yaml")))["data"]
+            ok(e.where == "fitted_values" and b["reason"].startswith("refit required: T2, fit_rule"),
+               f"JR0 stale fitted values block a joint-calibration run with the blocked artifact: {b['reason']}")
+        except Exception as e:  # noqa: BLE001
+            ok(False, f"JR0 stale fitted values block a joint-calibration run (got {type(e).__name__}: {e})")
+        finally:
+            del ToyEngine.fitted_path
+            EPm.benchmark_pack = orig_bp
+    with tempfile.TemporaryDirectory() as d:     # owner decision 2026-11-06: flagged, never silently
+        sp = JC._toy_joint(d, unreachable="5", group=False)
+        raw = yaml.safe_load(open(sp))
+        raw["calibration"]["joint"]["unmatched"] = {"mode": "flag", "max_units": 1, "default_reason": "toy reason"}
+        # a narrow prior on the toy's (unidentified) base keeps the best point off the prior's edge, so the stability
+        # folds' predicted unit values stay inside the emulator's design (a toy property, not part of the flag)
+        raw["uncertainty"]["priors"]["base"]["range"] = [0.45, 0.55]
+        yaml.safe_dump(raw, open(sp, "w"), sort_keys=False)
+        signoff.sign(d, "lead", note="self-test")
+        try:
+            R = run(d, log=q, compute_kw={"max_workers": 2})
+            rows = list(csv.DictReader(open(os.path.join(d, "allocation_optimized.csv"))))
+            rep_ = yaml.safe_load(open(os.path.join(d, "uncertainty_report.yaml")))
+            jc_ = yaml.safe_load(open(os.path.join(d, "analysis", "joint_calibration.yaml")))["data"]
+            fl = {r["unit"]: r["calibration_flag"] for r in rows}
+            ok(fl.get("5") == "toy reason" and all(v == "" for k, v in fl.items() if k != "5")
+               and [x["unit"] for x in rep_.get("low_confidence_units") or []] == ["5"]
+               and [x["unit"] for x in jc_["unmatched_decision"]["flagged"]] == ["5"]
+               and R["point"]["per_unit"]["5"].get("calibration_flag") == "toy reason"
+               and "unmatched" in (rep_.get("low_confidence_note") or ""),
+               "JR8 with unmatched: flag, an unmatched unit proceeds into the batch and the allocation, flagged "
+               "low-confidence with its reason in the allocation file, the point, the uncertainty report and label")
+        except AnalysisBlocked as e:
+            ok(False, f"JR8 flag mode proceeds (blocked: {e})")
+    with tempfile.TemporaryDirectory() as d:     # W0-F: an unpredicted miss under conflicts.policy declare_and_test
+        sp = JC._toy_joint(d, unreachable="5", group=False)
+        raw = yaml.safe_load(open(sp))
+        raw["conflicts"] = {"policy": "declare_and_test"}
+        raw["uncertainty"]["priors"]["base"]["range"] = [0.45, 0.55]       # as JR8 (a toy property)
+        yaml.safe_dump(raw, open(sp, "w"), sort_keys=False)
+        signoff.sign(d, "lead", note="self-test")
+        try:
+            run(d, log=q, compute_kw={"max_workers": 2})
+            cf = yaml.safe_load(open(os.path.join(d, "analysis", "conflicts.yaml")))["data"]
+            dtx = yaml.safe_load(open(os.path.join(d, "analysis", "decision_tests.yaml")))["data"]["tests"]
+            ids = [t["test_id"] for t in dtx if t["test_id"].startswith("conflict_")]
+            ok([c["key"] for c in cf["declared"]] == ["5"] and len(ids) == 2 and cf["needs_owner"] == ["5"],
+               f"JR-CF1 an undeclared unit miss is held out, tested twice, the run completes, and a test that cannot run "
+               f"puts it to the owner ({[(c['key'], c['verdicts']) for c in cf['declared']]}, {ids})")
+        except AnalysisBlocked as e:
+            ok(False, f"JR-CF1 the policy declares the miss and the run continues (blocked: {e})")
+        raw["conflicts"] = {"policy": "stop"}
+        yaml.safe_dump(raw, open(sp, "w"), sort_keys=False)
+        os.remove(os.path.join(d, signoff.SPEC_SIGNOFF))
+        signoff.sign(d, "lead", note="self-test")
+        try:
+            run(d, log=q, compute_kw={"max_workers": 2})
+            ok(False, "JR-CF2 conflicts.policy stop keeps today's behaviour (the miss blocks)")
+        except AnalysisBlocked:
+            ok(True, "JR-CF2 conflicts.policy stop keeps today's behaviour (the miss blocks)")
+    with tempfile.TemporaryDirectory() as d:
+        JC._toy_joint(d)
+        signoff.sign(d, "lead", note="self-test")
+        R = run(d, log=q, compute_kw={"max_workers": 2})
+        A = R["_A"]
+        jp = R["uncertainty"].get("draw_provenance", {}).get("joint_calibration") or {}
+        rg = A.joint["ranges"]["base"]
+        ok(jp.get("draws") == 6 and R["calibration"].get("joint", {}).get("shared") == ["base"]
+           and abs(A.theta0["base"] - A.joint["best"]["base"]) < 1e-12,
+           f"JR2 a matched joint calibration: the point uses the region's best value and the draws are region rows "
+           f"(provenance {jp})")
+        prt = [t for t in R["decision_tests"] if t.get("test_id") == "prior_range_base"]
+        from toolkit.analysis import decision_tests as DT_
+        pt_ = [t for t in DT_.prior_range_tests(A) if t["parameter"] == "base"]
+        ok(len(prt) == 1 and prt[0].get("status") != "not_run" and len(pt_) == 1 and pt_[0]["values"] == rg
+           and pt_[0].get("joint"),
+           f"JR3 the jointly calibrated parameter's prior_range test runs at its region's ends ({pt_ and pt_[0]['values']}"
+           f" vs {rg})")
+        jz = yaml.safe_load(open(os.path.join(d, "analysis", "joint_calibration.yaml")))["data"]["best"]["z"]
+        pz = {i: v["z"] for i, v in R["point"]["per_unit"].items()}
+        smp = A.joint["sample"]
+        ok(pz == {i: float(v) for i, v in jz.items()} and any(n.startswith("z:") for n in smp["names"])
+           and jp.get("draws") == 6,
+           "JR6 (Codex r1 P1-2) the point uses the joint calibration's unit values and the draws its full rows (shared "
+           "values and unit values together), not a re-inversion of one target")
+        figs_ = yaml.safe_load(open(os.path.join(d, "analysis", "figures.yaml")))["data"]
+        names_ = {f["figure"] for f in figs_["figures"]}
+        ok({"calibration_unit_fit", "calibration_waves"} <= names_
+           and all(f["tier"] == "data_model" for f in figs_["figures"] if f["figure"].startswith("calibration_"))
+           and os.path.exists(os.path.join(d, "figures", "joint_calibration", "calibration_unit_fit.png")),
+           f"JR7 the calibration figures are drawn at the calibration step and listed in the figure manifest (data and "
+           f"model tier): {sorted(n for n in names_ if n.startswith('calibration_'))}")
+        ok(rg[0] >= 0.3 - 1e-9 and rg[1] <= 0.7 + 1e-9 and contract.gate_findings(d) == [],
+           f"JR4 the region lies inside the prior and the contract checks pass ({contract.gate_findings(d)})")
+        # F6 run 1, owner decision R1: a calibration-target test on the joint path moves the listed units' values
+        z0 = {i: v["z"] for i, v in R["calibration"]["units"].items()}
+        out0, ben0, cost0 = A.evaluate(A.theta0, z0)
+        plan = R["point"]["plan"]
+        listed = [i for i in A.ids if A.spec.unit_ids() and i in ("0", "3", "6")]
+        dt = {"id": "DTt", "type": "calibration_target", "text": "t",
+              "calibration_target": {"units": listed, "scale": 0.8}}     # inside the toy emulator's reach
+        rec = DT_.run_one(A, dt, z0, ben0, cost0, plan, R["uncertainty"], out0)
+        zc = (rec.get("calibration_target") or {}).get("units") or {}
+        moved = {i: zc[i]["z"] - z0[i] for i in listed if i in zc}
+        ok(rec.get("status") == "run" and len(moved) == len(listed) and all(v < -1e-6 for v in moved.values())
+           and set(zc) == set(listed) and rec["results"] and "objective" in rec["results"][0],
+           f"JR10 a calibration_target test on the joint path lowers the listed units' calibrated values when their "
+           f"targets are lowered, and re-solves the plan ({rec.get('status')}, {moved})")
+        # F6 run 2, owner decision (DT13): a package's burden at a ratio of its swapped counterpart's, emulator only
+        dto = {"id": "DTo", "type": "outcome_ratio", "text": "t",
+               "outcome_ratio": {"component": "a", "reference": "b", "values": [0.5]}}
+        sent_ = []
+        orig_ev = A.evaluate
+        A.evaluate = lambda *a_, **k_: (sent_.append(1), orig_ev(*a_, **k_))[1]
+        try:
+            ro = DT_.run_one(A, dto, z0, ben0, cost0, plan, R["uncertainty"], out0)
+        finally:
+            A.evaluate = orig_ev
+        o_ = A.primary
+        i0 = A.ids[0]
+        want = A.dfac * (out0[i0]["y"][A.comp][o_] - 0.5 * out0[i0]["y"]["b"][o_])
+        got = (ro.get("outcome_ratio") or {}).get("check", {}).get(i0)
+        ok(ro.get("status") == "run" and got is not None and abs(got - want) <= 1e-9 * max(1.0, abs(want))
+           and ro["results"] and not sent_ and (ro.get("outcome_ratio") or {}).get("pairs") == {"a": "b"},
+           f"JR11 an outcome_ratio test sets package a's burden to half of b's, re-solves the plan, and evaluates "
+           f"nothing anew ({ro.get('status')}, {got} vs {want}, {len(sent_)} evaluations)")
+        dto2 = dict(dto, outcome_ratio={"component": "a", "reference": "zz", "values": [0.5]})
+        ro2 = DT_.run_one(A, dto2, z0, ben0, cost0, plan, R["uncertainty"], out0)
+        ok(ro2.get("status") == "not_run", f"JR11b no counterpart package: not run ({ro2.get('status')})")
+        # #248 (Codex review of #245). P2-4: a package holding the component with no counterpart is disclosed (held,
+        # listed as missing_subtraction) and the test does not claim to cover it.
+        from types import SimpleNamespace as _NS
+        fa = _NS(pk={"none": set(), "a": {"a"}, "b": {"b"}, "ac": {"a", "c"}}, primary="dalys", ids=["u"], comp="none",
+                 dfac=1.0, point_events=[])
+        fo = {"u": {"y": {k: {"dalys": v} for k, v in (("none", 10.0), ("a", 6.0), ("b", 8.0), ("ac", 5.0))}}}
+        fb = {"u": {"none": 0.0, "a": 4.0, "b": 2.0, "ac": 5.0}}
+        fr = DT_._outcome_ratio(fa, dto, fo, fb, {}, {"u": "a"}, {"u": 0.0})
+        ok((fr.get("record") or {}).get("unpaired") == ["ac"] and fr.get("unpaired") == ["ac"]
+           and "without one" in fr.get("varied", "") and fr["cases"][0][1]["u"]["ac"] == 5.0,
+           f"JR11c (#248 P2-4) a package with no counterpart is held and disclosed ({fr.get('record')}, {fr.get('varied')})")
+        # P2-2 (fixed in #251): the re-solved plans are guarded with the point evaluation's model corrections
+        saved_pe = getattr(A, "point_events", None)
+        try:
+            A.point_events = [{"unit": A.ids[0], "package": "*", "kind": "reduction_clip"}]
+            try:
+                DT_.run_one(A, dto, z0, ben0, cost0, plan, R["uncertainty"], out0)
+                blocked_ = False
+            except AnalysisBlocked:
+                blocked_ = True
+            ok(blocked_, "JR11d (#248 P2-2) a point correction bearing on the re-solved plan stops an outcome_ratio test")
+        finally:
+            A.point_events = saved_pe
+        # P2-5: an outcome_ratio test cannot carry an engine departure (it holds the engine): refused, saying why
+        from toolkit.spec import preconditions as PC_
+        okd, why_ = PC_.decision_test_runs(_NS(raw={"analysis": {"decision_tests": [dto]}}), "DTo", {"components": ["a"]})
+        ok(not okd and "does not vary" in why_ and "outcome_ratio" in why_,
+           f"JR11f (#248 P2-5) an outcome_ratio test is refused as an engine-departure test, with why ({why_})")
+        # P3: results.md and the claims carry the tested ratios and the package pairs
+        txt_ = CL.results_template(A, R["point"], R["uncertainty"], R["stability"], R["sensitivity"], [dict(ro, path="p")],
+                                   R["calibration"], R["emulator_accuracy"])
+        ids_ = {c["id"] for c in CL.claim_spec(A, {k: "x" for k in ("point", "uncertainty", "stability", "decision_tests",
+                                                                   "calibration", "engine")}, R["point"],
+                                               R["uncertainty"], R["stability"], [ro], R["calibration"])}
+        ok("[CLAIM:dt.DTo.ratio0]" in txt_ and "dt.DTo.ratio0" in ids_ and "package pairs: a → b" in txt_,
+           f"JR11g (#248 P3) the results state each tested ratio (a claim) and the package pairs")
+        # Codex review of #253 P1: the value "engine" (#251: the base adjustment removed) is not a number; it is named in
+        # words, and only the numeric ratios are claims (a scalar claim of "engine" fails the ledger and the run)
+        roe = dict(ro, path="p", outcome_ratio=dict(ro.get("outcome_ratio") or {}, values=["engine", 0.5]))
+        txe = CL.results_template(A, R["point"], R["uncertainty"], R["stability"], R["sensitivity"], [roe],
+                                  R["calibration"], R["emulator_accuracy"])
+        cle = [c for c in CL.claim_spec(A, {k: "x" for k in ("point", "uncertainty", "stability", "decision_tests",
+                                                             "calibration", "engine")}, R["point"], R["uncertainty"],
+                                       R["stability"], [roe], R["calibration"]) if c["id"].startswith("dt.DTo.ratio")]
+        ok([c["id"] for c in cle] == ["dt.DTo.ratio1"] and "[CLAIM:dt.DTo.ratio1]" in txe
+           and "[CLAIM:dt.DTo.ratio0]" not in txe and "base adjustment removed" in txe,
+           f"JR11h (Codex #253 P1) \"engine\" is a case in words, the numeric ratios claims ({[c['id'] for c in cle]})")
+        _self_test_outcome_adjust(ok, A, z0, out0, ben0, cost0, plan, R)
+        saved_z = A.joint["z"].pop(listed[0])
+        try:
+            rec2 = DT_.run_one(A, dt, z0, ben0, cost0, plan, R["uncertainty"], out0)
+        finally:
+            A.joint["z"][listed[0]] = saved_z
+        ok(rec2.get("status") == "not_run" and "joint calibration" in (rec2.get("why") or rec2.get("statement") or ""),
+           f"JR10b a listed unit the joint calibration did not fit fails closed (not run): {rec2.get('status')}")
+    with tempfile.TemporaryDirectory() as d:
+        p = schema.toy_spec(d, n=24)
+        rows = list(csv.DictReader(open(os.path.join(d, "units.csv"))))
+        rows[3]["tgt"] = "0.9999"
+        with open(os.path.join(d, "units.csv"), "w", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=list(rows[0]))
+            w.writeheader()
+            w.writerows(rows)
+        signoff.sign(d, "lead", note="self-test")
+        try:
+            run(d, log=q, compute_kw={"max_workers": 2})
+            ok(False, "JR5 a clamped emulator inversion blocks at the calibration step")
+        except AnalysisBlocked as e:
+            ok(e.where == "calibration" and [h["unit"] for h in e.hits] == [rows[3]["id"]]
+               and not os.path.exists(os.path.join(d, "analysis", "point.yaml")),
+               f"JR5 a clamped emulator inversion blocks at the calibration step, before the point plan ({e.hits})")
+    _ = p
+
+
+def _self_test_boundary_engine(ok, R):
+    """F6 run 4, owner decision R3 (RIG-002): a boundary_engine decision test re-solves the plan with the boundary
+    check's engine benefits and costs in place of the emulator's at its units (stored engine rows, no new job)."""
+    from toolkit.analysis import decision_tests as DT_
+    A = R["_A"]
+    z0 = {i: R["point"]["per_unit"][i]["z"] for i in A.ids}
+    out0, ben0, cost0 = A.evaluate(A.theta0, z0)
+    plan = R["point"]["plan"]
+    dt = {"id": "DTb", "type": "boundary_engine", "text": "t", "finding": "emulator_boundary_ranking:emulator_boundary"}
+    be = getattr(A, "boundary_engine", None) or {}
+    sent = []
+    orig = A.evaluate
+    A.evaluate = lambda *a_, **k_: (sent.append(1), orig(*a_, **k_))[1]
+    try:
+        rec = DT_.run_one(A, dt, z0, ben0, cost0, plan, R["uncertainty"], out0)
+    finally:
+        A.evaluate = orig
+    units = (rec.get("boundary_engine") or {}).get("units") or []
+    ok(rec.get("status") == "run" and units and sorted(units) == sorted(be.get("ben") or {}) and not sent
+       and rec.get("finding") == "emulator_boundary_ranking:emulator_boundary",
+       f"BE-R1 a boundary_engine test re-solves with the boundary check's engine tables at its units, with no new "
+       f"evaluation, under the finding it is declared for ({rec.get('status')}, {len(units)} units, {len(sent)} evals)")
+    u = units[0] if units else None
+    ok(u is not None and all(rec["boundary_engine"]["benefit"][u][k] == be["ben"][u][k] for k in be["pairs"][u]),
+       "BE-R2 at a boundary unit the two compared packages take the engine side's benefit")
+    saved = A.boundary_engine
+    try:
+        del A.boundary_engine
+        rec2 = DT_.run_one(A, dt, z0, ben0, cost0, plan, R["uncertainty"], out0)
+    finally:
+        A.boundary_engine = saved
+    ok(rec2.get("status") == "not_run" and "boundary" in rec2.get("reason", ""),
+       f"BE-R3 without the boundary check's engine tables: not run, with why ({rec2.get('reason')})")
+    # Codex review of #252 (3 P1, 2 P2)
+    pair = (be.get("pairs") or {}).get(u) or ()
+    others = [k for k in A.pk if k not in pair]
+    chk = (rec.get("boundary_engine") or {}).get("benefit") or {}
+    ok(u is not None and len(pair) == 2 and all(chk[u][k] == be["ben"][u][k] for k in pair)
+       and all(chk[u][k] == ben0[u][k] for k in others),
+       "BE-R4 (P1-1, P1-2) only the chosen package and its runner-up take the engine side's benefit and cost at a "
+       "boundary unit; every other package keeps the point tables'")
+    from toolkit.analysis.core import AnalysisBlocked
+    saved_ev = getattr(A, "point_events", None)
+    try:
+        A.point_events = [{"unit": A.ids[0], "package": "*", "kind": "reduction_clip"}]
+        try:
+            DT_.run_one(A, dt, z0, ben0, cost0, plan, R["uncertainty"], out0)
+            blocked = False
+        except AnalysisBlocked:
+            blocked = True
+    finally:
+        A.point_events = saved_ev
+    ok(blocked, "BE-R5 (P1-3) the point evaluation's model corrections reach the re-solved plan's guard")
+    # Codex re-review of #252 (P1, P2): a correction on a substituted cell no longer bears on it; no record, not run
+    pu, (pc, _pr) = next(iter(be["pairs"].items()))
+    try:
+        A.point_events = [{"unit": pu, "package": pc, "kind": "reduction_clip"}]
+        try:
+            rec8 = DT_.run_one(A, dt, z0, ben0, cost0, plan, R["uncertainty"], out0)
+        except AnalysisBlocked as e:
+            rec8 = {"status": f"blocked {e}"}
+        del A.point_events
+        rec9 = DT_.run_one(A, dt, z0, ben0, cost0, plan, R["uncertainty"], out0)
+    finally:
+        A.point_events = saved_ev
+    ok(rec8.get("status") == "run", f"BE-R8 a point correction on a cell the engine replaces does not block ({rec8.get('status')})")
+    ok(rec9.get("status") == "not_run" and "corrections" in (rec9.get("reason") or ""),
+       f"BE-R9 without the point evaluation's recorded corrections: not run ({rec9.get('reason')})")
+    from toolkit.analysis import boundary as BD_
+    saved_be = A.boundary_engine
+    try:
+        BD_.run(A, {i: A.comp for i in A.ids}, z0, out0, ben0, cost0, None, R["_run_dir"] if "_run_dir" in R else ".",
+                log=lambda *a_: None)
+        cleared = getattr(A, "boundary_engine", "missing") is None
+    except Exception:  # noqa: BLE001
+        cleared = getattr(A, "boundary_engine", "missing") is None
+    finally:
+        A.boundary_engine = saved_be
+    ok(cleared, "BE-R6 (P2-4) a later boundary check with no candidates clears the earlier engine tables")
+    orig_solve = A.solve
+    A.solve = lambda *a_, **k_: (_ for _ in ()).throw(RuntimeError("optimizer status infeasible"))
+    try:
+        rec7 = DT_.run_one(A, dt, z0, ben0, cost0, plan, R["uncertainty"], out0)
+    except RuntimeError as e:
+        rec7 = {"status": f"raised {e}"}
+    finally:
+        A.solve = orig_solve
+    ok(rec7.get("status") == "not_run" and "infeasible" in (rec7.get("reason") or ""),
+       f"BE-R7 (P2-5) an infeasible re-solve is recorded as not run, with why ({rec7.get('status')})")
+
+
+def _self_test_outcome_adjust(ok, A, z0, out0, ben0, cost0, plan, R):
+    """F6 run 4, owner decision R3: base outcome adjustments in every evaluation (OA-R1..R6)."""
+    import copy
+    from toolkit.analysis import outcome_adjust as OA, decision_tests as DT_, boundary as BD
+    from toolkit.analysis.core import Analysis
+    from toolkit.spec import schema as SC
+    raw = copy.deepcopy(A.spec.raw)
+    raw["analysis"]["outcome_adjustments"] = [{"id": "OA1", "component": "a", "reference": "b", "value": 0.5,
+                                               "source": "toy trial"}]
+    sp = SC.Spec(raw, A.spec.base, getattr(A.spec, "path", None))
+    A2 = Analysis(sp, A.model, log=lambda *a_: None)
+    A2.joint, A2.theta0, A2.flagged = A.joint, dict(A.theta0), getattr(A, "flagged", {})
+    ok(A2.adjust and A2.adjust[0]["pairs"] == {"a": "b"} and not getattr(A, "adjust", None),
+       f"OA-R1 the spec's adjustment reaches the analysis, with its package pairs ({getattr(A2, 'adjust', None)})")
+    out2, ben2, _c = A2.evaluate(A2.theta0, z0)
+    i0 = A.ids[0]
+    ys = all(abs(out2[i]["y"]["a"][o] - 0.5 * out2[i]["y"]["b"][o]) <= 1e-9 * max(1.0, abs(out2[i]["y"]["b"][o]))
+             for i in A.ids for o in A.outcomes)
+    held = all(out2[i]["y"][k][o] == out0[i]["y"][k][o] for i in A.ids for k in A.pk if k != "a" for o in A.outcomes)
+    want = A.dfac * (out0[i0]["y"][A.comp][A.primary] - 0.5 * out0[i0]["y"]["b"][A.primary])
+    ok(ys and held and abs(ben2[i0]["a"] - want) <= 1e-9 * max(1.0, abs(want)),
+       "OA-R2 every reported outcome of package a is 0.5 x b's in the evaluation; every other package, the comparator "
+       "and the costs' inputs are as the model predicts; benefits follow")
+    saved_pred = A2.model.predict
+
+    def planted(zs, theta, ids, noise=None):
+        res = saved_pred(zs, theta, ids, noise=noise)
+        A2.model.last_events = [{"unit": ids[0], "package": "b", "kind": "reduction_clip"}]
+        return res
+    A2.model.predict = planted
+    try:
+        A2.evaluate(A2.theta0, z0)
+        evs = list(A2.last_events)
+    finally:
+        A2.model.predict = saved_pred
+        A2.model.last_events = []
+    ok({"unit": A.ids[0], "package": "a", "kind": "reduction_clip", "derived_from": "b"} in evs,
+       f"OA-R3 a model correction on the reference package also bears on the package derived from it ({evs})")
+    dte = {"id": "DTe", "type": "outcome_ratio", "text": "t",
+           "outcome_ratio": {"component": "a", "reference": "b", "values": ["engine", 0.5]}}
+    rec = DT_.run_one(A2, dte, z0, ben2, cost0, plan, R["uncertainty"], out2)
+    chk = (rec.get("outcome_ratio") or {}).get("check_by_value") or {}
+    eng_b = chk.get("engine", {}).get(i0)
+    ok(rec.get("status") == "run" and eng_b is not None and abs(eng_b - ben0[i0]["a"]) <= 1e-9 * max(1.0, abs(eng_b))
+       and A2.adjust and A2.adjust[0]["component"] == "a",
+       f"OA-R4 an outcome_ratio value \"engine\" re-evaluates with the component's base adjustment removed (the "
+       f"engine's own effect) and restores it ({rec.get('status')}, {eng_b} vs {ben0[i0]['a']})")
+    saved_ev = getattr(A2, "point_events", None)       # Codex re-review of #251 P1-2: numeric cases are guarded
+    try:
+        A2.point_events = [{"unit": A.ids[0], "package": "*", "kind": "reduction_clip"}]
+        try:
+            DT_.run_one(A2, dict(dte, outcome_ratio=dict(dte["outcome_ratio"], values=[0.5])), z0, ben2, cost0, plan,
+                        R["uncertainty"], out2)
+            blocked = False
+        except AnalysisBlocked:
+            blocked = True
+    finally:
+        A2.point_events = saved_ev
+    ok(blocked, "OA-R7 (re-review P1-2) a numeric outcome_ratio case is guarded with the point evaluation's corrections")
+    pk_run = BD.run_packages(A2, {"chosen": "a", "runner_up": "none"})
+    ok("b" in pk_run, f"OA-R5 the boundary check runs the counterpart of an adjusted package on the engine ({pk_run})")
+    ok(OA.record(A2.adjust)[0]["value"] == 0.5 and OA.record(A2.adjust)[0]["pairs"] == {"a": "b"},
+       "OA-R6 the adjustments are recorded (id, component, reference, value, source, pairs)")
+
+
+
+def _self_test_stability_flagged(ok):
+    """Codex r6 P1-3, P2: a flagged unit informs neither the held-out prediction nor the covariate scaling; a fold
+    without enough unflagged training units is reported not_run, and the metrics are computed without it."""
+    from toolkit.analysis import stability as SB
+    from toolkit.analysis.core import CostTable
+
+    def ct(ids):        # F6 S1-5: costs carry their split by component
+        return CostTable({i: [1.0, 2.0] for i in ids}, {i: [{}, {"c": 2.0}] for i in ids})
+
+    class _A:
+        method, theta0, region, budget = "emulator_inversion", {}, None, 10.0
+        pk, alloc = {0: frozenset(), 1: frozenset({"c"})}, {"units": {"populations": {"total": "pop"}}}
+
+        def __init__(self, ids, xs, flagged):
+            self.ids = list(ids)
+            self.by_id = {i: {"g": f"g{n % 3}", "x": xs[i], "pop": 1.0} for n, i in enumerate(ids)}
+            self.spec = {"analysis": {"stability": {"holdout_group": "g", "covariates": ["x"]}},
+                         "options": {"components": {"c": {}}}, "calibration": {"range": [-1e6, 1e6]}}
+            self.flagged, self.seen = flagged, {}
+
+        def evaluate(self, theta, zh, hid):
+            self.seen.update({i: zh[i] for i in hid})
+            return {}, {i: [1.0 + zh[i], 0.5] for i in hid}, ct(hid)
+
+        def solve(self, ben, cost):
+            return {"choice": {i: 0 for i in self.ids}, "objective": sum(ben[i][0] for i in self.ids)}
+
+        def guard(self, *a):
+            pass
+    ids = [f"u{k}" for k in range(12)]
+    xs = {i: float(k) for k, i in enumerate(ids)}
+    z0 = {i: 0.1 * k for k, i in enumerate(ids)}
+    ben = {i: [1.0, 0.5] for i in ids}
+    cost = ct(ids)
+    plan = {i: 0 for i in ids}
+    xs_out = dict(xs, u11=1000.0)
+    with_flag = _A(ids, xs_out, {"u11": {"reason": "toy"}})
+    SB.run(with_flag, dict(z0, u11=9.0), plan, ben, cost, plan)
+    keep = [i for i in ids if i != "u11"]
+    without = _A(keep, xs, {})
+    without.by_id = {i: with_flag.by_id[i] for i in keep}
+    SB.run(without, z0, plan, ben, cost, plan)
+    common = [i for i in without.seen if i in with_flag.seen]
+    ok(common and all(abs(with_flag.seen[i] - without.seen[i]) < 1e-9 for i in common),
+       "JR9a a flagged unit with an extreme covariate leaves every held-out prediction unchanged")
+    allf = _A(ids, xs, {i: {"reason": "toy"} for i in ids})
+    try:
+        r = SB.run(allf, z0, plan, ben, cost, plan)
+        ok(r["n_folds"] == 0 and len(r["folds_not_run"]) == 3 and r["value_verdict"] == "NOT_RUN"
+           and r["verdict"] == "NOT_RUN",
+           f"JR9b folds without unflagged training units are not_run and the metrics skip them ({r['verdict']})")
+    except Exception as e:  # noqa: BLE001
+        ok(False, f"JR9b folds without unflagged training units are not_run ({type(e).__name__}: {e})")
+    # 1C-b 2c-i (STAB_CLAMP): a held-out prediction outside calibration.range is clamped to it and counted
+    far = _A(ids, dict(xs, u11=1000.0), {})
+    far.spec["calibration"] = {"range": [0.0, 1.5]}
+    try:
+        r = SB.run(far, z0, plan, ben, cost, plan)
+        ok(max(far.seen.values()) <= 1.5 and min(far.seen.values()) >= 0.0 and r.get("predictions_clamped", 0) >= 1
+           and sum(f.get("predictions_clamped", 0) for f in r["folds"]) == r.get("predictions_clamped"),
+           f"JR9c a held-out prediction outside calibration.range is clamped and counted "
+           f"({r.get('predictions_clamped')} clamped; largest evaluated {max(far.seen.values()):.3g})")
+    except Exception as e:  # noqa: BLE001
+        ok(False, f"JR9c a held-out prediction outside calibration.range is clamped ({type(e).__name__}: {e})")
+    # 1C-b 2c-ii: a fold whose refit is refused is not_run with the refusal's code; the other folds still run
+    lik = _A(ids, xs, {})
+    lik.method, lik.lik = "likelihood", {"x": {}, "params": [], "z": {}}
+    lik.evaluate = lambda theta, zh, hid=None: ({}, {i: [1.0, 0.5] for i in ids}, ct(ids))
+    saved = SB.C.read_targets, SB.C.fit_likelihood
+
+    def fit(spec, model, rows=None, fixed_z=None, **kw):
+        if "u0" in fixed_z:
+            raise SB.C.CalibrationRefused("calibration_ridge", "toy: the fold's fit is refused")
+        return {"theta": {}, "z": {i: z0[i] for i in ids if i not in fixed_z}}
+    lik.model = None
+    try:
+        SB.C.read_targets, SB.C.fit_likelihood = (lambda spec: [{"unit": i} for i in ids]), fit
+        r = SB.run(lik, z0, plan, ben, cost, plan)
+        nr = r["folds_not_run"]
+        ok(r["n_folds"] == 2 and len(nr) == 1 and nr[0]["group"] == "g0" and "calibration_ridge" in nr[0]["reason"],
+           f"JR9d a fold whose calibration is refused is not_run with the reason; the other folds run ({nr})")
+    except Exception as e:  # noqa: BLE001
+        ok(False, f"JR9d a fold whose calibration is refused is not_run ({type(e).__name__}: {e})")
+    finally:
+        SB.C.read_targets, SB.C.fit_likelihood = saved
+    # 1C-c (D3): a fold whose re-solve fails is not_run with the solver's status; the other folds run
+    from toolkit.analysis import core as CO
+    flaky, n_ = _A(ids, xs, {}), {"k": 0}
+
+    def solve1(ben_, cost_):
+        n_["k"] += 1
+        if n_["k"] == 1:
+            raise CO.SolveFailed("feasible", 0.5)
+        return {"choice": {i: 0 for i in ids}, "objective": sum(ben_[i][0] for i in ids)}
+    try:
+        flaky.solve = solve1
+        r = SB.run(flaky, z0, plan, ben, cost, plan)
+        nr = r["folds_not_run"]
+        ok(r["n_folds"] == 2 and len(nr) == 1 and "optimizer status feasible" in nr[0]["reason"],
+           f"JR9f a fold whose re-solve is not proven within the gap is not_run with the solver's status ({nr})")
+    except Exception as e:  # noqa: BLE001
+        ok(False, f"JR9f a fold whose re-solve fails is not_run ({type(e).__name__}: {e})")
+    # Codex r1 P1-2: a fold the solver proves infeasible still stops the step, as before
+    def none_fits(ben_, cost_):
+        raise CO.SolveFailed("infeasible")
+    try:
+        flaky.solve = none_fits
+        SB.run(flaky, z0, plan, ben, cost, plan)
+        ok(False, "JR9g a fold the solver proves infeasible still stops the stability step")
+    except RuntimeError as e:
+        ok(str(e) == "optimizer status infeasible", f"JR9g a fold the solver proves infeasible still stops the step ({e})")
+    # 1C-b 2d-iii: quantiles of a sample with a non-finite value are refused (were all NaN)
+    from toolkit.analysis.core import q as _q
+    try:
+        ok(False, f"JR9e quantiles of a sample with a non-finite value are refused: {_q([1.0, float('nan'), 3.0])}")
+    except ValueError as e:
+        ok("not finite" in str(e) and _q([1.0, 2.0, 3.0])["median"] == 2.0 and _q([]) is None,
+           f"JR9e quantiles of a sample with a non-finite value are refused ({e})")
+
+
+def _self_test_priors(ok, q):
+    """v2 priors on the emulator path: an engine-card prior (a DALY weight) and a scenario parameter with a spec range
+    enter the design, are drawn, get prior_range tests and are named in the label; correlated emulator error."""
+    import tempfile
+    import yaml
+    from toolkit.analysis import contract
+    from toolkit.spec import priors as PRI
+    with tempfile.TemporaryDirectory() as d:
+        pp = PRI.toy_priors_file(d)
+        p = schema.toy_spec(d, n=24)
+        r = yaml.safe_load(open(p))
+        from toolkit import import_guard as _G  # an unregistered toy, registered for this self-test only
+        _G.register_test_engine("toolkit.spec.priors:ToyPriorEngine")
+        r["engine"] = {"ref": "toolkit.spec.priors:ToyPriorEngine", "config": {"priors_path": pp}}
+        r["uncertainty"]["sources"].append({"kind": "emulator"})
+        r["uncertainty"]["excluded"] = [{"kind": "costs", "reason": "toy"}]
+        r["uncertainty"]["priors"] = {"synergy": {"dist": "uniform", "range": [-0.05, 0.1], "source": "toy spec range"}}
+        r["analysis"]["decision_tests"] = []
+        yaml.safe_dump(r, open(p, "w"), sort_keys=False)
+        signoff.sign(d, "lead", note="self-test")
+        R = run(d, log=q, compute_kw={"max_workers": 2})
+        M = R["_model"]
+        design = json.load(open(os.path.join(d, "analysis", "batch", "design.json")))
+        ok(design["prior_names"] == ["dw", "synergy"] and M.input_names[:5] == ["z", "eff_a", "eff_b", "dw", "synergy"]
+           and all(0.005 <= pt["theta"]["dw"] <= 0.02 for pt in design["points"]),
+           f"RP1 drawn priors enter the emulator design over their declared ranges: {M.input_names}")
+        u = R["uncertainty"]
+        ok("priors" in u["covers"] and "set by declared ranges, not by data: dw, synergy" in u["label"]
+           and "held fixed: 2 engine parameters" in u["label"], f"RP2 the label names the priors and what is fixed: "
+                                                                f"{u['label']}")
+        rep = yaml.safe_load(open(os.path.join(d, "uncertainty_report.yaml")))
+        dws = rep["parameter_samples"]["dw"]
+        ok(set(rep["sources_drawn"]) == {"engine_parameters", "calibration", "emulator", "priors"}
+           and [x["kind"] for x in rep["sources_not_drawn"]] == ["costs"]
+           and {x["name"] for x in rep["parameters_fixed"]} == {"base", "k"}
+           and all(x["reason"] for x in rep["parameters_fixed"]) and 0.005 <= dws["ci_low"] < dws["ci_high"] <= 0.02,
+           f"RP3 the report lists every source and every fixed parameter with why, and the priors vary: {dws}")
+        em = rep["emulator_error"]
+        ok(em and em["holdout_points"] >= 3 and em["sd_common_median"] > 0 and "population-mean" in em["model"],
+           f"RP4 the emulator-error model and its held-out evidence are in the report: {em and em['sd_common_median']}")
+        prt = {x["test_id"]: x for x in R["decision_tests"]}
+        t = prt.get("prior_range_dw")
+        ok({k for k in prt if k.startswith("prior_range_")} == {"prior_range_dw", "prior_range_synergy"}
+           and t["automatic"] and t["status"] == "run"
+           and [x["value"] for x in t["results"]] == [0.005, 0.02]
+           and t["results"][0]["point_plan_objective_under_test"] < t["results"][1]["point_plan_objective_under_test"]
+           and os.path.exists(os.path.join(d, t["path"])),
+           "RP5 every drawn prior gets an automatic prior_range test; the DALY-weight ends move the objective")
+        ok(contract.gate_findings(d) == [], f"RP6 the contract checks pass with priors: {contract.gate_findings(d)}")
+        from toolkit.analysis import decision_tests as DTm
+        A = R["_A"]
+        z0 = {i: v["z"] for i, v in R["calibration"]["units"].items()}
+        out0, ben0, cost0 = A.evaluate(A.theta0, z0)
+        plan0 = R["point"]["plan"]
+        orig_cal = A.calibrate
+        A.calibrate = lambda th, shifts=None, ids=None: {i: (z, True) for i, (z, _c) in orig_cal(th, shifts, ids).items()}
+        try:
+            rec = DTm.run_one(A, DTm.prior_range_tests(A)[0], z0, ben0, cost0, plan0, R["uncertainty"], out0)
+        finally:
+            A.calibrate = orig_cal
+        ok(all(x.get("calibration_clamped_units") == len(A.ids) for x in rec["results"])
+           and "calibration clamped" in rec["statement"],
+           f"RP8 an end whose calibration clamps is flagged in the result and its statement (Codex r1 P1-3): "
+           f"{rec['statement']}")
+        err = M.error
+        npk = len(M.packages) - 1
+        red = [c for c in (err.cols if err else []) if len(c) == 3]
+        ok(err is not None and len(red) == len(M.pops) * len(M.outcomes) * npk and {c[1] for c in red} == set(M.outcomes)
+           and {c for c in err.cols if c[:2] == ("emu", "base")} == {("emu", "base", P, o) for P in M.pops
+                                                                    for o in M.outcomes}
+           and {c for c in err.cols if c[:2] == ("emu", "cost")} == {("emu", "cost", n, k) for n in M.cost_outputs
+                                                                    for k in M.packages},
+           f"RP9 each outcome gets its own held-out residual column, so one outcome's bias is not applied to another "
+           f"(Codex r2 P1), and the comparator burden and cost outputs have theirs (F6 S2-4): {err and len(err.cols)} "
+           "columns")
+        ok(em["columns_by_quantity"].get("comparator") == len(M.pops) * len(M.outcomes)
+           and "emulator_error_floors" in u and "counts" in (u.get("emulator_error_clips") or {}),
+           f"RP9b the report counts the error columns by quantity and the uncertainty records cost floors (F6 S2-4): "
+           f"{em['columns_by_quantity']}")
+        design.pop("prior_names")
+        try:
+            EmulatorModel(schema.load(p), design, {}, log=q)
+            ok(False, "RP7 a design that lacks a drawn prior is refused, naming it")
+        except ValueError as e:
+            ok("['dw', 'synergy']" in str(e) and "must enter the design" in str(e),
+               f"RP7 a design that lacks a drawn prior is refused, naming it: {e}")
+        # a parameter_value test outside the design box: before this, the emulator extrapolated and the guard blocked
+        # the whole analysis; now the value is refused (not_run, with why) and the run completes
+        rec = DTm.run_one(A, {"id": "DTx", "type": "parameter_value", "parameter": "dw", "values": [0.001],
+                              "text": "t"}, z0, ben0, cost0, plan0, R["uncertainty"], out0)
+        ok(rec["status"] == "not_run" and "outside the emulator design" in rec["reason"],
+           f"RP11 a parameter_value test value outside the emulator design box is refused, not extrapolated: {rec}")
+    _self_test_test_ranges(ok, q)
+    _self_test_posterior_ranges(ok, q)
+
+
+def _self_test_posterior_ranges(ok, q):
+    """RNP1-RNP2 (f6-posterior-ranges): a toy run whose spec names a net-effect posterior whose hull exceeds the fitted
+    ranges completes; the design box, the draws, the manifest and the uncertainty report all carry the hull."""
+    import hashlib
+    import tempfile
+    import numpy as np
+    import yaml
+    from toolkit.engines import effect_fit as EF
+    with tempfile.TemporaryDirectory() as d:
+        p = schema.toy_spec(d, n=24)
+        u = [float(v) for v in np.random.default_rng(4).uniform(0, 1, 24)]
+        rows = [{"eff_a": round(0.25 + 0.5 * x, 6), "eff_b": round(0.15 + 0.3 * (1 - x), 6)} for x in u]
+        EF._fixture_placeholder(os.path.join(d, "nef.yaml"), schema.load(p).engine(), rows,
+                                {"eff_a": [0, 1], "eff_b": [0, 1]}, point={"eff_a": 0.433, "eff_b": 0.288})
+        hull = {k: [min(r[k] for r in rows), max(r[k] for r in rows)] for k in ("eff_a", "eff_b")}
+        sha = hashlib.sha256(open(os.path.join(d, "nef.yaml"), "rb").read()).hexdigest()
+        r = yaml.safe_load(open(p))
+        r["uncertainty"]["net_effect_posterior"] = {"path": "nef.yaml", "sha256": sha}
+        yaml.safe_dump(r, open(p, "w"), sort_keys=False)
+        signoff.sign(d, "lead", note="self-test")
+        try:
+            run(d, log=q, compute_kw={"max_workers": 2})
+        except Exception as e:  # noqa: BLE001
+            ok(False, f"RNP1 a run with a posterior beyond the fitted ranges completes: {type(e).__name__}: {str(e)[:300]}")
+            return
+        design = json.load(open(os.path.join(d, "analysis", "batch", "design.json")))
+        man = json.load(open(os.path.join(d, "analysis", "manifest.json")))
+        unc = yaml.safe_load(open(os.path.join(d, "analysis", "uncertainty.yaml")))
+        rep = yaml.safe_load(open(os.path.join(d, "uncertainty_report.yaml")))
+        want = {"sha256": sha, "range_source": "posterior_hull", "margin": 0.0, "ranges": hull}
+        ok(design.get("design_ranges") == hull and design.get("posterior_ranges") == want
+           and man["engine"].get("net_effect_posterior_ranges") == want
+           and {k: unc["data"]["net_effect_posterior"][k] for k in want} == want
+           and rep.get("net_effect_posterior_ranges") == want,
+           f"RNP1 the design box is the posterior's hull, and the manifest, the uncertainty artifact and the uncertainty "
+           f"report say the ranges came from the posterior with its sha256: "
+           f"{man['engine'].get('net_effect_posterior_ranges')}")
+        s = rep["parameter_samples"]["eff_a"]
+        ok(hull["eff_a"][0] <= s["ci_low"] < s["ci_high"] <= hull["eff_a"][1],
+           f"RNP2 the draws of a posterior column stay inside its hull: {s}")
+        ok(man["engine"].get("point_source") == {"eff_a": "posterior_chosen_point", "eff_b": "posterior_chosen_point"}
+           and man["engine"].get("posterior_point") == {"eff_a": 0.433, "eff_b": 0.288},
+           f"RNP3 (v2-posterior-point) the manifest records each posterior column's point source and the fit's chosen "
+           f"point: {man['engine'].get('point_source')} {man['engine'].get('posterior_point')}")
+    _self_test_posterior_point(ok)
+
+
+def _self_test_posterior_point(ok):
+    """RPP1-RPP5 (v2-posterior-point): with a declared net-effect posterior, the fit's verified chosen point is the point
+    value of every posterior column, in the analysis (core.Analysis.theta0) and in the joint calibration's held values
+    (joint_calibration.theta0) alike; a spec value that differs from it is refused, and a fit without a chosen point
+    fails closed. Without the field nothing changes. No engine runs: the analysis is only constructed."""
+    import hashlib
+    import tempfile
+    import numpy as np
+    import yaml
+    from toolkit.analysis import joint_calibration as JC
+    from toolkit.engines import effect_fit as EF
+    u = [float(v) for v in np.random.default_rng(5).uniform(0, 1, 24)]
+    rows = [{"eff_a": round(0.3 + 0.4 * x, 6), "eff_b": round(0.12 + 0.3 * (1 - x), 6), "synergy": round(0.2 * x, 6)}
+            for x in u]
+    chosen = {"eff_a": 0.41, "eff_b": 0.27, "synergy": 0.05}
+
+    def setup(d, point=None, spec_value=None, posterior=True):
+        """The toy spec; with `spec_value`, synergy is a spec engine parameter drawn over a range and a posterior
+        column too (without, the posterior holds the two fitted columns)."""
+        p = schema.toy_spec(d, n=24)
+        r = yaml.safe_load(open(p))
+        cols = ["eff_a", "eff_b"] + (["synergy"] if spec_value is not None else [])
+        if spec_value is not None:
+            r["engine_parameters"] = {"synergy": {"value": spec_value, "range": [0.0, 0.2], "dist": "uniform",
+                                                  "source": "self-test", "reason": "self-test",
+                                                  "basis": "owner_judgement"}}
+            r["uncertainty"]["excluded"] = [x for x in r["uncertainty"]["excluded"] if x.get("parameter") != "synergy"]
+        if posterior:
+            EF._fixture_placeholder(os.path.join(d, "nef.yaml"), schema.load(p).engine(),
+                                    [{k: x[k] for k in cols} for x in rows], {k: [0, 1] for k in cols},
+                                    point={k: chosen[k] for k in cols} if point is None else point)
+            sha = hashlib.sha256(open(os.path.join(d, "nef.yaml"), "rb").read()).hexdigest()
+            r["uncertainty"]["net_effect_posterior"] = {"path": "nef.yaml", "sha256": sha}
+        yaml.safe_dump(r, open(p, "w"), sort_keys=False)
+        return schema.load(p)
+
+    def both(spec):
+        out = []
+        for f in (lambda: Analysis(spec, None, log=lambda *a, **k: None).theta0, lambda: JC.theta0(spec)):
+            try:
+                out.append(f())
+            except Exception as e:  # noqa: BLE001 -- a failing case, not a crash of the self-test
+                out.append(f"{type(e).__name__}: {e}")
+        return out
+    with tempfile.TemporaryDirectory() as d:
+        a0, j0 = both(setup(d, posterior=False, spec_value=0.07))
+        ok(isinstance(a0, dict) and a0 == j0 and (a0["eff_a"], a0["eff_b"], a0["synergy"]) == (0.5, 0.3, 0.07),
+           f"RPP1 without a posterior the point values are unchanged (fitted values, the spec value): {a0} {j0}")
+    with tempfile.TemporaryDirectory() as d:
+        a1, j1 = both(setup(d))
+        ok(isinstance(a1, dict) and isinstance(j1, dict) and (a1["eff_a"], a1["eff_b"]) == (0.41, 0.27)
+           and a1 == j1,
+           f"RPP2 with a posterior every posterior column's point value is the fit's chosen point, in the analysis and "
+           f"the joint calibration alike: {a1} {j1}")
+    with tempfile.TemporaryDirectory() as d:
+        a2, j2 = both(setup(d, spec_value=0.12))
+        ok(all(isinstance(x, str) and "synergy" in x and "chosen point" in x for x in (a2, j2)),
+           f"RPP3 a spec engine_parameters value of a posterior column that differs from the chosen point is refused: "
+           f"{str(a2)[:160]} | {str(j2)[:80]}")
+    with tempfile.TemporaryDirectory() as d:
+        a3, _ = both(setup(d, spec_value=chosen["synergy"]))
+        ok(isinstance(a3, dict) and {k: a3[k] for k in chosen} == chosen,
+           f"RPP4 a spec value equal to the chosen point is accepted: {a3}")
+    with tempfile.TemporaryDirectory() as d:
+        a3b, j3b = both(setup(d, spec_value=chosen["synergy"] + 4e-7))     # within the 6-decimal rounding of a fit file
+        ok(isinstance(a3b, dict) and a3b == j3b and a3b["synergy"] == chosen["synergy"],
+           f"RPP4b a spec value equal to the chosen point within rounding is accepted, at the chosen point: {a3b}")
+    with tempfile.TemporaryDirectory() as d:
+        a4, j4 = both(setup(d, point=False))
+        ok(all(isinstance(x, str) and "chosen point" in x for x in (a4, j4)),
+           f"RPP5 a posterior file without a verified chosen point fails closed: {str(a4)[:160]} | {str(j4)[:80]}")
+    with tempfile.TemporaryDirectory() as d:     # the sign-off precondition's pre-run point (decision_tests)
+        s6 = setup(d)
+        p6 = DT.prerun_evidence(s6)["point"]
+        ok((p6["eff_a"], p6["eff_b"]) == (0.41, 0.27) and p6 == JC.theta0(s6),
+           f"RPP6 the pre-run evidence the sign-off checks read has the same point as the analysis: {p6}")
+    # Codex r1 P1-2: an interaction_rescale test reads arm ratios computed at the chosen point by the harness step
+    # (analysis/benchmarks_at_spec_values), and is not run without them or with arms computed at another point
+    from toolkit.spec import engine_parameters as PV
+    with tempfile.TemporaryDirectory() as d:
+        bench = _toy_bench(d)[0]
+        p9 = schema.toy_spec(d, n=12, bench=bench)
+        r9 = yaml.safe_load(open(p9))
+        EF._fixture_placeholder(os.path.join(d, "nef.yaml"), schema.load(p9).engine(), [
+            {k: x[k] for k in ("eff_a", "eff_b")} for x in rows], {"eff_a": [0, 1], "eff_b": [0, 1]},
+            point={"eff_a": 0.41, "eff_b": 0.27})
+        r9["uncertainty"]["net_effect_posterior"] = {
+            "path": "nef.yaml", "sha256": hashlib.sha256(open(os.path.join(d, "nef.yaml"), "rb").read()).hexdigest()}
+        yaml.safe_dump(r9, open(p9, "w"), sort_keys=False)
+        s9 = schema.load(p9)
+        before = DT.interaction_arms(s9, s9.engine(), "T2")
+        PV.write_spec_benchmarks(d, _toy_pack())
+        rec = json.load(open(os.path.join(d, PV.SPEC_BENCH_RECORD)))
+        after = DT.interaction_arms(s9, s9.engine(), "T2")
+        rec_point = rec.get("posterior_point")
+        rec["posterior_point"] = {"eff_a": 0.5, "eff_b": 0.3}           # arms recorded at another point
+        json.dump(rec, open(os.path.join(d, PV.SPEC_BENCH_RECORD), "w"))
+        other = DT.interaction_arms(s9, s9.engine(), "T2")
+        # Codex r4: the ratios are the chosen point's (not the defaults'); the file's own point is checked too; a
+        # caller's `fitted` entry never overrides a posterior column
+        dflt = yaml.safe_load(open(bench))["benchmarks"][0]["arm_or"][0]["a10"]
+        rec["posterior_point"] = rec_point
+        json.dump(rec, open(os.path.join(d, PV.SPEC_BENCH_RECORD), "w"))
+        bp = os.path.join(d, PV.SPEC_BENCH)
+        bd = yaml.safe_load(open(bp))
+        yaml.safe_dump(dict(bd, posterior_point={"eff_a": 0.5, "eff_b": 0.3}), open(bp, "w"), sort_keys=False)
+        rec["sha256"] = hashlib.sha256(open(bp, "rb").read()).hexdigest()
+        json.dump(rec, open(os.path.join(d, PV.SPEC_BENCH_RECORD), "w"))
+        filept = DT.interaction_arms(s9, s9.engine(), "T2")
+        sb = PV.spec_benchmarks(_toy_pack(), s9.engine(), s9, fitted={"eff_a": 0.6})
+        ok("not_run" in before and rec_point == {"eff_a": 0.41, "eff_b": 0.27} and "arm" in after
+           and abs(after["arm"]["a10"] - dflt) > 1e-3 and "chosen point" in filept.get("not_run", "")
+           and abs(sb["benchmarks"][0]["arm_or"][0]["a10"] - after["arm"]["a10"]) < 1e-9
+           and PV.SPEC_BENCH in after["src"] and "chosen point" in other.get("not_run", ""),
+           f"RPP9 with a posterior an interaction test runs on arms the harness step computed at the chosen point, and "
+           f"is not run without them or on arms from another point: {before} | {after.get('src')} | {other}")
+    # Codex r1 P1-5: the conflict tolerance is the fit's 6-decimal rounding, whatever the value's magnitude
+    import types
+    from toolkit.engines import hooks as _hooks
+    big = types.SimpleNamespace(raw={"engine_parameters": {"h": {"value": 1000.0004}}})
+    try:
+        _hooks.external_posterior_point(big, {"point": {"h": 1000.0}}, {})
+        w7 = "accepted"
+    except ValueError as e:
+        w7 = str(e)
+    ok("chosen point" in w7, f"RPP7 a spec value 4e-4 from a chosen point of 1000 is refused: {w7[:120]}")
+    # Codex r1 P1-6: a declared but empty net_effect_posterior is refused, never read as no posterior
+    with tempfile.TemporaryDirectory() as d:
+        s8 = setup(d, posterior=False)
+        s8.raw["uncertainty"]["net_effect_posterior"] = None
+        a8, j8 = both(s8)
+        ok(all(isinstance(x, str) and "net_effect_posterior" in x for x in (a8, j8)),
+           f"RPP8 an empty uncertainty.net_effect_posterior is refused: {str(a8)[:120]}")
+    # Codex r1 P1-4, r2 P1-1/P1-2: a chosen point that is not exactly the fit's recorded parameter values (a different
+    # value, a value within 1e-6, NaN), or that holds a coordinate the sample does not, is refused
+    def edited(d, edit):
+        s = setup(d)
+        f = os.path.join(d, "nef.yaml")
+        doc = yaml.safe_load(open(f))
+        edit(doc)
+        yaml.safe_dump(doc, open(f, "w"), sort_keys=False)
+        r = yaml.safe_load(open(os.path.join(d, "decision_spec.yaml")))
+        r["uncertainty"]["net_effect_posterior"]["sha256"] = hashlib.sha256(open(f, "rb").read()).hexdigest()
+        yaml.safe_dump(r, open(os.path.join(d, "decision_spec.yaml"), "w"), sort_keys=False)
+        return both(schema.load(os.path.join(d, "decision_spec.yaml")))[0], s
+    got10 = {}
+    for label, val in (("0.45", 0.45), ("0.409999", 0.409999), ("nan", float("nan"))):
+        with tempfile.TemporaryDirectory() as d:
+            got10[label] = edited(d, lambda doc: doc["parameters"]["eff_a"].update(value=val))[0]
+    ok(all(isinstance(x, str) and "parameters" in x and "eff_a" in x for x in got10.values()),
+       f"RPP10 a chosen point that is not exactly the fit's recorded parameter values is refused: "
+       f"{ {k: str(v)[:60] for k, v in got10.items()} }")
+    with tempfile.TemporaryDirectory() as d:
+        def extra(doc):
+            doc["joint_region"]["verified"]["chosen"]["point"]["synergy"] = 0.19
+            doc["parameters"]["synergy"] = {"value": 0.19}
+        a12, _ = edited(d, extra)
+        ok(isinstance(a12, str) and "synergy" in a12,
+           f"RPP12 a chosen point with a coordinate the sample does not hold is refused: {str(a12)[:160]}")
+    with tempfile.TemporaryDirectory() as d:
+        a13, _ = both(setup(d, spec_value=0.049999))           # exactly 1e-6 from the chosen 0.05
+        ok(isinstance(a13, dict) and a13["synergy"] == 0.05,
+           f"RPP13 a spec value exactly 1e-6 from the chosen point is accepted (float subtraction): {str(a13)[:120]}")
+    # Codex r1 P1-1: the likelihood and posterior calibrations build engine parameters without theta0, so they could
+    # not run at the chosen point: refused with a posterior rather than run at engine defaults
+    got11 = {}
+    for meth in ("likelihood", "posterior"):
+        with tempfile.TemporaryDirectory() as d:
+            s11 = setup(d)
+            s11.raw["calibration"]["method"] = meth
+            got11[meth] = both(s11)
+    ok(all(isinstance(x, str) and "calibration.method" in x for v in got11.values() for x in v),
+       f"RPP11 a posterior with a likelihood or posterior calibration is refused: "
+       f"{ {k: str(v[0])[:80] for k, v in got11.items()} }")
+    # Codex r3: a recorded parameter the sample does not hold is refused; the 1e-6 tolerance is not widened
+    with tempfile.TemporaryDirectory() as d:
+        a14, _ = edited(d, lambda doc: doc["parameters"].update(synergy={"value": 0.19}))
+        ok(isinstance(a14, str) and "synergy" in a14,
+           f"RPP14 a fit recording a parameter its sample and chosen point do not hold is refused: {str(a14)[:160]}")
+    with tempfile.TemporaryDirectory() as d:
+        a15, _ = both(setup(d, spec_value=0.0500010000005))
+        ok(isinstance(a15, str) and "chosen point" in a15,
+           f"RPP15 a spec value more than 1e-6 from the chosen point is refused: {str(a15)[:120]}")
+
+
+def _self_test_test_ranges(ok, q):
+    """A parameter_value decision test on a drawn prior at a value outside its declared range: the emulator design box
+    spans the test's values too (the draws stay inside the declared range), so the test is evaluated inside the design
+    and the run completes."""
+    import copy
+    import tempfile
+    import yaml
+    from toolkit.spec import priors as PRI
+    with tempfile.TemporaryDirectory() as d:
+        pp = PRI.toy_priors_file(d)
+        p = schema.toy_spec(d, n=24)
+        r = yaml.safe_load(open(p))
+        from toolkit import import_guard as _G  # an unregistered toy, registered for this self-test only
+        _G.register_test_engine("toolkit.spec.priors:ToyPriorEngine")
+        r["engine"] = {"ref": "toolkit.spec.priors:ToyPriorEngine", "config": {"priors_path": pp}}
+        r["uncertainty"]["sources"].append({"kind": "emulator"})
+        r["uncertainty"]["excluded"] = [{"kind": "costs", "reason": "toy"},
+                                        {"parameter": "synergy", "reason": "toy: no interaction assumed"}]
+        r["analysis"]["decision_tests"] = [{"id": "DTw", "type": "parameter_value", "parameter": "dw",
+                                            "values": [0.002], "text": "weaker weight, below the prior range"}]
+        # v2-dt-with: the same test with a companion engine parameter held at a value beyond its fitted range
+        r["analysis"]["decision_tests"].append(dict(r["analysis"]["decision_tests"][0], id="DTc",
+                                                    **{"with": {"eff_a": 0.75}}))
+        yaml.safe_dump(r, open(p, "w"), sort_keys=False)
+        bad_with = {}
+        for label, w in (("not an engine parameter", {"nope": 1.0}), ("not a finite number", {"eff_a": "x"}),
+                         ("the test's own parameter", {"dw": 0.01}), ("not a mapping", [1])):
+            rb = copy.deepcopy(r)
+            rb["analysis"]["decision_tests"][1]["with"] = w
+            errs = schema.validate(schema.Spec(rb, d))
+            bad_with[label] = [e for e in errs if "DTc" in e and "with" in e][:1]
+        errs_ok = [e for e in schema.validate(schema.load(p)) if "DTc" in e]
+        ok(all(bad_with.values()) and not errs_ok,
+           f"RPW1 a parameter_value test's `with` holds engine parameters other than its own at finite numbers; "
+           f"anything else is refused: { {k: bool(v) for k, v in bad_with.items()} } {errs_ok[:1]}")
+        signoff.sign(d, "lead", note="self-test")
+        try:
+            R = run(d, log=q, compute_kw={"max_workers": 2})
+        except Exception as e:  # noqa: BLE001
+            ok(False, f"RP10 a parameter_value test below a prior's range runs inside the design: {type(e).__name__}: "
+                      f"{str(e)[:200]}")
+            return
+        design = json.load(open(os.path.join(d, "analysis", "batch", "design.json")))
+        dws = [pt["theta"]["dw"] for pt in design["points"]]
+        ok(design.get("design_ranges", {}).get("dw") == [0.002, 0.02] and min(dws) < 0.005 and max(dws) <= 0.02,
+           f"RP10 the design box of dw spans the test value and the prior range: {design.get('design_ranges')}, "
+           f"min {min(dws):.4f}")
+        t = {x["test_id"]: x for x in R["decision_tests"]}["DTw"]
+        rep = yaml.safe_load(open(os.path.join(d, "uncertainty_report.yaml")))
+        s = rep["parameter_samples"]["dw"]
+        ok(t["status"] == "run" and [x["value"] for x in t["results"]] == [0.002]
+           and 0.005 <= s["ci_low"] < s["ci_high"] <= 0.02,
+           f"RP12 the test runs at 0.002 and the draws stay inside the declared prior range: {t['status']}, {s}")
+        # v2-dt-with: the companion's value is in the design box, the test runs with it held in every case and says so
+        from toolkit.analysis.core import Analysis as _A
+        c = {x["test_id"]: x for x in R["decision_tests"]}["DTc"]
+        rng = design.get("design_ranges", {}).get("eff_a") or [None, None]
+        ok(rng[1] == 0.75 and c["status"] == "run" and c.get("with") == {"eff_a": 0.75} and "eff_a" in c["varied"]
+           and "0.75" in c["varied"] and "with" not in t and "eff_a" not in t["varied"]
+           and t["varied"] == "engine parameter dw set to each tested value",
+           f"RPW2 a companion value widens the design box and the test runs with it held, named in the result; a test "
+           f"without `with` reads as before: {rng} {c['status']} {c.get('varied')} | {t['varied']}")
+        ok(c["results"][0] != t["results"][0],
+           "RPW3 the companion changes the evaluation: the two tests' results at the same value differ")
+        ev = DT.prerun_evidence(schema.load(p))
+        dtc = r["analysis"]["decision_tests"][1]
+        pl = DT.plan_test(schema.load(p), dict(dtc, values=[ev["point"]["dw"]]), ev)
+        pl0 = DT.plan_test(schema.load(p), dict(dtc, values=[ev["point"]["dw"]], **{"with": {"eff_a": ev["point"]["eff_a"]}}), ev)
+        out_box = DT.plan_test(schema.load(p), dict(dtc, **{"with": {"eff_a": 0.99}}), ev)
+        no_input = DT.plan_test(schema.load(p), dict(dtc, **{"with": {"base": 0.5}}), ev)
+        ok(pl["status"] == "runs" and pl["perturbations"][0]["identity"] is False
+           and pl0["perturbations"][0]["identity"] is True
+           and out_box["status"] == "not_run" and "eff_a" in out_box["why"]
+           and no_input["status"] == "not_run" and "base" in no_input["why"],
+           f"RPW4 a case is identity only when every companion is at its point value; a companion outside the design "
+           f"box, or one that is not an emulator input, is not run: {out_box['why'][:80]} | {no_input['why'][:80]}")
+        from toolkit.spec import engine_parameters as PV
+        rh = copy.deepcopy(r)
+        rh["engine_parameters"] = {"synergy": {"value": 0.0, "source": "s", "reason": "r", "basis": "owner_judgement"}}
+        rh["analysis"]["decision_tests"][1]["with"] = {"synergy": 0.1}
+        tb = PV.tested_boxes(schema.Spec(rh, d))
+        ok(tb.get("synergy") == [0.0, 0.1], f"RPW5 a held spec value named as a companion is a design input over the "
+                                            f"box spanning both values: {tb}")
+        # Codex r1 on v2-dt-with
+        from toolkit.spec import preconditions as PCm
+        quoted = {"type": "parameter_value", "parameter": "eff_a", "values": ["0.8"]}
+        rw1 = {}
+        for label, w in (("nan", {"eff_a": float("nan")}), ("inf", {"eff_a": float("inf")}), ("empty", {})):
+            rb = copy.deepcopy(r)
+            rb["analysis"]["decision_tests"][1]["with"] = w
+            rw1[label] = any("DTc" in e and "with" in e for e in schema.validate(schema.Spec(rb, d)))
+        ok(PV.test_settings(quoted) == {"eff_a": [0.8]} and all(rw1.values()),
+           f"RPW6 a quoted number among a test's values still counts (the runner converts it), as before; NaN, "
+           f"infinity and an empty `with` are refused: {PV.test_settings(quoted)} {rw1}")
+        rp = copy.deepcopy(r)
+        rp["calibration"]["method"] = "posterior"
+        plp = DT.plan_test(schema.Spec(rp, d), dtc, ev)
+        ok(plp["status"] == "not_run" and "posterior" in plp["why"] and "eff_a" in plp["why"],
+           f"RPW7 the planner (which the sign-off checks read) refuses a test with companions under a posterior "
+           f"calibration, naming them: {plp['why'][:120]}")
+        re_ = copy.deepcopy(r)
+        re_["analysis"]["decision_tests"].append({"id": "DTe", "type": "envelope", "values": [5.0], "text": "t",
+                                                  "with": {"eff_a": 0.75}})
+        errs_e = [e for e in schema.validate(schema.Spec(re_, d)) if "DTe" in e and "with" in e]
+        ok(bool(errs_e), f"RPW8 `with` on a test that is not a parameter_value test is refused, never ignored: "
+                         f"{errs_e[:1]}")
+        carries = PCm.decision_test_runs(schema.load(p), "DTc", {"parameters": ["dw"], "components": []})
+        rd = copy.deepcopy(r)
+        rd["analysis"]["decision_tests"][1]["with"] = {"base": 0.6}
+        dos = PCm.chosen_range_test_runs(rd, "DTc", "parameter:dw", {"dw": (0.005, 0.02)})
+        dos_ok = PCm.chosen_range_test_runs(r, "DTc", "parameter:dw", {"dw": (0.005, 0.02), "eff_a": (0.3, 0.7)})
+        ok(carries[0] is False and "with" in carries[1] and dos[0] is False and "with" in dos[1]
+           and dos_ok[0] is False and "with" in dos_ok[1],
+           f"RPW9 a test with companions cannot carry a benchmark departure or be the dossier's range test (Codex r1, "
+           f"r2): {carries[1][:90]} | {dos[1][:90]}")
+        # Codex r2 on v2-dt-with
+        rq = copy.deepcopy(rh)
+        rq["analysis"]["decision_tests"] = [{"id": "DTq", "type": "parameter_value", "parameter": "synergy",
+                                             "values": ["0.1"], "text": "t"}]
+        try:
+            PV.test_settings({"type": "parameter_value", "parameter": "eff_a", "values": [0.5, "oops"]})
+            malformed = "accepted"
+        except ValueError as e:
+            malformed = f"ValueError: {e}"
+        ok(PV.tested_boxes(schema.Spec(rq, d)) == {} and malformed.startswith("ValueError"),
+           f"RPW11 without `with`, a held spec value's box ignores a quoted value and a value that is not a number is "
+           f"an error where a test's values are read, both as before: {PV.tested_boxes(schema.Spec(rq, d))} "
+           f"{malformed[:60]}")
+        # Codex r3: a value that is not a number, on a parameter the reader does not use, raises nothing (as before)
+        from toolkit.analysis import batch as BAm
+        ro = copy.deepcopy(r)
+        ro["analysis"]["decision_tests"] = [{"id": "DTo", "type": "parameter_value", "parameter": "base",
+                                             "values": ["oops"], "text": "t"}]
+        try:
+            tvr = BAm.test_value_ranges(schema.Spec(ro, d), {"eff_a", "eff_b", "dw"})
+        except Exception as e:  # noqa: BLE001
+            tvr = f"{type(e).__name__}: {e}"
+        ok(tvr == {}, f"RPW15 a test value that is not a number, on a parameter that is not a design input, does not "
+                      f"stop the design (the test is then not run, as before): {tvr}")
+        rec_w = {"status": "run", "perturbation_identity": [False], "package_components": {"k": ["a"]},
+                 "benefit_change_by_package": {"k": 1.0}}
+        dv = [DT.departure_verdicts([{"benchmark": "B", "decision_test": "T", "engine": "e"}],
+                                    {"B": {"components": ["a"]}}, {"T": dict(rec_w, **x)})[0]
+              for x in ({}, {"with": {"eff_a": 1.0}})]
+        ok(dv[0]["effective"] is True and dv[1]["effective"] is False and "with" in dv[1]["why"],
+           f"RPW12 the run's departure verdict never credits a test that held companions: {dv[1]['why'][:100]}")
+        ra = copy.deepcopy(re_)
+        ra["engine"] = "auto"
+        try:
+            pend = [e for e in schema.validate(schema.Spec(ra, d), pending_ok=True) if "DTe" in e and "with" in e]
+        except Exception as e:  # noqa: BLE001
+            pend = [f"{type(e).__name__}: {e}"] if "with" in str(e) and "DTe" in str(e) else []
+        ok(bool(pend), f"RPW13 `with` on another test type is refused while the engine is still pending too: "
+                       f"{pend[:1]}")
+        from toolkit.spec import spec_critique as SCm
+        rv = copy.deepcopy(r)
+        rv["analysis"]["decision_tests"] = [{"id": "DTv", "type": "parameter_value", "parameter": "base",
+                                             "values": [0.3, 0.6], "text": "t", "with": {"eff_a": 0.6}}]
+        v_with = SCm._varied(rv, d)[0]
+        rv["analysis"]["decision_tests"][0].pop("with")
+        ok("base" not in v_with and "base" in SCm._varied(rv, d)[0],
+           f"RPW14 the pre-sign critique does not count a test with companions as varying its parameter: "
+           f"{sorted(map(str, v_with))[:4]}")
+        summ = yaml.safe_load(open(os.path.join(d, "analysis", "decision_tests.yaml")))
+        row = next(x for x in summ["data"]["tests"] if x.get("test_id") == "DTc")
+        ok((row.get("detail") or {}).get("with") == {"eff_a": 0.75},
+           f"RPW10 the decision-test artifact's summary row carries the companions: {row.get('detail')}")
+
+
+def _self_test_cost_structure(ok, A, R):
+    """F6 S1-3 on the emulator-path analysis: a per-unit fixed cost item for component a enters every cost path (the
+    point costs, drawn cost multipliers, the uncertainty draws, the figures' dollars); the point records floored
+    per-outcome increments, and the results state them."""
+    import copy
+    from toolkit.analysis import figure_data as FD, uncertainty as U
+    plan = R["point"]["plan"]
+    z0 = {i: v["z"] for i, v in R["point"]["per_unit"].items()}
+    out0, _b, cost0 = A.evaluate(A.theta0, z0)
+    d0 = FD.dollars(A, plan, out0)["by_component"]["a"]
+    # F6 cost amendment: a cost_items decision test multiplies the listed items together and re-solves the plan
+    its = {it["component"]: it["id"] for it in A.alloc["cost_items"]}
+    try:
+        t1 = DT.run_one(A, {"id": "DTc1", "type": "cost_items", "multipliers": {i: 1.0 for i in its.values()}},
+                        z0, _b, cost0, plan, R["uncertainty"])
+        t2 = DT.run_one(A, {"id": "DTc2", "type": "cost_items", "multipliers": {its["a"]: 1e9, its["b"]: 0.5}},
+                        z0, _b, cost0, plan, R["uncertainty"])
+        n_a0 = sum("a" in A.pk[plan[i]] for i in A.ids)
+        r2 = t2["results"][0]
+        ok(t1["status"] == "run" and t1["share_units_changed"] == 0.0 and not t1["decision_changes"],
+           f"R5n1 a cost_items decision test with every multiplier at 1 leaves the plan: {t1['share_units_changed']}")
+        ok(n_a0 > 0 and t2["can_move_plan"] and t2["decision_changes"] and not r2["point_plan_feasible"]
+           and r2["units_changed"] >= n_a0
+           and not any("a" in seg.split(":")[0].strip().split("+") for seg in r2["recommendation"].split(";"))
+           and r2["cost_multipliers"] == {its["a"]: 1e9, its["b"]: 0.5} and t2["cost_multipliers"] == r2["cost_multipliers"],
+           f"R5n2 a cost_items test that prices component a out re-solves without it, says the point plan is not "
+           f"affordable under the test, and records the multipliers: {r2.get('units_changed')} units change package ({n_a0} had a), "
+           f"{r2.get('recommendation')}, {r2.get('point_plan_infeasible')}")
+    except Exception as e:  # noqa: BLE001
+        ok(False, f"R5n1 a cost_items decision test runs: {type(e).__name__}: {e}")
+    # Codex r1: each multiplier reaches the cost table the plan is re-solved on; a cost item id that is not a string
+    # keeps its multiplier; a price case no allocation can afford is a not-run record with its prices, not a crash
+    orig, seen = A.solve, {}
+    m3 = {"a": 1.5, "b": 0.5}
+
+    def spy(ben, cost, budget=None, feas=None):
+        seen["cost"] = cost
+        return orig(ben, cost, budget=budget, feas=feas)
+
+    def no_plan(ben, cost, budget=None, feas=None):
+        raise RuntimeError("optimizer status infeasible")
+
+    def broken(ben, cost, budget=None, feas=None):
+        from toolkit.analysis import core as CO
+        raise CO.SolveFailed("no_feasible_found")
+    saved_items = copy.deepcopy(A.alloc["cost_items"])
+    try:
+        A.solve = spy
+        DT.run_one(A, {"id": "DTc3", "type": "cost_items", "multipliers": {its[c]: m for c, m in m3.items()}},
+                   z0, _b, cost0, plan, R["uncertainty"])
+        by0 = cost0.by_component
+        ok(all(abs(seen["cost"][i][k] - sum(v * m3.get(c, 1.0) for c, v in by0[i][k].items()))
+               <= 1e-9 * max(1.0, abs(cost0[i][k])) for i in A.ids for k in A.pk)
+           and any(abs(seen["cost"][i][k] - cost0[i][k]) > 1e-6 for i in A.ids for k in A.pk),
+           "R5n3 a cost_items test re-solves on a cost table with every listed multiplier applied to its own item")
+        A.solve = orig
+        for it in A.alloc["cost_items"]:
+            if it["id"] == its["a"]:
+                it["id"] = 7
+        t4 = DT.run_one(A, {"id": "DTc4", "type": "cost_items", "multipliers": {7: 1e9, its["b"]: 0.5}},
+                        z0, _b, cost0, plan, R["uncertainty"])
+        r4 = t4["results"][0]
+        ok(t4["decision_changes"] and r4["units_changed"] >= n_a0 and r4["cost_multipliers"].get(7) == 1e9
+           and not any("a" in seg.split(":")[0].strip().split("+") for seg in r4["recommendation"].split(";")),
+           f"R5n4 a cost item whose id is not a string keeps its multiplier: {r4.get('units_changed')} units change "
+           f"package ({n_a0} had a), {r4.get('recommendation')}")
+        A.alloc["cost_items"] = copy.deepcopy(saved_items)
+        A.solve = no_plan
+        t5 = DT.run_one(A, {"id": "DTc5", "type": "cost_items", "text": "t", "multipliers": {its["a"]: 6.0}},
+                        z0, _b, cost0, plan, R["uncertainty"])
+        ok(t5["status"] == "not_run" and "no allocation" in t5["reason"] and t5.get("cost_multipliers") == {its["a"]: 6.0},
+           f"R5n5 a price case no allocation can afford is a not-run record that keeps its prices: {t5.get('status')}, "
+           f"{t5.get('reason')}")
+        A.solve = broken
+        # 1C-c (D3) reverses the earlier R5n6 (such a failure stopped the analysis): the test is a not-run record
+        t6 = DT.run_one(A, {"id": "DTc6", "type": "cost_items", "text": "t", "multipliers": {its["a"]: 6.0}},
+                        z0, _b, cost0, plan, R["uncertainty"])
+        ok(t6["status"] == "not_run" and "no_feasible_found" in t6["reason"] and "infeasible" not in t6["reason"],
+           f"R5n6 a solver failure other than a proven infeasibility is a not-run record that names the solver's "
+           f"status, never a proven infeasibility: {t6.get('status')}, {t6.get('reason')}")
+    except Exception as e:  # noqa: BLE001
+        ok(False, f"R5n3 the cost_items checks run: {type(e).__name__}: {e}")
+    finally:
+        A.solve = orig
+        A.alloc["cost_items"] = saved_items
+    item = {"id": "ca_setup", "component": "a", "value": 100.0, "price_year": "2024", "price_rule": "as_published",
+            "basis": "per_unit", "includes": ["setup", "supervision"]}
+    saved = (copy.deepcopy(A.alloc), copy.deepcopy(A.spec.raw["options"]), copy.deepcopy(A.spec.raw["uncertainty"]))
+    try:
+        A.alloc["cost_items"].append(dict(item))
+        A.spec.raw["options"]["cost_items"].append(dict(item))
+        _o, _b, c1 = A.evaluate(A.theta0, z0)
+        _o, _b, c2 = A.evaluate(A.theta0, z0, cost_mult={"ca_setup": 2.0})
+        ok(all(abs(c1[i][k] - cost0[i][k] - (100.0 if "a" in A.pk[k] else 0.0)) < 1e-9
+               and abs(c2[i][k] - cost0[i][k] - (200.0 if "a" in A.pk[k] else 0.0)) < 1e-9 for i in A.ids for k in A.pk),
+           "R5n a per-unit fixed cost is charged once per unit whose package has the component, and its cost "
+           "multiplier scales it (point and draws)")
+        n_a = sum("a" in A.pk[plan[i]] for i in A.ids)
+        ok(abs(FD.dollars(A, plan, out0)["by_component"]["a"] - d0 - 100.0 * n_a) < 1e-6,
+           f"R5o the figures' dollars by component carry the fixed part ({n_a} units with a)")
+        A.spec.raw["uncertainty"]["sources"] = list(saved[2]["sources"]) + [{"kind": "costs",
+                                                                            "items": {"ca_setup": [0.5, 2.0]}}]
+        A.spec.raw["uncertainty"]["excluded"] = [x for x in saved[2].get("excluded") or [] if x.get("kind") != "costs"]
+        af = U.run(A, plan, "total_dalys_averted", draws=6, seed=5)["data"]["affordability"]
+        D = U.Drawer(A, 5)
+        D.prepare(6)
+        want = []
+        for _ in range(6):
+            th, zs, noise, mult, _s = D.draw()
+            _o, _b, cd = A.evaluate(th, zs, noise=noise, cost_mult=mult)
+            want.append(sum(cd[i][plan[i]] for i in A.ids))
+        ok(af.get("per_draw_cost") == want and len({round(c, 6) for c in want}) > 1,
+           "R5p the uncertainty draws cost the plan with the drawn multiplier on the fixed part")
+    finally:
+        A.alloc, A.spec.raw["options"], A.spec.raw["uncertainty"] = saved
+    _self_test_draw_floors(ok, A, R)
+    _self_test_solver(ok, A, R)
+    fl = R["point"].get("cost_floors") or {}
+    ok(fl.get("n_unit_packages") == 0 and fl.get("items") == [] and "statement" in fl,
+       f"R5q the point records floored per-outcome increments (none in this toy): {fl}")
+    fake = dict(R["point"], cost_floors={"items": ["x"], "n_unit_packages": 3, "by_item": {"x": 3},
+                                         "statement": "S1-3 floor statement"})
+    txt = CL.results_template(A, fake, R["uncertainty"], R["stability"], R["sensitivity"], R["decision_tests"],
+                              R["calibration"], R["emulator_accuracy"])
+    ids = {c["id"] for c in CL.claim_spec(A, {k: "x" for k in ("point", "uncertainty", "stability", "decision_tests",
+                                                              "calibration", "engine")}, fake, R["uncertainty"],
+                                          R["stability"], R["decision_tests"], R["calibration"])}
+    ok("[CLAIM:cost.floored_unit_packages.point]" in txt and "S1-3 floor statement" in txt
+       and "cost.floored_unit_packages.point" in ids,
+       "R5r the results state the floored increments, with the count as a claim")
+
+
+def _self_test_direct_decision_tests(ok, A, R):
+    """Canonical per-type decision tests execute directly; a joint parameter_value test with `with` holds its
+    companions and carries no departure."""
+    plan = R["point"]["plan"]
+    z0 = {i: v["z"] for i, v in R["point"]["per_unit"].items()}
+    out0, ben0, cost0 = A.evaluate(A.theta0, z0)
+    its = {it["component"]: it["id"] for it in A.alloc["cost_items"]}
+    box = DT.runtime_evidence(A)["box"] or {}
+    nm = sorted(box)
+    mid = {n: 0.5 * (box[n][0] + box[n][1]) for n in nm}
+    tests = [
+        {"id": "DTk", "type": "cost_items", "text": "t", "multipliers": {its["a"]: 1e9, its["b"]: 0.5}},
+        {"id": "DTe", "type": "envelope", "text": "t", "values": [0.5 * A.budget, A.budget]},
+    ]
+    if len(nm) >= 2:
+        tests.append({"id": "DTj", "type": "parameter_value", "text": "t", "parameter": nm[0],
+                      "values": [box[nm[0]][0], mid[nm[0]]], "with": {nm[1]: box[nm[1]][1]}})
+    ok(len(tests) == 3, f"RPT0 the toy emulator has two parameter inputs for the joint test: {nm}")
+    last = None
+    for dt in tests:
+        rec = DT.run_one(A, dt, z0, ben0, cost0, plan, R["uncertainty"], out0)
+        ok(rec["status"] == "run" and rec["type"] == dt["type"],
+           f"RPT1 direct decision test {dt['type']} ({dt['id']}) runs cleanly")
+        last = rec
+    if len(nm) >= 2 and last is not None:
+        dv = DT.departure_verdicts([{"engine": "e", "benchmark": "B", "decision_test": "DTj"}],
+                                   {"B": {"components": ["a"]}}, {"DTj": last})
+        ok(last.get("with") == {nm[1]: box[nm[1]][1]} and not dv[0]["effective"] and "companion" in dv[0]["why"],
+           f"RPT3 DT_CONDITIONAL_NO_DEPARTURE: a joint test holds its companion and carries no departure: {dv}")
+
+
+def _floor_q(theta, theta0, at_point):
+    """The injected cost output q of the floor tests: 10 per unit with b, 20 less where a is beside b when floored (at
+    the point if `at_point`, else only away from the point values: a draw), so b's increment in a+b is then -10."""
+    floored = at_point or dict(theta) != dict(theta0)
+    return lambda p: 10.0 * ("b" in p.split("+")) - (20.0 if floored and {"a", "b"} <= set(p.split("+")) else 0.0)
+
+
+def _self_test_solver(ok, A, R):
+    """1C-c (decision D3): the headline solve must be proven within optimizer.gap_rel; inside `auxiliary()` a feasible
+    solution within optimizer.aux_gap_max is accepted and counted, and anything else is SolveFailed with the status."""
+    from toolkit.analysis import core as CO
+    z0 = {i: v["z"] for i, v in R["point"]["per_unit"].items()}
+    _o, ben0, cost0 = A.evaluate(A.theta0, z0)
+    st = getattr(CO, "solver_settings", dict)()
+    sv = R["point"]["solver"]
+    ok(0 < st.get("gap_rel", 0) <= 1e-3 and sv.get("gap_rel") == st.get("gap_rel") and sv["status"] == "optimal"
+       and sv.get("threads") in (1, st.get("threads")) and sv.get("time_limit_s") == st.get("time_limit_s"),
+       f"SG1 the point plan is proven within the gap of thresholds.yaml, and point.yaml records the gap, the threads "
+       f"and the time limit: { {k: sv.get(k) for k in ('status', 'gap_rel', 'threads', 'time_limit_s')} }")
+    real, saved = CO.aopt.solve, dict(getattr(A, "solver_log", {}))
+
+    def fake(gap):
+        return lambda *a, **k: dict(real(*a, **k), status="feasible", gap=gap)
+    try:
+        CO.aopt.solve, A.solve_memo, A.solver_log = fake(0.001), {}, {}
+        try:
+            A.solve(ben0, cost0)
+            strict = False
+        except RuntimeError as e:
+            strict = str(e) == "optimizer status feasible"
+        with CO.auxiliary(A, "self-test"):
+            r = A.solve(ben0, cost0)
+        lg = dict(A.solver_log.get("self-test") or {})
+        ok(strict and r["status"] == "feasible"
+           and lg == {"solves": 1, "feasible_accepted": 1, "max_gap": 0.001, "not_solved": 0},
+           f"SG2 a feasible solution stops a headline solve; an auxiliary solve accepts it within the stated gap and "
+           f"counts it ({strict}, {lg})")
+        refused = []
+        for g in (2 * st["aux_gap_max"], None):
+            CO.aopt.solve, A.solve_memo = fake(g), {}       # without the plan SG2 accepted for this problem
+            with CO.auxiliary(A, "self-test"):
+                try:
+                    A.solve(ben0, cost0)
+                    refused.append(False)
+                except CO.SolveFailed as e:
+                    refused.append(e.status == "feasible")
+        ok(refused == [True, True] and A.solver_log["self-test"]["not_solved"] == 2 and getattr(A, "aux", 0) is None,
+           f"SG3 above the gap, or with no proven gap, an auxiliary solve fails with the status and is counted "
+           f"({refused}, {A.solver_log.get('self-test')})")
+        CO.aopt.solve = real
+        a1, a2 = A.solve(ben0, cost0), A.solve(ben0, cost0)
+        ok(a1["status"] == "optimal" and a2["choice"] == a1["choice"] and len(A.solve_memo) == 1,
+           "SG4 one problem solved twice in a run returns one plan (the proven result is kept), whatever the threads")
+        # Codex r1 P1-3: a feasible plan an auxiliary solve accepted is kept for auxiliary solves, never for a headline
+        calls = {"n": 0}
+
+        def counted(*a, **k):
+            calls["n"] += 1
+            return dict(real(*a, **k), status="feasible", gap=0.001)
+        CO.aopt.solve, A.solve_memo, lg0 = counted, {}, {k: dict(v) for k, v in A.solver_log.items()}
+        with CO.auxiliary(A, "self-test"):
+            f1, f2 = A.solve(ben0, cost0), A.solve(ben0, cost0)
+        try:
+            A.solve(ben0, cost0)
+            head = False
+        except CO.SolveFailed:
+            head = True
+        ok(calls["n"] == 2 and f1["choice"] == f2["choice"] and f2["status"] == "feasible" and head,
+           f"SG6 an accepted feasible plan is returned again to an auxiliary solve of the same problem, and a headline "
+           f"solve of it is still refused ({calls['n']} solver calls, headline refused: {head})")
+        CO.aopt.solve, A.solver_log = real, lg0
+        # Codex r1 P1-6: nothing is kept for ids that are not text (1 and "1" would share a key)
+        kb = {"u": {"1": 1.0}}
+        ok(CO._problem_key(kb, kb, {"feasible": {"u": {"1": True}}}, 1.0) is not None
+           and CO._problem_key({"u": {1: 1.0}}, kb, {"feasible": {"u": {1: True}}}, 1.0) is None
+           and CO._problem_key(kb, kb, {"feasible": {"u": {"1": True}}}, 1.0)
+           != CO._problem_key(kb, kb, {"feasible": {"u": {"1": False}}}, 1.0),
+           "SG7 the kept-result key needs text ids and separates problems that differ only in feasibility")
+        ok(CO._problem_key({"u": {"1": "1"}}, kb, {"feasible": {"u": {"1": True}}}, 1.0) is None
+           and CO._problem_key(kb, kb, {"feasible": {"u": {"1": True}}}, True) is None,
+           "SG8 (Codex r2 P1) nothing is kept for a table value or budget that is not a number, so the allocator's "
+           "own input check is never skipped")
+        # 1C-c follow-up: the better of an accepted incumbent and the point plan, with the gap as a bound
+        plan0 = dict(R["point"]["plan"])
+        obj0 = sum(ben0[i][plan0[i]] for i in A.ids)
+        worse = dict(a1, status="feasible", gap=0.005, objective=obj0 - 1.0, choice={i: A.comp for i in A.ids})
+        b1 = CO.best_known(A, worse, plan0, ben0, cost0)
+        b2 = CO.best_known(A, dict(a1, status="feasible", gap=0.005), plan0, ben0, cost0)
+        ok(b1["choice"] == plan0 and b1["objective"] == obj0 and b1["solver_gap"]["kept"] == "point_plan"
+           and 0 <= b1["solver_gap"]["bound"] < b2["solver_gap"]["bound"] + 1.0 and b2["solver_gap"]["kept"] == "incumbent"
+           and b2["solver_gap"]["gap"] == 0.005 and b2["solver_gap"]["bound"] > 0
+           and "solver_gap" not in CO.best_known(A, a1, plan0, ben0, cost0),
+           f"SG9 an accepted incumbent below the point plan gives way to it; the bound to the optimum is recorded; a "
+           f"proven solve is returned as it is ({b1.get('solver_gap')}, {b2.get('solver_gap')})")
+        from toolkit.analysis import decision_tests as DTg
+        CO.aopt.solve, A.solve_memo, lg1 = fake(0.001), {}, {k: dict(v) for k, v in A.solver_log.items()}
+        tg = DTg.run_one(A, {"id": "DTg", "type": "envelope", "text": "t",
+                             "values": [float(A.spec["constraints"]["envelope_usd"])]},
+                         z0, ben0, cost0, plan0, R["uncertainty"])
+        CO.aopt.solve, A.solve_memo, A.solver_log = real, {}, lg1
+        rg = (tg.get("results") or [{}])[0].get("regret_solver_gap") or {}
+        ok(tg["status"] == "run" and rg.get("gap") == 0.001 and rg.get("bound", 0) > 0 and tg["results"][0]["regret"] >= 0
+           and isinstance(tg["results"][0].get("within_solver_gap"), bool)
+           and bool(tg.get("within_solver_gap")) == (tg["results"][0]["within_solver_gap"] is True),
+           f"SG10 a decision test solved to an accepted incumbent records the gap beside its regret, and whether its "
+           f"verdict can be settled within it ({rg}, {tg.get('within_solver_gap')})")
+        rep = A.solver_report()
+        ok(rep["gap_rel"] == st["gap_rel"] and rep["headline"]["solves"] >= 1
+           and rep["auxiliary_total"] == {"solves": 3, "feasible_accepted": 1, "max_gap": 0.001, "not_solved": 2},
+           f"SG5 the solver record totals the auxiliary solves: {rep.get('auxiliary_total')}")
+    except Exception as e:  # noqa: BLE001
+        ok(False, f"SG2-SG5 the solver contract ({type(e).__name__}: {e})")
+    finally:
+        CO.aopt.solve, A.solver_log = real, saved
+
+
+def _self_test_draw_floors(ok, A, R):
+    """Codex S1-3 P2: floors that occur only in the uncertainty draws are published, with and without the reserve
+    search's precomputed draws."""
+    import copy
+    from toolkit.analysis import uncertainty as U
+    plan = R["point"]["plan"]
+    z0 = {i: v["z"] for i, v in R["point"]["per_unit"].items()}
+    orig = A.model.predict
+
+    def pred(zs, theta, ids, noise=None):
+        out = orig(zs, theta, ids, noise=noise)
+        f = _floor_q(theta, A.theta0, False)
+        for i in out:
+            for p in out[i]["cost"]:
+                out[i]["cost"][p]["q"] = f(p)
+        return out
+    saved = copy.deepcopy(A.alloc)
+    try:
+        A.model.predict = pred
+        A.alloc["cost_items"].append({"id": "cb_q", "component": "b", "value": 1.0, "price_year": "2024",
+                                      "price_rule": "as_published", "basis": "per_outcome", "outcome": "q",
+                                      "incremental": True, "includes": ["per_case"]})
+        A.evaluate(A.theta0, z0)
+        ok(A.last_cost_floors == [], "R5s at the point values nothing is floored")
+        n_ab = len(A.ids)       # every unit's a+b package floors b's increment in a draw
+        for label, pre in (("without", None), ("with", U.evaluate_draws(A, draws=4, seed=5))):
+            cf = U.run(A, plan, "total_dalys_averted", draws=4, seed=5, pre=pre)["data"].get("cost_floors") or {}
+            ok(cf.get("draws") == 4 and cf.get("draws_with_floors") == 4 and cf.get("max_unit_packages") == n_ab
+               and cf.get("per_draw") == [n_ab] * 4 and "not a cost" in (cf.get("statement") or ""),
+               f"R5t floors only in the draws are published ({label} the reserve search's precomputed draws): {cf}")
+    finally:
+        del A.model.predict
+        A.alloc = saved
+
+
+def _self_test_burden_e2e(ok, d, q):
+    """F6 S2-5: validation.burden on the emulator path: each reference against the comparator arm's annual mean, with
+    the draws' interval for all-age references and the point value for an age band; one declarable finding for the
+    group outside tolerance, none for a reported value; results.md, claims and the figure."""
+    import yaml
+    from toolkit.analysis import burden as BV, contract
+    rows = ["A,r0,,cases,count,,1,1e6,0,1e15,estimated,synthetic A,overlap,,,REF-A,",
+            "B,r1,,dalys,count,,1,1e12,1e11,1e13,estimated,synthetic B,ratio,,,REF-B,",
+            "C,r2,,cases,count,,1,1,0.5,2,reported,synthetic C,ratio,,,REF-C,",
+            "D,*,all,cases,rate,1000,1,1e3,0,1e9,estimated,synthetic D,overlap,,,REF-D,REF-A",
+            "E,*,,cases,count,,2,1e6,0,1e15,estimated,synthetic E,overlap,,,REF-E,"]
+    open(os.path.join(d, "burden_refs.csv"), "w").write("\n".join([",".join(BV.COLUMNS)] + rows) + "\n")
+    try:
+        _resign(d, lambda r: (r.update(validation={"burden": {"csv": "burden_refs.csv"}}),
+                              r["calibration"].update(target_source_id="TOY-TARGETS")))
+        R = run(d, log=q, compute_kw={"max_workers": 2}, draws=4)
+    except Exception as e:  # noqa: BLE001
+        ok(False, f"BE1 a run with validation.burden completes: {type(e).__name__}: {e}")
+        return
+    try:
+        bv = yaml.safe_load(open(os.path.join(d, "analysis", "burden_validation.yaml")))["data"]
+    except (OSError, TypeError, KeyError) as e:
+        ok(False, f"BE1 the burden_validation artifact is written: {e}")
+        return
+    by = {r["id"]: r for r in bv["references"]}
+    ok({k: r["status"] for k, r in by.items()} == {"A": "within", "B": "outside", "C": "information", "D": "within",
+                                                    "E": "within"} and bv["arm"] == "none",
+       f"BE1 each reference is judged against the comparator arm: { {k: r['status'] for k, r in by.items()} }")
+    pop = sum(float(u["pop"]) for u in R["_A"].spec.units())
+    tot = R["point"]["comparator_total"]["cases"] / 3.0
+    ok(by["A"]["model"]["interval_from"] == "draws" and bv["draws"] == 4 and by["D"]["model"]["interval_from"] == "point"
+       and abs(by["E"]["model"]["point"] - tot) <= 1e-9 * tot
+       and abs(by["D"]["model"]["point"] * pop / 1000 - tot) <= 1e-9 * tot,
+       f"BE2 annual means over the window; draws for all ages, the point value for an age band "
+       f"(E {by['E']['model']['point']:.6g} vs {tot:.6g})")
+    fs = contract.gate_findings(d)
+    ok([(x["kind"], x["key"], x["scope_declarable"]) for x in fs] == [("burden_outside_tolerance", "burden:B", True)],
+       f"BE3 the group outside tolerance is one declarable gate finding; the reported value none: {fs}")
+    res = open(os.path.join(d, "results.md")).read()
+    led = {c["id"]: c for c in (yaml.safe_load(open(os.path.join(d, "models", "claims_ledger.yaml"))) or {})
+           .get("claims", [])}
+    figs = {f["figure"] for f in yaml.safe_load(open(os.path.join(d, "analysis", "figures.yaml")))["data"]["figures"]}
+    ok("## Absolute burden against external estimates" in res and "[CLAIM:" not in res and "burden.B.ratio" in led
+       and "burden_validation" in figs and "not computed" in bv["daly_parts"]["statement"],
+       f"BE4 results.md, the claims ledger and the figure carry the comparison ({sorted(figs)[:3]})")
+    pv = bv.get("provenance") or {}
+    ok(pv.get("independent") is True and pv.get("csv") == "burden_refs.csv" and pv.get("calibration_inputs")
+       and pv.get("calibration_source_ids") == ["TOY-TARGETS"]
+       and {x["id"]: x["derived_from"] for x in pv.get("references") or []}.get("D") == ["REF-A"],
+       f"BE5 the artifact records the reference file's provenance and the calibration inputs it is independent of: {pv}")
+    # Codex r1 P2: precomputed draws (the reserve search) reach the hook with their events, so the arm is guarded
+    from toolkit.analysis import uncertainty as U
+    A = R["_A"]
+    seen = []
+    U.run(A, R["point"]["plan"], "h", draws=2, seed=5, pre=U.evaluate_draws(A, 2, 5),
+          on_draw=lambda out, events, cost=None: seen.append((len(out), type(events).__name__)))
+    ok(seen == [(len(A.ids), "list")] * 2, f"BE6 precomputed draws call the hook with outcomes and events: {seen}")
+    # Codex r3 P1: a reference file replaced after the run fails the gate closed (the sign-off no longer covers it)
+    rp_ = os.path.join(d, "burden_refs.csv")
+    good = open(rp_).read()
+    open(rp_, "w").write(good.replace("1e12,1e11,1e13", "84,40,200"))
+    try:
+        fs = contract.gate_findings(d)
+    finally:
+        open(rp_, "w").write(good)
+    ok(any(x["kind"] == "analysis_contract_burden" and "sign-off" in x["claim"] and not x["scope_declarable"]
+           for x in fs) and signoff.status(d) == "signed",
+       f"BE7 a reference file replaced after sign-off is a gate finding that cannot be declared: "
+       f"{sorted({x['kind'] for x in fs})}")
+    _self_test_burden_scale(ok, R, by)
+    # F6 S2-5b: a model window on the emulator path; a report-only row with no published interval
+    from toolkit.engines.contract import ToyEngine, UnitSpec, Package
+    open(rp_, "w").write("\n".join([",".join(BV.COLUMNS + ("role", "interval")),
+                                    "W,*,,cases,count,,1,1e6,0,1e15,estimated,synthetic W,overlap,,,REF-W,,,",
+                                    "X,r0,,cases,count,,2,1,,,estimated,synthetic X,ratio,,,REF-X,,report_only,none",
+                                    "Y,*,all,cases,rate,1000,1,1e3,0,1e9,estimated,synthetic Y,overlap,,,REF-Y,,,"])
+                         + "\n")
+    try:
+        _resign(d, lambda r: r["validation"]["burden"].update(window=[1, 2], window_metrics={"cases": "prev"}))
+        R = run(d, log=q, compute_kw={"max_workers": 2}, draws=2)
+        bv = yaml.safe_load(open(os.path.join(d, "analysis", "burden_validation.yaml")))["data"]
+    except Exception as e:  # noqa: BLE001
+        ok(False, f"BE8 a run with a model window completes: {type(e).__name__}: {e}")
+        return
+    A, by = R["_A"], {r["id"]: r for r in bv["references"]}
+    h = A.spec.horizon({BV.WINDOW: [1, 2]})
+    want = sum(ToyEngine().run(A.theta0, UnitSpec(i, {"x": R["point"]["per_unit"][i]["z"]}), Package("none", {}), h,
+                               1).windows[BV.WINDOW]["prev"] * float(A.by_id[i]["pop"]) for i in A.ids)
+    dec = R["point"]["comparator_total"]["cases"] / 3.0
+    got = by["W"]["model"]["point"]
+    ok(abs(got - want) <= 0.05 * want and abs(got - dec) > 0.1 * dec and bv["window"] == [1.0, 2.0]
+       and by["W"]["model"]["interval_from"] == "draws",
+       f"BE8 the model value is the arm's window metric over the model window ({got:.6g} vs engine {want:.6g}; "
+       f"decision-window mean {dec:.6g}), with the draws' interval")
+    pop = sum(float(A.by_id[i]["pop"]) for i in A.ids)
+    ok(abs(by["Y"]["model"]["point"] - got * 1000 / pop) <= 1e-9 * got and by["Y"]["model"]["interval_from"] == "draws",
+       f"BE11 (S2-5c) an age-banded row under a window: its group's window value, with the draws' interval "
+       f"({by['Y']['model']['point']:.6g} vs {got * 1000 / pop:.6g})")
+    fs = contract.gate_findings(d)
+    res = open(os.path.join(d, "results.md")).read()
+    ok(by["X"]["status"] == "outside" and not [x for x in fs if x["key"] == "burden:X"] and "no published interval"
+       in res and "report only" in res, f"BE8 a report-only row is reported, never a finding: {fs}")
+    # Codex S2-5b r1 P2: the emulator error reaches the window values as it reaches the reductions
+    import numpy as np
+    M, zs = R["_model"], {i: R["point"]["per_unit"][i]["z"] for i in A.ids}
+    a, b, c = (M.predict(zs, A.theta0, A.ids, noise=None if s is None else np.random.default_rng(s))
+               for s in (1, 2, None))
+    w = lambda o: [o[i]["burden"]["none"]["cases"] for i in A.ids]  # noqa: E731
+    ok(w(a) != w(b) and w(a) != w(c) and M.error is not None and ("emu", "bw", "cases", "all") in M.error.col,
+       "BE9 a draw with the emulator error moves the window values (a column of the error model)")
+    saved = M.pops          # Codex S2-5b r3 P1: by_population() predicts with a subset of the population groups
+    try:
+        M.pops = {}
+        got = M.predict(zs, A.theta0, A.ids)
+        err = None
+    except Exception as e:  # noqa: BLE001
+        got, err = None, e
+    finally:
+        M.pops = saved
+    ok(err is None and all("burden" not in got[i] for i in A.ids),
+       f"BE10 a prediction for a subset of the population groups skips the window values of the others: {err!r}")
+
+
+def _self_test_burden_scale(ok, R, by):
+    """F6 run 3, owner decision D-c: a burden_scale test scales every package's outcomes in each listed reference's
+    group by (reference / model point)^share, from the point outputs alone, and re-solves the plan."""
+    from toolkit.analysis import decision_tests as DT_
+    A = R["_A"]
+    z0 = {i: R["point"]["per_unit"][i]["z"] for i in A.ids}
+    out0, ben0, cost0 = A.evaluate(A.theta0, z0)
+    plan = R["point"]["plan"]
+    dt = {"id": "DTb", "type": "burden_scale", "text": "t",
+          "burden_scale": {"references": ["A", "B"], "shares": [0.5, 1.0]}}
+    sent = []
+    orig = A.evaluate
+    A.evaluate = lambda *a_, **k_: (sent.append(1), orig(*a_, **k_))[1]
+    try:
+        rec = DT_.run_one(A, dt, z0, ben0, cost0, plan, R["uncertainty"], out0)
+    finally:
+        A.evaluate = orig
+    bs = rec.get("burden_scale") or {}
+    f = {k: by[k]["value"] / by[k]["model"]["point"] for k in ("A", "B")}
+    got = {k: (bs.get("references") or {}).get(k, {}).get("factor") for k in ("A", "B")}
+    ok(rec.get("status") == "run" and not sent and len(rec.get("results") or []) == 2
+       and all(got[k] is not None and abs(got[k] - f[k]) <= 1e-9 * abs(f[k]) for k in f),
+       f"BS-R1 a burden_scale test runs from the point outputs (no evaluation) with each group's factor reference / "
+       f"model point, as burden_validation reports them ({rec.get('status')}, {got} vs {f}, {len(sent)} evaluations)")
+    reg = {i: A.by_id[i]["region"] for i in A.ids}
+    chk = bs.get("check") or {}
+    want = {i: {k: ben0[i][k] * ({"r0": f["A"], "r1": f["B"]}.get(reg[i], 1.0)) for k in A.pk} for i in A.ids}
+    ok({reg[i] for i in chk} == {"r0", "r1", "r2"}
+       and all(abs(chk[i][k] - want[i][k]) <= 1e-9 * max(1.0, abs(want[i][k])) for i in chk for k in A.pk),
+       "BS-R2 at the largest share (1) every package's benefit in a listed group's units is scaled by the group's "
+       f"factor; a unit of no listed group is held (check units {sorted(chk)})")
+    dt2 = dict(dt, burden_scale={"references": ["zz"], "shares": [1.0]})
+    rec2 = DT_.run_one(A, dt2, z0, ben0, cost0, plan, R["uncertainty"], out0)
+    ok(rec2.get("status") == "not_run" and "zz" in rec2.get("reason", ""),
+       f"BS-R3 a reference the file does not hold: not run, with why ({rec2.get('status')}: {rec2.get('reason')})")
+    # Codex review of #246 P1-1: the point evaluation's model corrections reach the guard of every re-solved plan
+    saved_ev = getattr(A, "point_events", None)
+    try:
+        A.point_events = [{"unit": A.ids[0], "package": "*", "kind": "reduction_clip"}]
+        try:
+            DT_.run_one(A, dt, z0, ben0, cost0, plan, R["uncertainty"], out0)
+            blocked = False
+        except AnalysisBlocked:
+            blocked = True
+        ok(blocked, "BS-R4 a point correction bearing on the re-solved plan stops the test (the point events are "
+                    "guarded, not an empty list)")
+        del A.point_events
+        rec4 = DT_.run_one(A, dt, z0, ben0, cost0, plan, R["uncertainty"], out0)
+        ok(rec4.get("status") == "not_run" and "corrections" in rec4.get("reason", ""),
+           f"BS-R5 without the point evaluation's recorded corrections: not run ({rec4.get('reason')})")
+    finally:
+        A.point_events = saved_ev
+    # Codex review of #246 P1-2: a model value that is not finite is refused, never a factor of 0
+    from toolkit.analysis import burden as BV_
+    orig_v = BV_._value
+    BV_._value = lambda *a_, **k_: float("inf")
+    try:
+        rec6 = DT_.run_one(A, dt, z0, ben0, cost0, plan, R["uncertainty"], out0)
+    finally:
+        BV_._value = orig_v
+    ok(rec6.get("status") == "not_run" and "finite" in rec6.get("reason", ""),
+       f"BS-R6 an infinite model value: not run ({rec6.get('status')}: {rec6.get('reason')})")
+    # #248 item 8 (#246 P2-5): results.md and the claims show the shares, each reference's factor and the assumption
+    txt = CL.results_template(A, R["point"], R["uncertainty"], R["stability"], R["sensitivity"], [dict(rec, path="p")],
+                              R["calibration"], R["emulator_accuracy"])
+    ids = {c["id"] for c in CL.claim_spec(A, {k: "x" for k in ("point", "uncertainty", "stability", "decision_tests",
+                                                              "calibration", "engine")}, R["point"], R["uncertainty"],
+                                          R["stability"], [rec], R["calibration"])}
+    ok("[CLAIM:dt.DTb.share0]" in txt and "[CLAIM:dt.DTb.factor0]" in txt and "[CLAIM:dt.DTb.factor1]" in txt
+       and {"dt.DTb.share0", "dt.DTb.share1", "dt.DTb.factor0", "dt.DTb.factor1"} <= ids,
+       "BS-R8 (#248) the results state each share and each reference's factor as claims")
+    # Codex review of #246 P2-4: each reference's window is recorded, and a transfer across outcome, age band or
+    # window is stated as an assumption
+    ok(all("window" in v for v in (bs.get("references") or {}).values()) and "A" in (bs.get("assumption") or ""),
+       f"BS-R7 the record gives each reference's window and states the transfer assumption ({bs.get('assumption')})")
+
+
+def _self_test_anchor_e2e(ok, d, q):
+    """F6 S2-5d: anchor rows on the emulator path: each region's cases and all units' DALYs scaled to the external
+    level over the model window; every package's outcome moves by its unit's factor, reductions are kept."""
+    import yaml
+    from toolkit.analysis import burden as BV, contract
+    open(os.path.join(d, "burden_refs.csv"), "w").write("\n".join([",".join(BV.COLUMNS + ("role", "interval", "group_by")),
+        "W,*,,cases,count,,1,1e6,0,1e15,estimated,synthetic W,overlap,,,REF-W,,,,",
+        *[f"N{k},r{k},,cases,count,,1,{v},{v / 2},{2 * v},estimated,synthetic N,ratio,,,TOY-TARGETS,,anchor,,region"
+          for k, v in ((0, 2000.0), (1, 1500.0), (2, 1000.0))],
+        "ND,*,,dalys,count,,1,10000,5000,20000,estimated,synthetic ND,ratio,,,REF-ND,,anchor,,"]) + "\n")
+    try:
+        def mut(r):         # review r1 P1-2, P2-3: a burden-driven cost output, the external estimates' uncertainty
+            r["validation"]["burden"].update(window=[1, 2], window_metrics={"cases": "prev", "dalys": "prev"},
+                                             cost_scaling={"q": "cases"})
+            r["analysis"]["cost_outputs"] = {"q": {"cost_driver": "a_doses"}}
+            r["options"]["cost_items"].append({"id": "ca_q", "component": "a", "value": 1.0, "price_year": "2024",
+                                               "price_rule": "as_published", "basis": "per_outcome", "outcome": "q",
+                                               "includes": ["per_case"]})
+            r["uncertainty"]["sources"].append({"kind": "burden_anchor"})
+        _resign(d, mut)
+        R = run(d, log=q, compute_kw={"max_workers": 2}, draws=2)
+        ba = yaml.safe_load(open(os.path.join(d, "analysis", "burden_anchor.yaml")))["data"]
+    except Exception as e:  # noqa: BLE001
+        ok(False, f"BA6 a run with anchor rows completes and writes analysis/burden_anchor.yaml: {type(e).__name__}: {e}")
+        return
+    A, rows = R["_A"], {x["id"]: x for x in ba["rows"]}
+    z0 = {i: R["point"]["per_unit"][i]["z"] for i in A.ids}
+    anchored = A.evaluate(A.theta0, z0)
+    saved, A.anchor = A.anchor, None
+    try:
+        raw_out, raw_ben, _c = A.evaluate(A.theta0, z0)
+    finally:
+        A.anchor = saved
+    reg = {i: A.by_id[i]["region"] for i in A.ids}
+    f = {i: (rows[f"N{reg[i][1]}"]["factor"], rows["ND"]["factor"]) for i in A.ids}
+    tol = lambda a, b: abs(a - b) <= 1e-9 * max(abs(b), 1.0)  # noqa: E731
+    ok(set(rows) == {"N0", "N1", "N2", "ND"} and rows["N0"]["independent"] is False
+       and rows["N0"]["overlapping_source_ids"] == ["TOY-TARGETS"] and rows["ND"]["independent"] is True
+       and all(tol(rows[k]["factor"], rows[k]["value"] / rows[k]["model"]) for k in rows),
+       f"BA6 the artifact records each anchor's model value, external value, factor and independence: "
+       f"{ {k: round(r['factor'], 4) for k, r in rows.items()} }")
+    ok(all(tol(anchored[0][i]["y"][k]["cases"], raw_out[i]["y"][k]["cases"] * f[i][0])
+           and tol(anchored[0][i]["y"][k]["dalys"], raw_out[i]["y"][k]["dalys"] * f[i][1])
+           and tol(anchored[1][i][k], raw_ben[i][k] * f[i][1]) for i in A.ids for k in A.pk)
+       and all(tol(anchored[0][i]["y"][k]["cases"] / anchored[0][i]["y"][A.comp]["cases"],
+                   raw_out[i]["y"][k]["cases"] / raw_out[i]["y"][A.comp]["cases"]) for i in A.ids for k in A.pk),
+       "BA3 with an anchor every package's outcome and benefit move by the unit's factor; package/comparator ratios "
+       "are unchanged; with the anchor removed the evaluation is the engine's")
+    tot = sum(raw_out[i]["y"][A.comp]["dalys"] * f[i][1] for i in A.ids)
+    ok(tol(R["point"]["comparator_total"]["dalys"], tot)
+       and tol(sum(raw_out[i]["burden"][A.comp]["cases"] for i in A.ids if reg[i] == "r0") * rows["N0"]["factor"],
+               2000.0),
+       f"BA6 the point outcomes are the un-anchored ones times the factor ({R['point']['comparator_total']['dalys']:.6g}"
+       f" vs {tot:.6g}); the anchored arm's window burden is the external value")
+    fs = contract.gate_findings(d)
+    res = open(os.path.join(d, "results.md")).read()
+    ok(not [x for x in fs if x["kind"].startswith("burden_anchor")] and "anchored to external estimates" in res
+       and "[CLAIM:" not in res, f"BA6 the gate accepts the anchor artifact and results.md reports it: {fs}")
+    # review r1 P1-2: the cost matrix reads the scaled cost output (item ca_q, 1 $ per q, on packages with a)
+    cst, raw_c = anchored[2], _c
+    ok(all(tol(cst[i][k] - raw_c[i][k], (raw_out[i]["cost"][k]["q"] * (f[i][0] - 1.0)) if "a" in A.pk[k] else 0.0)
+           for i in A.ids for k in A.pk) and ba.get("cost_scaling") == {"q": "cases"},
+       "BA8 (review r1 P1-2) a cost output in cost_scaling enters the real cost matrix at its outcome's factor")
+    # review r1 P1-1, P2-3: in a draw the level is the draw's external value, against that draw's own model value
+    from toolkit.analysis import uncertainty as U
+    D = U.Drawer(A, 7)
+    D.prepare(2)
+    th, zs, noise, mult, smp = D.draw()
+    D2 = U.Drawer(A, 7)
+    D2.prepare(2)
+    smp2 = D2.draw()[4]
+    o_d = A.evaluate(th, zs, noise=noise, cost_mult=mult, sampled=smp)[0]
+    ud = yaml.safe_load(open(os.path.join(d, "analysis", "uncertainty.yaml")))["data"]
+    lvl = sum(o_d[i]["burden"][A.comp]["cases"] for i in A.ids if reg[i] == "r0")
+    ok("anchor:N0" in smp and smp["anchor:N0"] != 2000.0 and smp == smp2 and tol(lvl, smp["anchor:N0"])
+       and "burden_anchor" in ud.get("covers", []) and {"kind": "burden_anchor", "status": "drawn"} in [
+           {k: x.get(k) for k in ("kind", "status")} for x in ud["draw_plan"]["sources"]],
+       f"BA9 (review r1 P2-3) a draw samples each anchor's external value from its own seeded stream; the draw's "
+       f"window burden is that value ({lvl:.6g} vs {smp.get('anchor:N0')}); the interval covers burden_anchor")
+    _self_test_anchor_r2(ok, R, A, z0, anchored, reg, tol)
+
+
+def _self_test_anchor_r2(ok, R, A, z0, anchored, reg, tol):
+    """F6 S2-5d review round 2: the boundary check, stability folds, and the anchors' ranges in sensitivity and the
+    decision tests."""
+    import toolkit.analysis.model as Mm
+    import toolkit.engines.contract as Ct
+    from toolkit.analysis import boundary as BD, decision_tests as DT
+    out0, ben0, cost0 = anchored
+    raw = A.model.predict(z0, A.theta0, A.ids)            # the emulator's own (un-anchored) outputs
+    plan = R["point"]["plan"]
+    cands = [{"unit": i, "chosen": plan[i], "runner_up": next(k for k in A.pk if k != plan[i])} for i in A.ids[:4]]
+
+    class _DM:          # an engine that returns exactly what the emulator predicts
+        def __init__(self, spec, log=None):
+            self.packages = None
+
+        def predict(self, zs, theta, ids):
+            return {i: raw[i] for i in ids}
+    saved = Mm.DirectModel, Ct.Outcomes
+    Mm.DirectModel, Ct.Outcomes = _DM, (lambda **kw: None)
+    try:
+        ben_e, cost_e = BD.engine_tables(A, cands, z0, out0, {f"boundary:{c['unit']}|{k}": {}
+                                                              for c in cands for k in A.pk})
+        err = None
+    except Exception as e:  # noqa: BLE001
+        err = e
+    finally:
+        Mm.DirectModel, Ct.Outcomes = saved
+    ok(err is None and all(tol(ben_e[c["unit"]][k], ben0[c["unit"]][k]) and tol(cost_e[c["unit"]][k], cost0[c["unit"]][k])
+                           for c in cands for k in (c["chosen"], c["runner_up"])),
+       f"BA17 (review r2 P1) identical engine and emulator outputs, non-unit anchors, fixed and burden-driven costs: the "
+       f"boundary check's engine side equals the emulator side ({err!r})")
+    # review r2 P2: a fold evaluation keeps each anchor group's anchored total
+    hid = [i for i in A.ids if A.by_id[i]["grp"] == "g0"]
+    zh = dict(z0, **{i: z0[i] + 0.3 for i in hid})
+    oh, bh, ch = A.evaluate(A.theta0, zh, hid)
+    merged = {**out0, **oh}
+    ok(all(tol(sum(merged[i]["burden"][A.comp]["cases"] for i in A.ids if reg[i] == g), v)
+           for g, v in (("r0", 2000.0), ("r1", 1500.0), ("r2", 1000.0))) and set(bh) >= set(hid) and set(ch) == set(bh),
+       f"BA18 (review r2 P2) a fold that re-evaluates some units returns every member of their anchor groups, so the "
+       f"merged anchored totals stay external ({len(bh)} units for {len(hid)} held out)")
+    # review r2 P2: each anchor's published interval is a sensitivity row and an automatic range test
+    sens = R["sensitivity"]
+    srow = {r["name"]: r for r in sens["rows"]}
+    tests = {t["test_id"]: t for t in R["decision_tests"]}
+    ok({"burden_anchor_N0", "burden_anchor_ND"} <= set(srow) and srow["burden_anchor_N0"]["kind"] == "burden_anchor"
+       and tests.get("anchor_range_N0", {}).get("status") == "run" and tests["anchor_range_N0"].get("automatic"),
+       f"BA19 (review r2 P2) each anchor's interval enters the tornado and an automatic range test: "
+       f"{sorted(srow)[:6]}, {sorted(tests)[:8]}")
+    dt = next(t for t in DT.prior_range_tests(A) if t["id"] == "anchor_range_N0")
+    v0 = A.anchor["rows"]["N0"]["value"]          # the test's two ends, moved far apart (review r3: ends by group)
+    rec = DT.run_one(A, dict(dt, ends={0.025: {"anchor:N0": v0 * 0.06}, 0.975: {"anchor:N0": v0 * 15}}),
+                     z0, ben0, cost0, plan, R["uncertainty"], out0)
+    ok(rec.get("status") == "run" and rec.get("decision_changes") is True,
+       f"BA19 (review r2 P2) an anchor that moves the recommendation is found by its range test "
+       f"({rec.get('share_units_changed')}, {rec.get('triggered_by')})")
+    import tempfile
+    saved_dts = A.spec.raw["analysis"].get("decision_tests")
+    A.spec.raw["analysis"]["decision_tests"] = list(saved_dts or []) + [
+        {"id": "anchor_range_N0", "type": "envelope", "values": [9000.0], "text": "t"}]
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            DT.run_all(A, z0, out0, ben0, cost0, plan, R["uncertainty"], td)
+            ran = os.listdir(os.path.join(td, DT.DIR)) if os.path.isdir(os.path.join(td, DT.DIR)) else []
+        ok(False, f"BA24 (review r3) a declared test id equal to an automatic one is refused before any test runs ({ran})")
+    except ValueError as e:
+        ok("anchor_range_N0" in str(e), f"BA24 (review r3) a declared test id equal to an automatic one is refused "
+           f"before any test runs: {e}")
+    finally:
+        A.spec.raw["analysis"]["decision_tests"] = saved_dts
+
+
+
+def _self_test_floors_e2e(ok, d, q):
+    """Codex S1-3 P2: a run whose point floors per-outcome increments publishes them in point.yaml and the uncertainty
+    artifact, resolves the claims, and states them in results.md."""
+    import yaml
+    from toolkit.analysis.model import EmulatorModel
+
+    def mut(r):
+        r["analysis"]["cost_outputs"] = {"q": {"cost_driver": "b_doses"}}
+        r["options"]["cost_items"].append({"id": "cb_q", "component": "b", "value": 1.0, "price_year": "2024",
+                                           "price_rule": "as_published", "basis": "per_outcome", "outcome": "q",
+                                           "incremental": True, "includes": ["per_case"]})
+    orig = EmulatorModel.predict
+
+    def pred(self, zs, theta, ids, noise=None):
+        out = orig(self, zs, theta, ids, noise=noise)
+        f = _floor_q(theta, {}, True)
+        for i in out:
+            for p in out[i]["cost"]:
+                out[i]["cost"][p]["q"] = f(p)
+        return out
+    try:
+        _resign(d, mut)
+        EmulatorModel.predict = pred
+        R = run(d, log=q, compute_kw={"max_workers": 2}, draws=4)
+    except Exception as e:  # noqa: BLE001
+        ok(False, f"R5u a run with floored increments completes: {type(e).__name__}: {e}")
+        return
+    finally:
+        EmulatorModel.predict = orig
+    pt = yaml.safe_load(open(os.path.join(d, "analysis", "point.yaml")))["data"]
+    un = yaml.safe_load(open(os.path.join(d, "analysis", "uncertainty.yaml")))["data"]
+    n = len(R["_A"].ids)
+    ok((pt.get("cost_floors") or {}).get("n_unit_packages") == n and pt["cost_floors"]["items"] == ["cb_q"]
+       and (un.get("cost_floors") or {}).get("draws_with_floors") == 4,
+       f"R5u point.yaml and uncertainty.yaml record the floors ({pt.get('cost_floors')}; {un.get('cost_floors')})")
+    led = {c["id"]: c for c in (yaml.safe_load(open(os.path.join(d, "models", "claims_ledger.yaml"))) or {}).get("claims", [])}
+    res = open(os.path.join(d, "results.md")).read()
+    ok(float((led.get("cost.floored_unit_packages.point") or {}).get("value") or -1) == n
+       and "cost.floored_unit_packages.draws_with_floors" in led and "floors, not a cost" in res,
+       f"R5v the claims resolve the point and draw counts and results.md states them "
+       f"({ {k: (v or {}).get('value') for k, v in led.items() if 'floored' in k} })")
+
+
+def _self_test_reserve(ok, A, R, u_unc):
+    """F6 S1-1b on the emulator-path analysis, with a drawn cost multiplier (costs vary by draw): the unconstrained
+    plan fails the rule; the enforced plan, solved within a reserve, meets it on the same draws, and the contract
+    check finds nothing; the reserve and the value given up are reported; an unreachable rule blocks."""
+    import tempfile
+    import yaml
+    from toolkit.analysis import contract, run as _run_mod, uncertainty as U
+    plan0 = R["point"]["plan"]
+    z0 = {i: v["z"] for i, v in R["point"]["per_unit"].items()}
+    _o, ben0, cost0 = A.evaluate(A.theta0, z0)
+    sol0 = A.solve(ben0, cost0)
+    fn = getattr(_run_mod, "affordable_plan", None)
+    ok(callable(fn) and sol0["choice"] == plan0, "R5g affordable_plan() exists; the point plan re-solves unchanged")
+    if not callable(fn):
+        return
+    rule = {"max_share_over_budget": 0.2, "enforce": True}
+    A.spec.raw["uncertainty"]["affordability"] = rule
+    ok(u_unc["rule_met"] is False, f"R5h the unconstrained plan fails the rule on these draws "
+                                   f"({u_unc['draws_over_budget']} of 8 over, at most 0.2)")
+    res = fn(A, ben0, cost0, sol0, draws=8, seed=3)
+    rv, plan1 = res["reserve"], res["solution"]["choice"]
+    if hasattr(A, "set_reserve"):
+        A.set_reserve(rv["fraction"])
+    A.plan_budget = rv["budget_planned"]
+    u1 = U.run(A, plan1, "total_dalys_averted", draws=8, seed=3, pre=res["pre"])["data"]
+    af1 = u1["affordability"]
+    with tempfile.TemporaryDirectory() as t:
+        open(os.path.join(t, contract.SPEC), "w").write(yaml.safe_dump({"uncertainty": {"affordability": rule}}))
+        f_aff = contract._affordability(t, {"draws": 8, "affordability": af1})
+        f_unc = contract._affordability(t, {"draws": 8, "affordability": dict(u_unc, rule=rule)})
+    ok(af1["rule_met"] is True and f_aff == [] and f_unc and af1["draws_over_budget"] == rv["affordable"]["draws_over_budget"]
+       and rv["unconstrained"]["draws_over_budget"] == u_unc["draws_over_budget"],
+       f"R5i the enforced plan meets the rule on the uncertainty step's own draws and the contract check finds nothing; "
+       f"the unconstrained plan is a finding ({af1['draws_over_budget']} of 8 over; {f_aff[:1]})")
+    ok(0.5 <= rv["fraction"] < 1.0 and abs(rv["reserve_usd"] - (1 - rv["fraction"]) * A.budget) < 1e-6
+       and abs(rv["value_given_up"] - (rv["unconstrained"]["objective"] - rv["affordable"]["objective"])) < 1e-9
+       and rv["value_given_up"] >= 0 and abs(rv["value_given_up_pct"] - 100 * rv["value_given_up"]
+                                             / rv["unconstrained"]["objective"]) < 1e-9
+       and rv["search"]["steps"][0]["fraction"] == 1.0 and rv["search"]["tolerance"] > 0
+       and (rv.get("affordable") or {}).get("plan") == plan1 and rv["search"].get("result") == "best_visited"
+       and u1.get("budget_planned") == rv["budget_planned"],
+       f"R5j the reserve (fraction {rv['fraction']:.4f}, {rv['reserve_usd']:,.0f} USD held back) and the value given "
+       f"up ({rv['value_given_up_pct']:.2f}%) are reported with the search steps")
+    A.spec.raw["uncertainty"]["affordability"] = {"max_share_over_budget": 0.0, "enforce": True}
+    A.spec.raw["uncertainty"]["sources"][-1] = {"kind": "costs", "items": {"ca": [1.9, 2.0]}}
+    try:
+        fn(A, ben0, cost0, sol0, draws=8, seed=3, floor=0.95)
+        ok(False, "R5k a rule no plan at or above the floor meets blocks the analysis")
+    except AnalysisBlocked as e:
+        ok(e.where == "affordability" and "no visited fraction" in (e.reason or "")
+           and "not a proof" in (e.reason or ""),
+           f"R5k a rule no visited plan meets blocks the analysis, and the reason claims only what was visited: "
+           f"{e.reason}")
+    A.spec.raw["uncertainty"]["affordability"] = rule
+    # Codex S1-1b P2: an undefined percentage (zero unconstrained objective) is not a claim; the ledger never gets null
+    arts = R["artifacts"]
+    ids = lambda rr: {c["id"] for c in CL.claim_spec(A, arts, dict(R["point"], reserve=rr), R["uncertainty"],  # noqa: E731
+                                                      R["stability"], R["decision_tests"], R["calibration"])}
+    ok("reserve.value_given_up_pct" in ids(rv)
+       and "reserve.value_given_up_pct" not in ids(dict(rv, value_given_up_pct=None))
+       and "reserve.value_given_up" in ids(dict(rv, value_given_up_pct=None)),
+       "R5l a zero unconstrained objective leaves the value given up in percent undefined: that claim is omitted")
+    # Codex S1-1b P2: the envelope test and the frontier keep the reserve; the unchanged envelope does not move the plan
+    if hasattr(A, "set_reserve"):
+        A.set_reserve(rv["fraction"])
+    _o0, ben0, cost0 = A.evaluate(A.theta0, z0)
+    env = float(A.spec["constraints"]["envelope_usd"])
+    try:
+        t = DT.run_one(A, {"id": "env_same", "type": "envelope", "values": [env]}, z0, ben0, cost0, plan1, u1)
+        fr = FD.frontier(A, ben0, cost0, _o0)
+        p1 = next((x for x in fr["points"] if x["fraction"] == 1.0), {})
+        ok(t["share_units_changed"] == 0.0 and not t["decision_changes"]
+           and abs(p1.get("objective", -1) - rv["affordable"]["objective"]) <= 1e-9 * max(1.0, abs(p1.get("objective", 1))),
+           f"R5m with the reserve, the unchanged envelope shows NO_CHANGE ({t['share_units_changed']}) and the frontier "
+           f"at fraction 1 is the affordable plan ({p1.get('objective')} vs {rv['affordable']['objective']})")
+    except Exception as e:  # noqa: BLE001
+        ok(False, f"R5m the envelope test and frontier keep the reserve: {type(e).__name__}: {e}")
+
+
+def _self_test_reserve_e2e(ok, d, q):
+    """F6 S1-1b end to end: a signed spec that enforces the rule; point.yaml, claims and api.headline carry the reserve,
+    and the contract checks pass."""
+    import yaml
+    from toolkit.analysis import api, contract
+
+    def mut(r):
+        r["uncertainty"]["sources"] = list(r["uncertainty"]["sources"]) + [{"kind": "costs", "items": {"ca": [0.5, 2.0]}}]
+        r["uncertainty"]["excluded"] = [x for x in r["uncertainty"].get("excluded") or [] if x.get("kind") != "costs"]
+        r["uncertainty"]["affordability"] = {"max_share_over_budget": 0.2, "enforce": True}
+    try:
+        _resign(d, mut)
+        R = run(d, log=q, compute_kw={"max_workers": 2}, draws=8)
+    except Exception as e:  # noqa: BLE001
+        ok(False, f"R33 an enforced affordability rule runs end to end: {type(e).__name__}: {e}")
+        return
+    pt = yaml.safe_load(open(os.path.join(d, "analysis", "point.yaml")))["data"]
+    rv = pt.get("reserve") or {}
+    af = R["uncertainty"]["affordability"]
+    ok(rv.get("fraction") is not None and pt["plan"] == R["point"]["plan"] and af["rule_met"] is True
+       and (rv.get("affordable") or {}).get("plan") == pt["plan"]
+       and abs(pt["solver"]["objective"] - rv["affordable"]["objective"]) < 1e-9,
+       f"R33 the headline plan is the affordable plan, and it meets the rule: {af['draws_over_budget']} of 8 over")
+    cs = {c["id"] for c in (yaml.safe_load(open(os.path.join(d, CL.SPEC_REL))) or {}).get("claims", [])}
+    hl = api.headline(d)
+    ok({"reserve.fraction", "reserve.usd", "reserve.value_given_up", "reserve.value_given_up_pct"} <= cs
+       and {"reserve_fraction", "reserve_usd", "value_given_up", "value_given_up_pct"} <= set(hl),
+       f"R34 claims and api.headline carry the reserve and the value given up: {sorted(k for k in hl if 'reserve' in k)}")
+    ok(contract.gate_findings(d) == [], f"R35 the contract checks pass on an enforced run: {contract.gate_findings(d)}")
+    # Codex S1-1b P2: with enforce, the contract requires the reserve record and checks it against the artifacts
+    unc = yaml.safe_load(open(os.path.join(d, "analysis", "uncertainty.yaml")))["data"]
+    rule = {"max_share_over_budget": 0.2, "enforce": True}
+    rf = getattr(contract, "reserve_findings", None)
+    ok(callable(rf) and rf(rule, pt, unc) == [], "R37 reserve_findings() passes the enforced run's own artifacts")
+    if callable(rf):
+        u0 = next(iter(pt["plan"]))
+        alt = dict(pt["plan"], **{u0: "none" if pt["plan"][u0] != "none" else "a"})
+        for label, p_, u_ in (
+                ("no reserve record", {k: v for k, v in pt.items() if k != "reserve"}, unc),
+                ("published plan is not the reserve plan", dict(pt, plan=alt), unc),
+                ("planned budget is not fraction x budget", dict(pt, reserve=dict(rv, budget_planned=rv["budget_planned"] + 1)), unc),
+                ("dollars held back do not add up", dict(pt, reserve=dict(rv, reserve_usd=rv["reserve_usd"] + 1)), unc),
+                ("seed differs from the uncertainty step's", dict(pt, reserve=dict(rv, seed=rv["seed"] + 1)), unc),
+                ("draw count differs", dict(pt, reserve=dict(rv, draws=rv["draws"] + 1)), unc),
+                ("affordable count disagrees with the uncertainty step", pt,
+                 dict(unc, affordability=dict(unc["affordability"], draws_over_budget=unc["affordability"]["draws_over_budget"] + 1))),
+                ("draws planned at another budget", pt, dict(unc, budget_planned=unc.get("budget_planned", 0) + 1)),
+                ("the reserve plan breaks the rule", dict(pt, reserve=dict(rv, affordable=dict(rv["affordable"], share_over_budget=0.5,
+                                                                                          draws_over_budget=4))), unc)):
+            ok(bool(rf(rule, p_, u_)), f"R38 reserve contract, {label}: a finding")
+
+
+def _resign(d, mutate):
+    """Edit the run's signed spec (a new owner decision): drop the old sign-off and sign again."""
+    import shutil
+    import yaml
+    p = os.path.join(d, "decision_spec.yaml")
+    raw = yaml.safe_load(open(p))
+    mutate(raw)
+    yaml.safe_dump(raw, open(p, "w"), sort_keys=False)
+    for f in ("decision_spec.signoff.json",):
+        if os.path.exists(os.path.join(d, f)):
+            os.remove(os.path.join(d, f))
+    shutil.rmtree(os.path.join(d, "decision_brief.signed"), ignore_errors=True)
+    signoff.sign(d, "lead", note="self-test re-sign")
+
+
+def _self_test_round2(ok, d, q):
+    """Codex round 2 cases, on the emulator-path run directory of the main self-test."""
+    import math
+    import yaml
+    from toolkit.analysis import contract
+    # r2 P1-1: a real settings file must not break the run
+    with open(os.path.join(d, "analysis_settings.yaml"), "w") as f:   # the settings file exists before sign-off
+        yaml.safe_dump({"uncertainty": {"draws": 3}}, f)
+    _resign(d, lambda r: r["uncertainty"].pop("draws"))
+    try:
+        R = run(d, log=q, compute_kw={"max_workers": 2})
+        ok(R["uncertainty"]["draws"] == 3 and contract.gate_findings(d) == [],
+           f"R24 a run with a real analysis_settings.yaml completes and certifies (r2 P1-1): {contract.gate_findings(d)}")
+    except Exception as e:  # noqa: BLE001
+        ok(False, f"R24 a run with a real analysis_settings.yaml completes (r2 P1-1): {type(e).__name__}: {e}")
+        return
+    A = R["_A"]
+    spec = A.spec
+    # r2 P1-7: consumed files are inputs; replacing or deleting them invalidates the certificate
+    rp = os.path.join(d, "analysis", "batch", "results.jsonl")
+    keep = open(rp).read()
+    open(rp, "w").write(keep + "\n")
+    stale = [x for x in contract.gate_findings(d) if x["kind"] == "analysis_contract_stale" and "results.jsonl" in x["claim"]]
+    open(rp, "w").write(keep)
+    bench = A.eng.results_path
+    bkeep = open(bench).read()
+    open(bench, "a").write("# edited\n")
+    stale_b = [x for x in contract.gate_findings(d) if x["kind"] == "analysis_contract_stale"
+               and os.path.basename(bench) in x["claim"]]
+    open(bench, "w").write(bkeep)
+    ok(stale and stale_b and contract.gate_findings(d) == [],
+       "R25 replacing the batch results or the benchmark results invalidates the certificate (r2 P1-7)")
+    # r2 P1-5: the interaction is rescaled on one scale for the benchmark target and the allocation outcomes
+    out0, ben0, cost0 = A.evaluate(A.theta0, {i: v[0] for i, v in A.calibrate(A.theta0).items()})
+    plan = R["point"]["plan"]
+    dt = spec["analysis"]["decision_tests"][0]
+    try:
+        r = DT._interaction(A, dt, ben0, cost0, plan, out0)
+        comp, wa = set(dt["components"]), set(dt["with_any"])
+        worst = 0.0
+        for (v, ben, _c, _b, _f) in r["cases"]:
+            g = r["extra"][v]["increment_scale"]
+            for i in A.ids:
+                y0 = out0[i]["y"][A.comp][A.primary]
+                for k, cs in A.pk.items():
+                    if comp <= cs and cs & wa:
+                        base = next(n for n, c2 in A.pk.items() if c2 == cs - comp)
+                        yb, yk = out0[i]["y"][base][A.primary], out0[i]["y"][k][A.primary]
+                        yk_new = y0 - ben[i][k] / A.dfac
+                        worst = max(worst, abs(yk_new / yb - (yk / yb) ** g))
+        ok(r["cases"] and worst < 1e-9, f"R27 the allocation outcomes are rescaled like the benchmark odds ratio "
+                                        f"(log scale; r2 P1-5): worst {worst:.2e}")
+    except Exception as e:  # noqa: BLE001
+        ok(False, f"R27 the interaction rescale is one transformation (r2 P1-5): {type(e).__name__}: {e}")
+    # r2 P1-3: corrections in any later evaluation block publication when they touch a plan
+    orig = EmulatorModel.predict
+    calls = [0]
+
+    def late(self, zs, theta, ids, noise=None):
+        o = orig(self, zs, theta, ids, noise)
+        calls[0] += 1
+        if calls[0] > 1:          # every evaluation after the point one (draws, stability, sensitivity, tests)
+            self.last_events = self.last_events + [{"unit": ids[0], "package": "*", "kind": "reduction_clip"}]
+        return o
+    EmulatorModel.predict = late
+    try:
+        run(d, log=q, compute_kw={"max_workers": 2})
+        ok(False, "R28 a correction in an uncertainty draw that touches the plan blocks publication (r2 P1-3)")
+    except AnalysisBlocked as e:
+        ok("uncertainty" in str(e) and {x["kind"] for x in contract.gate_findings(d)} == {"analysis_contract_blocked"},
+           f"R28 a correction in an uncertainty draw that touches the plan blocks publication (r2 P1-3): {e}")
+    finally:
+        EmulatorModel.predict = orig
+    calls[0] = 0
+
+    def stab_only(self, zs, theta, ids, noise=None):
+        o = orig(self, zs, theta, ids, noise)
+        if len(ids) < len(A.ids):  # only the stability folds evaluate a subset of units
+            self.last_events = self.last_events + [{"unit": ids[0], "package": "*", "kind": "reduction_clip"}]
+        return o
+    EmulatorModel.predict = stab_only
+    try:
+        run(d, log=q, compute_kw={"max_workers": 2})
+        ok(False, "R29 a correction in a stability fold that touches its plan blocks publication (r2 P1-3)")
+    except AnalysisBlocked as e:
+        ok("stability" in str(e), f"R29 a correction in a stability fold that touches its plan blocks publication: {e}")
+    finally:
+        EmulatorModel.predict = orig
+    ends = {k: (lo, hi) for k, (lo, hi, _) in A.fr.items()}
+
+    def sens_only(self, zs, theta, ids, noise=None):
+        o = orig(self, zs, theta, ids, noise)
+        if any(float(theta.get(k, 1e300)) in e for k, e in ends.items()):   # only sensitivity sets a range end
+            self.last_events = self.last_events + [{"unit": ids[0], "package": "*", "kind": "cost_output_floor"}]
+        return o
+    EmulatorModel.predict = sens_only
+    try:
+        run(d, log=q, compute_kw={"max_workers": 2})
+        ok(False, "R31 a correction in a sensitivity evaluation that touches a plan blocks publication (r2 P1-3)")
+    except AnalysisBlocked as e:
+        ok("sensitivity" in str(e), f"R31 a correction in a sensitivity evaluation blocks publication: {e.where}")
+    finally:
+        EmulatorModel.predict = orig
+    # r2 P1-4: clamped calibrations in draws are recorded and narrow the interval's claim
+    _resign(d, lambda r: r["calibration"]["target_uncertainty"].update(region_sd_logit=4.0))
+    R = run(d, log=q, compute_kw={"max_workers": 2})
+    u = R["uncertainty"]
+    cc = u.get("calibration_clamped") or {}
+    ok(cc.get("draws", 0) > 0 and "calibration" not in u["interval"]["covers"]
+       and "calibration_partly_clamped" in u["interval"]["covers"] and "partly clamped" in u["label"],
+       f"R30 draws whose calibration clamps are recorded and the interval does not claim full calibration coverage "
+       f"(r2 P1-4): {cc} {u['label']}")
+    # engine: auto: the engine comes from the harness's engine_choice.json; its hash certifies every artifact
+    chosen = yaml.safe_load(open(os.path.join(d, "decision_spec.yaml")))["engine"]
+    _resign(d, lambda r: r.update(engine={"auto": True, "candidates": [chosen["ref"]]}))
+    cp = os.path.join(d, schema.ENGINE_CHOICE)
+    json.dump({"engine": chosen, "why": "self-test: the only candidate",
+               "candidates": [{"ref": chosen["ref"], "eligible": True, "why_not": ""}], "cross_check": {}}, open(cp, "w"))
+    run(d, log=q, compute_kw={"max_workers": 2}, draws=2)
+    pt = yaml.safe_load(open(os.path.join(d, "analysis", "point.yaml")))
+    clean = contract.gate_findings(d) == [] and pt["engine_choice_sha256"] == schema.sha256_file(cp)
+    doc = json.load(open(cp))
+    doc["why"] = "edited"
+    json.dump(doc, open(cp, "w"))
+    st = [x for x in contract.gate_findings(d) if x["kind"] == "analysis_contract_stale"]
+    ok(clean and st, f"R32 engine: auto runs on the harness's engine choice, and a changed choice makes the analysis "
+                     f"stale ({len(st)} findings)")
+    del math
+
+
+def _self_test_unit_attr(ok, q):
+    """F6: a decision test varies a units-table column that feeds an engine unit attribute (toy table, direct path)."""
+    import copy
+    import hashlib
+    import io
+    import tempfile
+    import yaml
+    with tempfile.TemporaryDirectory() as d:
+        r = schema.direct_toy(yaml.safe_load(open(schema.toy_spec(d, n=12))))
+        with open(os.path.join(d, "override.csv"), "w") as f:
+            f.write("id,cov\n2,1.2\n3,-1.2\n")
+        spec = schema.Spec(r, d)
+        A = Analysis(spec, DirectModel(spec, log=q))
+        base_rows = [dict(u) for u in spec.units()]
+        z0 = {i: None for i in A.ids}
+        out0, ben0, cost0 = A.evaluate(A.theta0, z0)
+        plan = A.solve(ben0, cost0)["choice"]
+
+        def one(**ua):
+            dt = {"id": "DTu", "type": "unit_attribute", "text": "t", "unit_attribute": ua}
+            try:
+                return DT.run_one(A, dt, z0, ben0, cost0, plan, {}, out0)
+            except Exception as e:  # noqa: BLE001 -- a failing case, not a crash of the self-test
+                return {"status": "error", "reason": f"{type(e).__name__}: {e}"}
+        rec = one(column="cov", values=[1.8, -1.8])
+        ua = rec.get("unit_attribute") or {}
+        ok(rec.get("status") == "run" and ua.get("column") == "cov" and ua.get("attributes") == ["x"]
+           and all(len(c["units_changed"]) == len(A.ids) for c in ua.get("cases") or [{}])
+           and max((rec.get("benefit_change_by_package") or {"": 0}).values()) > 0,
+           f"UA1 a unit_attribute test runs: it names the column, its engine attribute and the units changed, and the "
+           f"benefits move ({rec.get('status')}, {rec.get('reason')}, {ua.get('cases')})")
+
+        def ser(rows):
+            buf = io.StringIO()
+            w = csv.DictWriter(buf, fieldnames=list(rows[0]), lineterminator="\n")
+            w.writeheader()
+            w.writerows(rows)
+            return hashlib.sha256(buf.getvalue().encode()).hexdigest()
+        want = ser([dict(u, cov=repr(1.8)) for u in base_rows])
+        hs = [c.get("table_sha256") for c in ua.get("cases") or []]
+        ok(len(hs) == 2 and hs[0] == want and hs[0] != hs[1] and ua.get("base_table_sha256") == ser(base_rows),
+           f"UA2 each case records the sha256 of the modified units table (and the base table's): {hs}")
+        _, ben1, _ = A.evaluate(A.theta0, z0)
+        ok(spec.units() == base_rows and ben1 == ben0 and all(A.model.attrs[i] == spec.unit_attributes(A.by_id[i])
+                                                             for i in A.ids),
+           "UA3 after the test the units table, the engine attributes and the benefits are the headline's again")
+        rs = one(column="cov", units=["0", "1"], scale=[0.5])
+        ok(rs.get("status") == "run" and (rs.get("unit_attribute") or {}).get("cases", [{}])[0].get("units_changed")
+           == ["0", "1"], f"UA4 a scale case changes only the listed units ({rs.get('reason')}, "
+                          f"{(rs.get('unit_attribute') or {}).get('cases')})")
+        rf = one(column="cov", set_from="override.csv")
+        uf = rf.get("unit_attribute") or {}
+        fsha = hashlib.sha256(open(os.path.join(d, "override.csv"), "rb").read()).hexdigest()
+        ok(rf.get("status") == "run" and uf.get("cases", [{}])[0].get("units_changed") == ["2", "3"]
+           and uf.get("inputs") == {"override.csv": fsha},
+           f"UA5 a set_from case takes per-unit values from a table in the run directory and records its sha256 "
+           f"({rf.get('reason')}, {uf})")
+        refusals = {
+            "UA6 an unknown column": (dict(column="nocol", values=[0.5]), "not a column of the units table"),
+            "UA7 a unit id not in the table": (dict(column="cov", units=["zz"], values=[0.5]), "'zz'"),
+            "UA8 a value outside the declared domain": (dict(column="cov", values=[9.0]), "declared domain"),
+            "UA9 a scale that leaves every unit unchanged": (dict(column="cov", scale=[1.0]), "identity"),
+            "UA10 values equal to every unit's own": (dict(column="cov", units=["0"], values=[float(base_rows[0]["cov"])]),
+                                                     "identity"),
+            "UA11 a column feeding no engine attribute": (dict(column="pop", values=[5.0]), "feeds no engine unit"),
+            "UA12 a set_from table outside the run directory": (dict(column="cov", set_from="/etc/hosts"),
+                                                               "inside the run directory"),
+            "UA13 a scale case that leaves the domain": (dict(column="cov", scale=[10.0]), "declared domain")}
+        for label, (u_, needle) in refusals.items():
+            x = one(**u_)
+            ok(x.get("status") == "not_run" and needle in str(x.get("reason")),
+               f"{label} is refused: the test is not run and says why ({x.get('status')}, {x.get('reason')})")
+        # the emulator path: a column that is no emulator input cannot move the emulator's answer
+        ev = {"kind": "emulator", "box": {}, "features_box": {}, "point": dict(A.theta0), "packages": A.pk,
+              "engine": A.eng}
+        pe = DT.plan_test(spec, {"id": "DTu", "type": "unit_attribute",
+                                 "unit_attribute": {"column": "cov", "values": [0.5]}}, ev)
+        ok(pe.get("status") == "not_run" and "emulator input" in pe.get("why", ""),
+           f"UA14 on the emulator path a column that feeds no emulator feature is refused ({pe.get('why')})")
+        r2 = copy.deepcopy(r)
+        r2["analysis"]["decision_tests"] = [{"id": "DTu", "type": "unit_attribute", "text": "t",
+                                             "unit_attribute": {"column": "cov", "values": [1.8]}}]
+        os.makedirs(os.path.join(d, "models"), exist_ok=True)
+        A2 = Analysis(schema.Spec(r2, d), DirectModel(schema.Spec(r2, d), log=q))
+        try:
+            recs = DT.run_all(A2, z0, out0, ben0, cost0, plan, {}, d)
+            on_disk = yaml.safe_load(open(os.path.join(d, recs[0]["path"])))
+        except Exception as e:  # noqa: BLE001
+            on_disk = {"error": f"{type(e).__name__}: {e}"}
+        ok((on_disk.get("unit_attribute") or {}).get("cases", [{}])[0].get("table_sha256") == want,
+           f"UA15 the result file names the column, units and modified-table sha256 ({str(on_disk)[:160]})")
+    _self_test_unit_attr_r1(ok, q)
+    _self_test_unit_attr_r2(ok, q)
+    with tempfile.TemporaryDirectory() as d:     # end to end: the manifest binds the record and the set_from table
+        r = schema.direct_toy(yaml.safe_load(open(schema.toy_spec(d, n=12))))
+        with open(os.path.join(d, "override.csv"), "w") as f:
+            f.write("id,cov\n2,1.2\n3,-1.2\n")
+        r["analysis"]["decision_tests"] = [{"id": "DTu", "type": "unit_attribute", "text": "Does the attribute move it?",
+                                            "unit_attribute": {"column": "cov", "set_from": "override.csv"}}]
+        yaml.safe_dump(r, open(os.path.join(d, "decision_spec.yaml"), "w"), sort_keys=False)
+        signoff.sign(d, "lead", note="self-test")
+        from toolkit.analysis import contract
+        try:
+            run(d, log=q, compute_kw={"max_workers": 2}, draws=8)
+            art = yaml.safe_load(open(os.path.join(d, "analysis", "decision_tests.yaml")))
+            man = json.load(open(os.path.join(d, "analysis", "manifest.json")))
+        except Exception as e:  # noqa: BLE001 -- a failing case, not a crash of the self-test
+            art, man = {"error": f"{type(e).__name__}: {e}"}, {}
+        fsha = hashlib.sha256(open(os.path.join(d, "override.csv"), "rb").read()).hexdigest()
+        det = ((art.get("data") or {}).get("tests") or [{}])[0].get("detail") or {}
+        ok((art.get("inputs") or {}).get("override.csv") == fsha and det.get("unit_attribute", {}).get("column") == "cov"
+           and "models/decision_tests/DTu.yaml" in (man.get("deliverables") or {}) and contract.gate_findings(d) == [],
+           f"UA16 a run records the test in analysis/decision_tests.yaml with the set_from table among its hashed "
+           f"inputs, its record file is a manifest deliverable, and the contract checks pass ({str(art)[:200]})")
+
+
+def _self_test_unit_attr_r2(ok, q):
+    """#228 re-review (the reviewer's probes): a changed cell is written in its column's own format; identity compares
+    everything the arm's analysis reads (not the feature vector alone); the 'provably unchanged' proof needs the
+    feasible packages and constraints unchanged too."""
+    import tempfile
+    import types
+    import yaml
+    from toolkit.analysis import variants as V
+
+    def toy(d, n, mut):
+        r = schema.direct_toy(yaml.safe_load(open(schema.toy_spec(d, n=n))))
+        mut(r)
+        return schema.Spec(r, d)
+
+    def one(sp, ua):
+        try:
+            A = Analysis(sp, DirectModel(sp, log=q))
+            V.apply_headline(A)
+            z0 = {i: None for i in A.ids}
+            out0, ben0, cost0 = A.evaluate(A.theta0, z0)
+            plan = A.solve(ben0, cost0)["choice"]
+            return DT.run_one(A, {"id": "DTu", "type": "unit_attribute", "text": "t", "unit_attribute": ua},
+                              z0, ben0, cost0, plan, {}, out0)
+        except Exception as e:  # noqa: BLE001 -- a failing case, not a crash of the self-test
+            return {"status": "error", "reason": f"{type(e).__name__}: {e}", "results": [{}]}
+
+    def bind_elig(r):
+        r["decision_units"]["engine_attributes"] = {"x": {"column": "elig"}}
+    with tempfile.TemporaryDirectory() as d:     # P2-1: a binary eligibility column keeps its integer format
+        rec = one(toy(d, 6, bind_elig), {"column": "elig", "values": [1]})
+        ok(rec.get("status") == "run",
+           f"UA-R7 a value written into a binary eligibility column is read back by the eligibility reader "
+           f"({rec.get('status')}, {rec.get('reason')})")
+        rec = one(toy(d, 6, bind_elig), {"column": "elig", "values": [0.5]})
+        ok(rec.get("status") == "not_run" and "is not a boolean" in str(rec.get("rejected_values")),
+           f"UA-R7b a value the units reader rejects is refused with the reader's reason, not a crash "
+           f"({rec.get('status')}, {rec.get('reason')})")
+
+    def threshold(r):
+        bind_elig(r)
+        r["constraints"]["eligibility"] = {"b": {"column": "elig", "min": 0.5}}
+        r["engine_parameters"] = {"k": {"value": 0.0, "source": "probe", "reason": "constant burden",
+                                        "basis": "owner_judgement"}}
+    for label, ua in (("unlocks", {"column": "elig", "units": ["0"], "values": [1]}),
+                      ("locks", {"column": "elig", "units": ["1"], "values": [0]})):
+        with tempfile.TemporaryDirectory() as d:     # P2-3: feasibility moves while benefits and costs do not
+            rec = one(toy(d, 2, threshold), ua)
+            ok(rec.get("status") == "run" and rec.get("can_move_plan") is True
+               and not any(x.get("provably_unchanged") for x in rec.get("results") or [{}])
+               and "cannot move the plan" not in str(rec.get("statement")),
+               f"UA-R9 a change that {label} a package through eligibility is never 'provably unchanged' "
+               f"({rec.get('status')}, {rec.get('can_move_plan')}, {rec.get('decision_changes')}, "
+               f"{rec.get('reason') or rec.get('statement')})")
+    with tempfile.TemporaryDirectory() as d:     # P2-2: a population change no emulator feature sees is no identity
+        sp = toy(d, 6, lambda r: None)
+        for u in sp.units():
+            u["pop"] = "1"
+        sp.raw["decision_units"]["engine_attributes"] = {"group": {"columns": ["pop"]}}
+        sp.raw["analysis"]["emulator"] = {"features": [{"attribute": "group", "encoding": "count"}]}
+        card = types.SimpleNamespace(valid_ranges={"group": [0, 2]})
+        pl = DT.plan_unit_attribute(sp, {"unit_attribute": {"column": "pop", "values": [0.1]}}, card, "emulator",
+                                    {"group.count": (1.0, 1.0)})
+        ok(pl["status"] == "runs" and len((pl.get("perturbations") or [{}])[0].get("units_changed") or []) == 6,
+           f"UA-R8 a population change the emulator features do not see is not an identity: populations, costs and "
+           f"caps read it ({pl['status']}, {pl.get('why')})")
+
+
+def _self_test_unit_attr_r1(ok, q):
+    """#228 review round 1 (the reviewer's probes): each arm's analysis state is built from the modified table by the
+    headline's own constructor; identity on the built inputs; the set_from bytes executed are the bytes bound."""
+    import hashlib
+    import tempfile
+    import types
+    import yaml
+    from toolkit.analysis import variants as V
+
+    def setup(d, mut, pop=None, n=12):
+        r = schema.direct_toy(yaml.safe_load(open(schema.toy_spec(d, n=n))))
+        if pop is not None:
+            rows = list(csv.DictReader(open(os.path.join(d, "units.csv"))))
+            with open(os.path.join(d, "units.csv"), "w", newline="") as f:
+                w = csv.DictWriter(f, fieldnames=list(rows[0]))
+                w.writeheader()
+                w.writerows([dict(x, pop=pop) for x in rows])
+        mut(r)
+        sp = schema.Spec(r, d)
+        A = Analysis(sp, DirectModel(sp, log=q))
+        V.apply_headline(A)
+        z0 = {i: None for i in A.ids}
+        out0, ben0, cost0 = A.evaluate(A.theta0, z0)
+        return A, z0, out0, ben0, cost0, A.solve(ben0, cost0)["choice"]
+
+    def one(S_, ua):
+        A, z0, out0, ben0, cost0, plan = S_
+        try:
+            return DT.run_one(A, {"id": "DTu", "type": "unit_attribute", "text": "t", "unit_attribute": ua},
+                              z0, ben0, cost0, plan, {}, out0)
+        except Exception as e:  # noqa: BLE001 -- a failing case, not a crash of the self-test
+            return {"status": "error", "reason": f"{type(e).__name__}: {e}", "recommendation": {}}
+
+    def with_a(rec):      # units on a package holding a, in the re-solved plan (from its words)
+        parts = [x.split(": ") for x in str((rec.get("recommendation") or {}).get("without") or "").split("; ") if x]
+        return {k: int(n.split()[0]) for k, n in parts}
+    with tempfile.TemporaryDirectory() as d:     # P1: the headline minimum-service rule holds in every arm
+        S_ = setup(d, lambda r: (r["constraints"].update(envelope_usd=7000), r["analysis"].update(plan_variants={
+            "variants": [{"id": "ms", "type": "minimum_service", "components": ["a"], "text": "a everywhere"}],
+            "headline": "ms"})), n=6)
+        rec = one(S_, {"column": "cov", "units": ["0"], "values": [-1.5]})
+        got = with_a(rec)
+        ok(rec.get("status") == "run" and got and all("a" in k.split("+") for k in got),
+           f"UA-R1 a headline minimum-service rule holds in the test's arm ({rec.get('reason')}, {got})")
+    with tempfile.TemporaryDirectory() as d:     # P2: population-share caps from the arm's own table
+        S_ = setup(d, lambda r: (r["decision_units"]["engine_attributes"].update(x={"column": "pop"}),
+                                 r["constraints"].update(coverage={"a": {"max_population_share": 0.5}})), pop=1)
+        rec = one(S_, {"column": "pop", "values": [2.0]})
+        n_a = sum(n for k, n in with_a(rec).items() if "a" in k.split("+"))
+        ok(rec.get("status") == "run" and n_a == 6,
+           f"UA-R2 a population-share cap is computed from the arm's populations: a in 6 of 12 units ({n_a}, "
+           f"{rec.get('reason')})")
+    with tempfile.TemporaryDirectory() as d:     # P3: no package pruned away that an arm can afford
+        S_ = setup(d, lambda r: (r["decision_units"]["engine_attributes"].update(x={"column": "pop"}),
+                                 r["constraints"].update(envelope_usd=0.5),
+                                 r["options"]["packages"].update(within_envelope=True),
+                                 r["analysis"]["decision_tests"].append(
+                                     {"id": "DTu", "type": "unit_attribute", "text": "t",
+                                      "unit_attribute": {"column": "pop", "values": [0.1]}})), pop=2)
+        rec = one(S_, {"column": "pop", "values": [0.1]})
+        n_a = sum(n for k, n in with_a(rec).items() if "a" in k.split("+"))
+        ok(rec.get("status") == "run" and rec.get("decision_changes") is True and n_a == 5,
+           f"UA-R3 a package the arm can afford is not pruned by the headline table: a in 5 units ({n_a}, "
+           f"{rec.get('decision_changes')}, {rec.get('reason')})")
+    with tempfile.TemporaryDirectory() as d:     # P4: identity is judged on the built emulator inputs
+        r = schema.direct_toy(yaml.safe_load(open(schema.toy_spec(d, n=12))))
+        r["decision_units"]["engine_attributes"] = {"group": {"columns": ["cov", "elig"]}}
+        r["analysis"]["emulator"] = {"features": [{"attribute": "group", "encoding": "count"}]}
+        card = types.SimpleNamespace(valid_ranges={"group": [-2, 2]})
+        pl = DT.plan_unit_attribute(schema.Spec(r, d), {"unit_attribute": {"column": "cov", "values": [0.5]}}, card,
+                                    "emulator", {"group.count": (2.0, 2.0)})
+        ok(pl["status"] == "not_run" and "identity" in pl["why"],
+           f"UA-R4 a change no built emulator input sees (a list's count) is an identity ({pl['status']}, {pl['why']})")
+    with tempfile.TemporaryDirectory() as d:     # P6: the bytes executed are the bytes the artifact binds
+        S_ = setup(d, lambda r: None)
+        with open(os.path.join(d, "override.csv"), "w") as f:
+            f.write("id,cov\n0,1.8\n")
+        rec = one(S_, {"column": "cov", "set_from": "override.csv"})
+        ran = ((rec.get("unit_attribute") or {}).get("inputs") or {}).get("override.csv")
+        with open(os.path.join(d, "override.csv"), "w") as f:
+            f.write("id,cov\n0,-1.8\n")
+        try:
+            st = Store(d, None, False, {})
+            rel = st.write("decision_tests", {"tests": []}, DT.PRODUCER, DT.artifact_inputs([rec], d))
+            bound = (yaml.safe_load(open(os.path.join(d, rel))).get("inputs") or {}).get("override.csv")
+        except Exception as e:  # noqa: BLE001
+            bound = f"{type(e).__name__}: {e}"
+        now = hashlib.sha256(open(os.path.join(d, "override.csv"), "rb").read()).hexdigest()
+        ok(ran is not None and bound == ran and bound != now,
+           f"UA-R6 the artifact binds the set_from bytes the test executed, not a later re-read ({ran}, {bound})")
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

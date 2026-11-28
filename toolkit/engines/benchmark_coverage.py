@@ -518,12 +518,12 @@ def posterior_trained(raw: dict, ref: str, config: dict | None, base: str | None
     if not isinstance(u, dict) or "net_effect_posterior" not in u:      # malformed: schema validation says so
         return None, None
     try:
-        from toolkit.analysis import uncertainty as UQ
+        from toolkit.engines import hooks as _hooks
         from toolkit.spec import schema
         sp = schema.Spec({k: v for k, v in raw.items() if k != "_packages"} | {"engine": {"ref": ref, "config":
                                                                                          config or {}}},
                          base or os.getcwd())
-        ne = UQ.net_effect_sample(sp, engine if engine is not None else sp.engine())
+        ne = _hooks.external_posterior_sample(sp, engine if engine is not None else sp.engine())
         if not isinstance(ne.get("trained"), dict):
             raise ValueError("the loaded posterior does not say which benchmarks its fit trains on")
         return dict(ne["trained"]), None

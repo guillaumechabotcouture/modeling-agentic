@@ -84,11 +84,11 @@ def design_box(spec, eng) -> tuple:
     snames = list(sbox)
     sval = PV.values(spec)
     fr.update({k: (b[0], b[1], sval[k]) for k, b in sbox.items()})
-    # owner, 14 Nov (f6-posterior-ranges): a declared net-effect posterior's hull is its columns' box (the ranges the
-    # draws use, toolkit/analysis/uncertainty.py net_effect_sample); listed in `ext` so the emulator's domain is it too
-    from toolkit.analysis import uncertainty as UQ
-    ne = UQ.net_effect_sample(spec, eng)
-    fr, _ = UQ.with_posterior_ranges(ne, fr)
+    # owner, 14 Nov (f6-posterior-ranges): a declared external posterior's hull is its columns' box;
+    # listed in `ext` so the emulator's domain is it too
+    from toolkit.engines import hooks as _hooks
+    ne = _hooks.external_posterior_sample(spec, eng)
+    fr, _ = _hooks.external_posterior_with_ranges(ne, fr)
     ext = {k: list(fr[k][:2]) for k in (ne or {}).get("ranges", {}) if k in fr}
     # owner, 15 Nov ("tests may go wider"): an explicit parameter_value test widens a posterior column's box too (the
     # union of the hull and its values); the draws stay inside the hull. The sign-off precondition refuses a test value
@@ -254,10 +254,10 @@ def design(spec) -> tuple[dict, list[dict]]:
         #                                   values, a net-effect posterior's hull)
     if em.get("independent_features") is not None:     # only when declared, so other designs stay
         d["independent_features"], d["independent_features_basis"] = independent_features(spec)
-    from toolkit.analysis import uncertainty as UQ
-    ne = UQ.net_effect_sample(spec, eng)    # cached: the sample design_box read
+    from toolkit.engines import hooks as _hooks
+    ne = _hooks.external_posterior_sample(spec, eng)    # cached: the sample design_box read
     if ne is not None:                      # only with the field, so other designs stay
-        d["posterior_ranges"] = UQ.posterior_range_record(ne)
+        d["posterior_ranges"] = _hooks.external_posterior_range_record(ne)
     if snames:                            # only with spec values a decision test varies, so other designs stay
         d["spec_value_names"], d["spec_value_ranges"] = snames, {k: list(sbox[k]) for k in snames}
     return d,[dict(j, engine=spec["engine"], horizon=d["horizon"], windows=windows(spec)) for j in jobs]
@@ -557,7 +557,7 @@ def _self_test() -> int:
             # owner, 15 Nov ("tests may go wider"): an explicit parameter_value test on a posterior column widens its
             # design box to the union of the hull and the test's values (a DT9-like test at the prior's ends and its
             # middle); the draws stay inside the hull
-            from toolkit.analysis import uncertainty as UQ
+            from toolkit.engines import hooks as _hooks
             raw["analysis"]["decision_tests"] = list(raw["analysis"].get("decision_tests") or []) + [
                 {"id": "DTpa", "type": "parameter_value", "parameter": "eff_a", "values": [0.1, 0.5, 0.9], "text": "t"}]
             yaml.safe_dump(raw, open(os.path.join(d, "decision_spec.yaml"), "w"), sort_keys=False)
@@ -565,7 +565,7 @@ def _self_test() -> int:
             fr2, _n, _p, _s, ext2 = design_box(s2, s2.engine())
             ok(tuple(fr2["eff_a"][:2]) == (0.1, 0.9) and ext2["eff_a"] == [0.1, 0.9]
                and tuple(fr2["eff_b"][:2]) == hull["eff_b"]
-               and UQ.net_effect_sample(s2, s2.engine())["ranges"] == hull,
+               and _hooks.external_posterior_sample(s2, s2.engine())["ranges"] == hull,
                f"BA-NP4 a decision test outside the hull widens that column's box to the union ({fr2['eff_a'][:2]}); "
                f"the draw ranges stay the hull")
     case("BA-NP", bnp)

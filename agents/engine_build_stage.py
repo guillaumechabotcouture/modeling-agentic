@@ -38,12 +38,10 @@ POST_ENGINE_SIGN_STATES = (
 )
 
 MAX_ENGINE_BUILD_TRIES = 2
-MAX_ENGINE_REFERENCE_TRIES = 2
 MAX_ENGINE_REPAIRS = 1
 ENGINE_BUILD_CAP_USD = 40.0
 ENGINE_BUILD_CAP_MAX_USD = 200.0
 ENGINE_BUILD_TRY_CAP_USD = 15.0
-ENGINE_REFERENCE_CAP_USD = 6.0
 ENGINE_REVIEW_CAP_USD = 3.0
 ENGINE_ADMIT_COMPUTE_CAP_USD = 15.0
 AWAITING_ENGINE_SIGNOFF = "awaiting_engine_signoff"
@@ -143,7 +141,7 @@ class EngineBuildMixin:
         if eb.get("status") != "signed":
             return []
         from toolkit.engines.built import snapshot as BSNAP
-        return BSNAP.verify_engine_snapshot(self.run_dir)
+        return BSNAP.verify_admitted_engine(self.run_dir, require_signoff=True)[1]
 
     def _max_engine_build_tries(self) -> int:
         repairs = int((self.st.engine_build or {}).get("repairs") or 0)
@@ -185,34 +183,11 @@ class EngineBuildMixin:
                 "S1-S3": "file/link/size audit, AST import allowlist, banned calls/dunders/top-level execution",
                 "A1": "conformance with EngineCard, card.yaml, exact request parameters, non-negative finite outputs",
                 "A2": "determinism across processes, PYTHONHASHSEED, case orders, opaque IDs, and seed_test_setting",
-                "A3": "optional run_batch_state equals run pair by pair",
                 "A4": "declared oracle reductions + absent-component identity + per_capita_invariant_to_N",
                 "A5": "compartment mass balance, non-negativity, conservation, transition-count witnesses (starsim_module)",
                 "A6": "dead-parameter read tracking, read_outcomes phase check, non-trivial output movement, and output liveness",
                 "A8": "structured trial benchmarks under built coverage policy",
             },
-            "feedback": list(feedback or []),
-        }
-
-    def _build_reference_packet(self, build_decl: dict, feedback: list[str] | None,
-                                dossier_path: str = "evidence_dossier.yaml") -> dict:
-        """Build `_task_input.json` for `build_reference` (§4.4): request, contract, oracle signatures,
-        and allowed imports (including `scipy.integrate`), NEVER candidate code or paths."""
-        import inspect
-        from toolkit.engines import contract as _C
-        from toolkit.engines.built import oracles as BORC
-        from toolkit.engines.built import snapshot as BSNAP
-        oracle_sigs = {name: str(inspect.signature(fn)) for name, fn in sorted(BORC.ORACLE_REGISTRY.items())}
-        return {
-            "build": build_decl,
-            "contract_docstring": inspect.getdoc(_C) or "",
-            "allowed_imports": {
-                "top_level": sorted(BSNAP.ALLOWED_TOP_IMPORTS),
-                "qualified": sorted(BSNAP.REFERENCE_ALLOWED_QUALIFIED),
-            },
-            "oracle_signatures": oracle_sigs,
-            "dossier_path": dossier_path,
-            "output_file": "engine_build/reference/reference.py",
             "feedback": list(feedback or []),
         }
 
@@ -322,62 +297,6 @@ class EngineBuildMixin:
                           "critique_engine.yaml"):
             remove_nofollow(self.run_dir, stale_rel, missing_ok=True)
 
-    def _smoke_check_reference(self, ref_raw: bytes, build_decl: dict, raw_spec: dict) -> list[str]:
-        """Fast sandboxed runtime smoke check on `reference.py` before locking its snapshot: verifies
-        `describe()`, `parameters()`, and one evaluation produce finite non-negative declared outputs."""
-        import math
-        import numpy as np
-        from toolkit.engines.built import admission as BADM
-        from toolkit.engines.built import candidate as BCAND
-        from toolkit.engines.contract import Package
-        ref_build = dict(build_decl)
-        ref_build["kind"] = "closed_form"
-        req = ref_build.get("request") or {}
-        ref_files = {
-            "engine.py": bytes(ref_raw),
-            "card.yaml": b"name: built_reference\nkind: reference\nbenchmarks: []\n",
-            "ENGINE_NOTES.md": b"# Independent reference implementation\n",
-        }
-        try:
-            rc = BCAND.CandidateEngine(
-                ref_files, ref_build, run_dir=self.run_dir, unsandboxed_ok=self.st.engine_unsandboxed,
-            )
-            card = rc.describe()
-            _ = rc.parameters()
-            hor = BADM._default_horizon(raw_spec, req)
-            comp_specs = req.get("components") or {}
-            absent_pkg = {c: cs["absent"] for c, cs in comp_specs.items()}
-            u0 = BADM.generate_domain_units(req, 1, np.random.default_rng(17))[0]
-            out = rc.run({}, u0, Package("ref_smoke", absent_pkg), hor, seed=1)
-        except Exception as e:  # noqa: BLE001
-            return [f"reference runtime smoke check failed: {type(e).__name__}: {e}"]
-        probs: list[str] = []
-        req_outs = req.get("outputs") or {}
-        for pc in (req_outs.get("per_capita") or []):
-            pm = (out.per_capita or {}).get(pc)
-            if not isinstance(pm, dict):
-                probs.append(f"reference output missing per_capita.{pc}")
-                continue
-            for g in (req.get("age_groups") or card.age_groups or []):
-                v = pm.get(g)
-                if not isinstance(v, (int, float)) or isinstance(v, bool) or not math.isfinite(float(v)) or float(v) < 0.0:
-                    probs.append(f"reference per_capita.{pc}[{g}]={v!r} (must be finite >= 0)")
-        for drv in (req_outs.get("cost_drivers") or []):
-            dv = (out.cost_drivers or {}).get(drv)
-            if not isinstance(dv, (int, float)) or isinstance(dv, bool) or not math.isfinite(float(dv)) or float(dv) < 0.0:
-                probs.append(f"reference cost_driver {drv}={dv!r} (must be finite >= 0)")
-        for wn, ms in (req_outs.get("windows") or {}).items():
-            if wn in hor.windows:
-                wm = (out.windows or {}).get(wn)
-                if not isinstance(wm, dict):
-                    probs.append(f"reference window {wn!r} missing")
-                    continue
-                for m in (ms or []):
-                    mv = wm.get(m)
-                    if not isinstance(mv, (int, float)) or isinstance(mv, bool) or not math.isfinite(float(mv)):
-                        probs.append(f"reference window {wn}.{m}={mv!r} not finite")
-        return probs
-
     def _begin_engine_repair(self, why: str, findings: list[str] | None = None):
         """Route a GATE/FIX_LOOP finding with `target_stage: ENGINE` into the single allowed engine repair
         (§6.1, BE30): clears post_write, increments round_pending, withholds report, removes old sign-off,
@@ -408,154 +327,59 @@ class EngineBuildMixin:
         n_used = int(eb.get("tries") or 0)
         max_tries = self._max_engine_build_tries()
         snaps_dir = os.path.join(self.run_dir, "engine_build", "snapshots")
-        doss_rel = ((raw_spec.get("evidence") or {}).get("dossier")
-                    if isinstance(raw_spec.get("evidence"), dict) else None) or "evidence_dossier.yaml"
+        if n_used >= max_tries:
+            self._write_request_for_owner("maximum engine build tries exhausted",
+                                          list(self.st.tries.get("engine_build_feedback") or []))
+            eb["status"] = "refused"
+            return self._go("FINAL", f"engine build exhausted {max_tries} try/tries", ENGINE_NOT_ADMITTED)
 
-        # If a prior visit already built and snapshotted a valid candidate and paused for budget during
-        # `build_reference`, resume directly at the reference phase without spending another candidate try.
-        snap_sha = None
-        try_num = n_used
-        if (eb.get("status") == "awaiting_reference"
-                and isinstance(eb.get("snapshot_sha256"), str) and len(eb["snapshot_sha256"]) == 64):
-            try:
-                BSNAP.read_verified_snapshot(snaps_dir, eb["snapshot_sha256"])
-                snap_sha = eb["snapshot_sha256"]
-            except BSNAP.SnapshotError:
-                snap_sha = None
+        wdir_rel = f"models/ext/engine_{bid}"
+        wdir = os.path.join(self.run_dir, wdir_rel)
+        if os.path.isdir(wdir) and not os.path.islink(wdir):
+            from lib.safe_io import remove_nofollow
+            for entry in list(os.listdir(wdir)):
+                if not BSNAP._allowed_filename(entry):
+                    ep = os.path.join(wdir, entry)
+                    if not os.path.isdir(ep) or os.path.islink(ep):
+                        remove_nofollow(self.run_dir, f"{wdir_rel}/{entry}", missing_ok=True)
+        fb = list(self.st.tries.get("engine_build_feedback") or [])
+        packet = self._build_engine_packet(build_decl, fb)
+        try_num = n_used + 1
+        res = self._task(
+            f"ENGINE_BUILD#{self._visit()}:try{try_num}",
+            "build_engine",
+            self.run_dir,
+            packet,
+            bid,
+            cap_override=ENGINE_BUILD_TRY_CAP_USD,
+            build_budget=True,
+        )
+        if res is None:
+            return self._budget_out("ENGINE_BUILD")
+        eb["tries"] = try_num
+        static_probs: list[str] = []
+        try:
+            files = BSNAP.read_working_copy(wdir)
+            static_probs.extend(BSNAP.check_static(files, request=build_decl))
+        except BSNAP.SnapshotError as e:
+            static_probs.append(f"working copy invalid: {e}")
+        if static_probs and not res.ok:
+            static_probs.insert(0, f"build_engine task failed: {res.note}")
+        if static_probs:
+            self.st.tries["engine_build_feedback"] = static_probs[:40]
+            if try_num < max_tries:
+                return self._go("ENGINE_BUILD", f"static check failed on try {try_num}: {static_probs[0][:160]}")
+            self._write_request_for_owner("static checks failed on final try", static_probs)
+            eb["status"] = "refused"
+            return self._go("FINAL", f"engine build failed static checks after {try_num} tries", ENGINE_NOT_ADMITTED)
 
-        if snap_sha is None:
-            if n_used >= max_tries:
-                self._write_request_for_owner("maximum engine build tries exhausted",
-                                              list(self.st.tries.get("engine_build_feedback") or []))
-                eb["status"] = "refused"
-                return self._go("FINAL", f"engine build exhausted {max_tries} try/tries", ENGINE_NOT_ADMITTED)
-
-            wdir_rel = f"models/ext/engine_{bid}"
-            wdir = os.path.join(self.run_dir, wdir_rel)
-            if os.path.isdir(wdir) and not os.path.islink(wdir):
-                from lib.safe_io import remove_nofollow
-                for entry in list(os.listdir(wdir)):
-                    if not BSNAP._allowed_filename(entry):
-                        ep = os.path.join(wdir, entry)
-                        if not os.path.isdir(ep) or os.path.islink(ep):
-                            remove_nofollow(self.run_dir, f"{wdir_rel}/{entry}", missing_ok=True)
-            fb = list(self.st.tries.get("engine_build_feedback") or [])
-            packet = self._build_engine_packet(build_decl, fb)
-            try_num = n_used + 1
-            res = self._task(
-                f"ENGINE_BUILD#{self._visit()}:try{try_num}",
-                "build_engine",
-                self.run_dir,
-                packet,
-                bid,
-                cap_override=ENGINE_BUILD_TRY_CAP_USD,
-                build_budget=True,
-            )
-            if res is None:
-                return self._budget_out("ENGINE_BUILD")
-            eb["tries"] = try_num
-            static_probs: list[str] = []
-            try:
-                files = BSNAP.read_working_copy(wdir)
-                static_probs.extend(BSNAP.check_static(files, request=build_decl))
-            except BSNAP.SnapshotError as e:
-                static_probs.append(f"working copy invalid: {e}")
-            if static_probs and not res.ok:
-                static_probs.insert(0, f"build_engine task failed: {res.note}")
-            if static_probs:
-                self.st.tries["engine_build_feedback"] = static_probs[:40]
-                if try_num < max_tries:
-                    return self._go("ENGINE_BUILD", f"static check failed on try {try_num}: {static_probs[0][:160]}")
-                self._write_request_for_owner("static checks failed on final try", static_probs)
-                eb["status"] = "refused"
-                return self._go("FINAL", f"engine build failed static checks after {try_num} tries", ENGINE_NOT_ADMITTED)
-
-            man = BSNAP.create_snapshot(wdir, snaps_dir, run_static=True, request=build_decl)
-            snap_sha = man["snapshot_sha256"]
-            eb["snapshot_sha256"] = snap_sha
-            eb["status"] = "awaiting_reference"
-            self.st.tries.pop("engine_build_feedback", None)
-            self._update_pending_choice_status(bid, "building")
-            self._save()
-
-        # §4.4 & §6.1: when A11 is on and no verified reference snapshot exists yet, run `build_reference`
-        # (up to MAX_ENGINE_REFERENCE_TRIES = 2) or snapshot a pre-seeded reference.py. If `build_reference`
-        # fails twice, proceed to ENGINE_ADMIT where A11 returns `unavailable` -> not admitted.
-        req_ref = bool(eb.get("require_reference")) if "require_reference" in eb else True
-        if req_ref and not eb.get("reference_snapshot_sha256"):
-            from lib.safe_io import read_nofollow, remove_nofollow
-            ref_snaps = os.path.join(self.run_dir, "engine_build", "reference", "snapshots")
-            ref_rel = "engine_build/reference/reference.py"
-            ref_built = False
-            # If a valid reference.py is already on disk (e.g. reused or fixture-seeded), snapshot it directly
-            if os.path.lexists(os.path.join(self.run_dir, ref_rel)) and eb.get("reference_status") != "failed":
-                try:
-                    ref_raw, ref_st = read_nofollow(self.run_dir, ref_rel)
-                    if ref_st.st_nlink == 1:
-                        smoke_probs = self._smoke_check_reference(ref_raw, build_decl, raw_spec)
-                        if not smoke_probs:
-                            rman = BSNAP.create_reference_snapshot(ref_raw, ref_snaps, request=build_decl)
-                            eb["reference_snapshot_sha256"] = rman["snapshot_sha256"]
-                            eb["reference_status"] = "ready"
-                            ref_built = True
-                        else:
-                            remove_nofollow(self.run_dir, ref_rel, missing_ok=True)
-                    else:
-                        remove_nofollow(self.run_dir, ref_rel, missing_ok=True)
-                except (OSError, ValueError, BSNAP.SnapshotError):
-                    remove_nofollow(self.run_dir, ref_rel, missing_ok=True)
-            if not ref_built and eb.get("reference_status") != "failed":
-                start_ref_try = int(eb.get("reference_tries") or 0) + 1
-                ref_fb: list[str] = list(eb.get("reference_feedback") or [])
-                for ref_try in range(start_ref_try, MAX_ENGINE_REFERENCE_TRIES + 1):
-                    remove_nofollow(self.run_dir, ref_rel, missing_ok=True)
-                    r_pkt = self._build_reference_packet(build_decl, ref_fb, dossier_path=str(doss_rel))
-                    r_res = self._task(
-                        f"ENGINE_BUILD:{snap_sha[:12]}:ref{ref_try}",
-                        "build_reference",
-                        self.run_dir,
-                        r_pkt,
-                        bid,
-                        cap_override=ENGINE_REFERENCE_CAP_USD,
-                        build_budget=True,
-                    )
-                    if r_res is None:
-                        self._save()
-                        return self._budget_out("ENGINE_BUILD")
-                    eb["reference_tries"] = ref_try
-                    ref_probs: list[str] = []
-                    if os.path.lexists(os.path.join(self.run_dir, ref_rel)):
-                        try:
-                            ref_raw, ref_st = read_nofollow(self.run_dir, ref_rel)
-                            if ref_st.st_nlink != 1:
-                                ref_probs.append("reference.py must be a single-link regular file")
-                            else:
-                                rman = BSNAP.create_reference_snapshot(ref_raw, ref_snaps, request=build_decl)
-                                smoke_probs = self._smoke_check_reference(ref_raw, build_decl, raw_spec)
-                                if smoke_probs:
-                                    ref_probs.extend(smoke_probs)
-                                else:
-                                    eb["reference_snapshot_sha256"] = rman["snapshot_sha256"]
-                                    eb["reference_status"] = "ready"
-                                    eb.pop("reference_feedback", None)
-                                    ref_built = True
-                                    break
-                        except (FileNotFoundError, OSError, ValueError, BSNAP.SnapshotError) as e:
-                            ref_probs.append(f"reference static check failed: {e}")
-                    if not ref_built:
-                        if not r_res.ok:
-                            ref_probs.insert(0, f"build_reference failed: {r_res.note}")
-                        elif not ref_probs:
-                            ref_probs.append("reference.py was not written")
-                    ref_fb = ref_probs[:20]
-                    eb["reference_feedback"] = ref_fb
-                    self._save()
-                if not ref_built:
-                    remove_nofollow(self.run_dir, ref_rel, missing_ok=True)
-                    eb["reference_status"] = "failed"
-                    eb["reference_snapshot_sha256"] = None
-
+        man = BSNAP.create_snapshot(wdir, snaps_dir, run_static=True, request=build_decl)
+        snap_sha = man["snapshot_sha256"]
+        eb["snapshot_sha256"] = snap_sha
         eb["status"] = "building"
+        self.st.tries.pop("engine_build_feedback", None)
+        self._update_pending_choice_status(bid, "building")
+        self._save()
         return self._go("ENGINE_ADMIT", f"snapshot {snap_sha[:12]} built (try {try_num}/{max_tries})")
 
     def h_ENGINE_ADMIT(self):
@@ -650,7 +474,7 @@ class EngineBuildMixin:
                 eb["compute_reserved_usd"] = 0.0
                 _withhold_report(self.run_dir)
                 return self._go("FINAL", f"reference snapshot tampered: {e}", "artifact_tampered")
-        elif eb.get("reference_status") != "failed":
+        else:
             ref_dir = os.path.join(self.run_dir, "engine_build", "reference")
             if os.path.isdir(ref_dir) and os.path.isfile(os.path.join(ref_dir, "reference.py")):
                 try:
@@ -673,9 +497,7 @@ class EngineBuildMixin:
                 dossier_bytes = None
         from toolkit.engines import benchmark_coverage as BC
         from toolkit.engines.built import try_tool as BTRY
-        # §7 Q2: A11 reference comparison is ON by default (matches pre-sign sheet `A11_reference: 1`); never
-        # silently waived when reference.py is missing unless explicitly disabled in state.
-        req_ref = bool(eb.get("require_reference")) if "require_reference" in eb else True
+        req_ref = bool(eb.get("require_reference"))
         cfg_map = (build_decl.get("request") or {}).get("configs") or {}
         default_cfg = dict(cfg_map.get("default") or {}) if isinstance(cfg_map, dict) else {}
         actual_compute_usd = 0.0
@@ -703,13 +525,11 @@ class EngineBuildMixin:
         eb["admission_sha256"] = adm_sha
         eb["hidden_commitment"] = adm.get("hidden_commitment") or commit
 
-        # Check SPEC amendment routing BEFORE accepting admission (A10 is non-gating in admit(), so an
-        # otherwise-admitted engine with an unidentified parameter still routes to SPEC).
+        # Check SPEC amendment routing BEFORE accepting admission (A8).
         checks = adm.get("checks") or {}
         a8 = checks.get("A8") or {}
-        a10 = checks.get("A10") or {}
         other_gating_failed = [
-            cid for cid in ("A1", "A2", "A3", "A4", "A5", "A6", "A11")
+            cid for cid in ("A1", "A2", "A4", "A5", "A6", "A11")
             if (checks.get(cid) or {}).get("status") not in ("pass", "skipped", "not_applicable")
         ]
         a8_missing_bm = any("no benchmark" in str(p) for p in (a8.get("problems") or []))
@@ -720,43 +540,8 @@ class EngineBuildMixin:
             and a8.get("routing") == "spec_amendment"
             and (a8_missing_bm or not other_gating_failed or n_used >= max_tries)
         )
-        a10_unid = list(a10.get("unidentified") or [])
-        dt_names: set[str] = set()
-        for dt in ((spec_raw.get("analysis") or {}).get("decision_tests") or []):
-            if isinstance(dt, dict):
-                for key in ("parameter", "id"):
-                    if dt.get(key):
-                        dt_names.add(str(dt[key]))
-                for item in (dt.get("set") or []):
-                    if isinstance(item, dict) and item.get("parameter"):
-                        dt_names.add(str(item["parameter"]))
-                pert = dt.get("perturb")
-                if isinstance(pert, dict) and pert.get("name"):
-                    dt_names.add(str(pert["name"]))
-        cal_cfg = spec_raw.get("calibration") if isinstance(spec_raw.get("calibration"), dict) else {}
-        cal_method = "joint" if cal_cfg.get("joint") else str(cal_cfg.get("method") or "none")
-        cal_priors = cal_cfg.get("priors") if isinstance(cal_cfg.get("priors"), dict) else {}
-        a10_classes = a10.get("classes") if isinstance(a10.get("classes"), dict) else {}
-        auto_prior_range = {
-            p for p in a10_unid
-            if cal_method == "posterior"
-            and a10_classes.get(p) == "prior_dominated"
-            and p in cal_priors
-        }
-        req_d = build_decl.get("request") or {}
-        inert_set = set((req_d.get("inert") or {}).keys())
-        engine_inputs = (
-            {str(p["name"]) for p in (req_d.get("parameters") or []) if isinstance(p, dict) and p.get("name")}
-            | set((req_d.get("unit_attributes") or {}).keys())
-        ) - inert_set
-        a10_uncovered = [
-            p for p in a10_unid
-            if p in engine_inputs and p not in dt_names and p not in auto_prior_range
-        ]
-        if a8_amend or (adm.get("status") == "admitted" and a10_uncovered):
-            probs = list(a8.get("problems") or []) if a8_amend else []
-            if a10_uncovered:
-                probs.append(f"A10 unidentified parameter(s) without covering decision_test: {a10_uncovered}")
+        if a8_amend:
+            probs = list(a8.get("problems") or [])
             claim_txt = "; ".join(probs[:6])
             fix_req = "Owner amendment: add signed engine_departures or decision_test"
             led = FL.load(self.run_dir)
@@ -774,7 +559,7 @@ class EngineBuildMixin:
                 "source": "ENGINE_ADMIT",
                 "signed_spec_sha256": _spec_signed_sha(self.run_dir),
                 "working_spec_sha256": signed_hash(self.run_dir),
-                "briefs": [{"task": "ENGINE_ADMIT", "findings": ["A8" if a8_amend else "A10"],
+                "briefs": [{"task": "ENGINE_ADMIT", "findings": ["A8"],
                             "brief": "; ".join(probs[:4])}],
                 "findings": [{"id": "engine_admit_amendment", "severity": "HIGH",
                               "claim": claim_txt, "fix_requires": fix_req}],
@@ -782,7 +567,7 @@ class EngineBuildMixin:
             }
             _write_json(self.run_dir, SPEC_RETHINK_REQUEST, req_doc)
             self.st.tries["spec_amendment"] = True
-            return self._go("SPEC", "admission requires signed spec amendment (" + ("A8" if a8_amend else "A10") + ")")
+            return self._go("SPEC", "admission requires signed spec amendment (A8)")
 
         if adm.get("status") == "admitted":
             eb["status"] = "admitted"
@@ -796,7 +581,7 @@ class EngineBuildMixin:
         if adm.get("static_problems"):
             fb_lines += [f"static: {p}" for p in adm["static_problems"][:12]]
         failed_ids = list((adm.get("feedback") or {}).get("failed_checks") or [])
-        if (checks.get("A11") or {}).get("status") == "unavailable" and eb.get("reference_status") == "failed":
+        if (checks.get("A11") or {}).get("status") == "unavailable":
             fb_lines.append("A11 independent reference implementation failed to build; cannot admit without reference")
             eb["status"] = "refused"
             self._write_request_for_owner(f"admission failed on checks {failed_ids}", fb_lines)
@@ -1274,10 +1059,14 @@ def _self_test_built_engine(ok, td: str) -> None:
        f"(pending={pending_ok}, done={s_done}, lead={s_lead}, tamp={s_tamp})")
 
     # BE29a: static/admission failure twice -> completed_engine_not_admitted (exit 2) + request_for_owner.md;
-    # missing A11 reference.py also fails closed (A11 unavailable -> not admitted)
+    # default require_reference=False skips A11 cleanly; explicit require_reference=True without ref fails closed
     d29a, T29a, st29a = _mk_run("be29_fail", signoff="lead", build_fn=_cf_files(bad_static=True))
     s29a = Machine(d29a, T29a, st29a, backend=fast_b, log=lambda *a: None, cross_engine_check=False).run()
-    d29r, T29r, st29r = _mk_run("be29_noref", signoff="lead", with_ref=False)
+    d29_ok, T29_ok, st29_ok = _mk_run("be29_noref_default", signoff="lead", with_ref=False)
+    s29_ok = Machine(d29_ok, T29_ok, st29_ok, backend=fast_b, log=lambda *a: None, cross_engine_check=False).run()
+    d29r, T29r, st29r = _mk_run("be29_noref_req", signoff="lead", with_ref=False)
+    st29r.engine_build["require_reference"] = True
+    save_state(d29r, st29r)
     s29r = Machine(d29r, T29r, st29r, backend=fast_b, log=lambda *a: None, cross_engine_check=False).run()
     # BE29b: A8 out-of-band without departure -> ENGINE_ADMIT -> SPEC -> paused:awaiting_spec_amendment
     d29b, T29b, st29b = _mk_run("be29_a8", signoff="owner", include_trial_oob=True)
@@ -1301,13 +1090,14 @@ def _self_test_built_engine(ok, td: str) -> None:
     BSIG.decline(d29c, "owner", note="still unacceptable on try 2")
     s29c3 = Machine(d29c, StubTasks(T29c.s), None, backend=fast_b, log=lambda *a: None, cross_engine_check=False).run()
     ok(s29a == ENGINE_NOT_ADMITTED and RF.exit_code_for(s29a) == 2
+       and (s29_ok == "completed" or (dev_un and s29_ok == "run_failed"))
        and s29r == ENGINE_NOT_ADMITTED
        and os.path.isfile(os.path.join(d29a, "engine_build", "request_for_owner.md"))
        and s29b == f"paused:{AWAITING_SPEC_AMENDMENT}" and rq29b.get("source") == "ENGINE_ADMIT"
        and s29c1 == f"paused:{AWAITING_ENGINE_SIGNOFF}" and s29c2 == f"paused:{AWAITING_ENGINE_SIGNOFF}"
        and decl_n[0] == 2 and s29c3 == ENGINE_DECLINED and RF.exit_code_for(s29c3) == 2,
-       f"BE29 not-admitted (exit 2), missing-A11 fail-closed, A8 spec-amendment pause, and decline-rebuild/decline-terminal "
-       f"({s29a}, noref={s29r}, {s29b}, {s29c1}->{s29c2}->{s29c3}, builds={decl_n[0]})")
+       f"BE29 not-admitted (exit 2), optional A11 default + explicit require_reference fail-closed, A8 amendment, decline "
+       f"({s29a}, noref_default={s29_ok}, noref_req={s29r}, {s29b}, {s29c1}->{s29c2}->{s29c3}, builds={decl_n[0]})")
 
     # BE30: post-analysis GATE finding with target_stage=ENGINE triggers 1 repair (new hidden seed) and refuses 2nd
     rep_n = [0]
@@ -1430,136 +1220,18 @@ def _self_test_built_engine(ok, td: str) -> None:
        f"BE33 compute reservation pauses before BADM.admit (calls={admit_calls[0]}, {s33_adm}); "
        f"interrupted build charges lane ({lane_charged}), engine_build_cap pauses ({s33_bcap}) and resumes ({s33_res})")
 
-    # BE17_REF (§4.4, PR epsilon): real `build_reference` task using scipy.integrate creates a content-addressed
-    # reference snapshot, binds admission.json["digests"]["reference_snapshot"], and passes A11
-    ref_ode_py = (
-        "from scipy.integrate import solve_ivp\n"
-        "from toolkit.engines.contract import EngineCard, Outcomes, ParamSpec\n"
-        "class Model:\n"
-        "    def describe(self):\n"
-        "        return EngineCard(\n"
-        "            name='built:cf_mod', version='0.1',\n"
-        "            mechanisms=['custom_coupled_hazard_scaling', 'exponential_survival'],\n"
-        "            components={'comp_a': [0, 1]},\n"
-        "            unit_attributes={'N': 'pop', 'haz': 'hazard'},\n"
-        "            outputs={'per_capita': ['cases'], 'windows': ['surv'], 'cost_drivers': ['units_delivered']},\n"
-        "            age_groups=['all'], valid_ranges={'N': [1000.0, 10000.0], 'haz': [0.1, 0.5]},\n"
-        "        )\n"
-        "    def parameters(self):\n"
-        "        return [ParamSpec('base_scale', 1.0, 'fixed', units='ratio', lo=0.5, hi=1.5, source='dossier:E1')]\n"
-        "    def evaluate(self, params, unit, package, horizon):\n"
-        "        dt = max(float(horizon.stop) - float(horizon.start), 1e-6)\n"
-        "        haz = float(unit.attributes['haz'])\n"
-        "        bs = float(params.get('base_scale', 1.0))\n"
-        "        ca = int(package.components.get('comp_a', 0))\n"
-        "        h_eff = haz * bs * (1.0 - 0.4 * ca)\n"
-        "        sol = solve_ivp(lambda _t, y: [-h_eff * y[0]], [0.0, dt], [1.0], rtol=1e-9, atol=1e-12)\n"
-        "        surv = float(sol.y[0, -1])\n"
-        "        return Outcomes(per_capita={'cases': {'all': 1.0 - surv}},\n"
-        "                        windows={'w0': {'surv': surv}},\n"
-        "                        cost_drivers={'units_delivered': float(ca)})\n"
-    ).encode("utf-8")
-    d_ref, T_ref, st_ref = _mk_run("be17_real_ref", signoff="lead", with_ref=False)
-    T_ref.s["build_reference"] = ref_ode_py
-    s_ref = Machine(d_ref, T_ref, st_ref, backend=fast_b, log=lambda *a: None, cross_engine_check=False).run()
-    st_ref_end = load_state(d_ref)
-    adm_ref = json.load(open(os.path.join(d_ref, "engine_build", "admission.json")))
-    ref_sha = (st_ref_end.engine_build or {}).get("reference_snapshot_sha256")
-    ok((s_ref == "completed" or (dev_un and s_ref == "run_failed"))
-       and isinstance(ref_sha, str) and len(ref_sha) == 64
-       and adm_ref.get("checks", {}).get("A11", {}).get("status") == "pass"
-       and (adm_ref.get("digests") or {}).get("reference_snapshot") == ref_sha
-       and "build_reference:cf_mod" in T_ref.calls,
-       f"BE17_REF build_reference (scipy.integrate) snapshots reference, binds digest, and passes A11 "
-       f"(status={s_ref}, a11={adm_ref.get('checks', {}).get('A11', {}).get('status')}, ref_sha={bool(ref_sha)})")
-
-    # BE17_REF_RESUME + BEG_GATE_WIRE: budget pause during build_reference on the final candidate try
-    # resumes straight into build_reference without losing the snapshot; and manifest size tampering is
-    # caught by Machine.harness_findings() via built_engine_gate.
-    d_rr, T_rr, st_rr = _mk_run("be17_ref_resume", signoff="lead", with_ref=False)
-    T_rr.s["build_reference"] = ref_ode_py
-    m_rr = Machine(d_rr, T_rr, st_rr, backend=fast_b, log=lambda *a: None, cross_engine_check=False)
-    for _ in range(10):
-        if m_rr.st.state == "ENGINE_BUILD" or m_rr.st.state == "FINAL" or m_rr.st.paused:
-            break
-        m_rr.step()
-    m_rr.st.engine_build["tries"] = MAX_ENGINE_BUILD_TRIES - 1
-    m_rr.st.engine_build_cap_usd = 5.0
-    T_rr.s["usd"] = 4.90  # leaves $0.10 < MIN_TASK_ALLOWANCE_USD so build_reference pauses on engine_build_cap
-    save_state(d_rr, m_rr.st)
-    s_rr_p = m_rr.run()
-    st_rr_p = load_state(d_rr)
-    paused_ok = (s_rr_p == f"paused:{AWAITING_BUDGET}" and st_rr_p.state == "ENGINE_BUILD"
-                 and (st_rr_p.engine_build or {}).get("status") == "awaiting_reference"
-                 and int((st_rr_p.engine_build or {}).get("tries") or 0) == MAX_ENGINE_BUILD_TRIES)
-    # Raise cap and resume: must NOT fail with ENGINE_NOT_ADMITTED, must skip build_engine, run build_reference & admit
-    st_rr_p.engine_build_cap_usd = 30.0
-    st_rr_p.paused = None
-    T_rr.s["usd"] = 0.0
-    save_state(d_rr, st_rr_p)
-    s_rr_end = Machine(d_rr, T_rr, st_rr_p, backend=fast_b, log=lambda *a: None, cross_engine_check=False).run()
-    # Now tamper ONLY `size` in the snapshot manifest and check Machine.harness_findings() catches it via built_engine_gate
-    snap_rr = (load_state(d_rr).engine_build or {}).get("snapshot_sha256")
-    man_p = os.path.join(d_rr, "engine_build", "snapshots", f"{snap_rr}.json")
+    # BEG_GATE_WIRE: manifest size tampering is caught by Machine.harness_findings() via built_engine_gate
+    d_gw = os.path.join(td, "be_gate_wire")
+    shutil.copytree(lead_d, d_gw)
+    snap_gw = (load_state(d_gw).engine_build or {}).get("snapshot_sha256")
+    man_p = os.path.join(d_gw, "engine_build", "snapshots", f"{snap_gw}.json")
     man_doc = json.load(open(man_p))
     man_doc["files"][0]["size"] = int(man_doc["files"][0]["size"]) + 99
     with open(man_p, "w", encoding="utf-8") as _mf:
         json.dump(man_doc, _mf)
-    hf_rr = Machine(d_rr, T_rr, load_state(d_rr), backend=fast_b, log=lambda *a: None, cross_engine_check=False).harness_findings()
-    ok(paused_ok and (s_rr_end == "completed" or (dev_un and s_rr_end == "run_failed"))
-       and T_rr.calls.count("build_engine:cf_mod") == 1 and "build_reference:cf_mod" in T_rr.calls
-       and any(f.get("kind") == "built_engine_snapshot_invalid" and "size mismatch" in str(f.get("claim")) for f in hf_rr),
-       f"BE17_REF_RESUME budget pause during build_reference resumes cleanly on final try ({paused_ok}, {s_rr_end}) "
-       f"and harness_findings runs built_engine_gate ({[f.get('kind') for f in hf_rr]})")
-
-    # BE_A10_PRIOR: posterior prior_dominated params with declared calibration.priors are auto-covered by
-    # ANALYZE's prior_range_<p> tests and proceed to ENGINE_REVIEW; non-posterior unidentified params still route to SPEC.
-    import yaml as _yaml
-    a10_res = {}
-    for label, cal_decl, a10_cls in (
-        ("post", {"method": "posterior", "parameters": ["base_scale"],
-                  "priors": {"base_scale": {"dist": "uniform", "range": [0.5, 1.5], "source": "test"}}},
-         "prior_dominated"),
-        ("lik", {"method": "likelihood", "parameters": ["base_scale"]}, "unidentified"),
-    ):
-        d_ap, T_ap, st_ap = _mk_run(f"be_a10_{label}", signoff="lead")
-        m_ap = Machine(d_ap, T_ap, st_ap, backend=fast_b, log=lambda *a: None, cross_engine_check=False)
-        for _ in range(10):
-            if m_ap.st.state == "ENGINE_ADMIT" or m_ap.st.state == "FINAL" or m_ap.st.paused:
-                break
-            m_ap.step()
-        sp_p = os.path.join(d_ap, AB.SPEC_FILE)
-        sp_d = _yaml.safe_load(open(sp_p))
-        sp_d["calibration"] = cal_decl
-        with open(sp_p, "w", encoding="utf-8") as _sf:
-            _yaml.safe_dump(sp_d, _sf, sort_keys=False)
-        orig_adm_ap = BADM.admit
-
-        def _stub_adm(run_dir, snap_sha, *_a, _cls=a10_cls, **_kw):
-            doc = {
-                "status": "admitted",
-                "hidden_commitment": "0" * 64,
-                "snapshot_sha256": snap_sha,
-                "checks": {
-                    "A8": {"id": "A8", "status": "pass", "problems": [], "routing": None},
-                    "A10": {"id": "A10", "status": "pass", "classes": {"base_scale": _cls},
-                            "unidentified": ["base_scale"], "problems": []},
-                },
-            }
-            ap = os.path.join(run_dir, "engine_build", "admission.json")
-            os.makedirs(os.path.dirname(ap), exist_ok=True)
-            with open(ap, "w", encoding="utf-8") as _af:
-                json.dump(doc, _af)
-            return doc
-
-        BADM.admit = _stub_adm
-        try:
-            m_ap.step()
-        finally:
-            BADM.admit = orig_adm_ap
-        a10_res[label] = (m_ap.st.state, os.path.isfile(os.path.join(d_ap, SPEC_RETHINK_REQUEST)))
-    ok(a10_res["post"] == ("ENGINE_REVIEW", False) and a10_res["lik"] == ("SPEC", True),
-       f"BE_A10_PRIOR posterior prior_dominated proceeds to ENGINE_REVIEW while likelihood unidentified routes to SPEC ({a10_res})")
+    hf_gw = Machine(d_gw, StubTasks(lead_T.s), load_state(d_gw), backend=fast_b, log=lambda *a: None, cross_engine_check=False).harness_findings()
+    ok(any(f.get("kind") == "built_engine_snapshot_invalid" and "size mismatch" in str(f.get("claim")) for f in hf_gw),
+       f"BEG_GATE_WIRE harness_findings runs built_engine_gate ({[f.get('kind') for f in hf_gw]})")
 
 
 

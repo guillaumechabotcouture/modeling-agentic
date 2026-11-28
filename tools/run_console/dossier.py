@@ -285,8 +285,7 @@ def _card_units(run_dir: str) -> dict:
 
 def _decision_tests(spec: dict, units: dict) -> list:
     out = []
-    from toolkit.spec import perturb as PT       # W0-B: a perturb test in its per-target form
-    for t in PT.tests(_m(spec.get("analysis"))):
+    for t in _l(_m(spec.get("analysis")).get("decision_tests")):
         if not isinstance(t, dict):
             continue
         typ, unit, values = t.get("type"), "", _l(t.get("values"))
