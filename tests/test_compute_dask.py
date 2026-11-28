@@ -63,6 +63,27 @@ def _self_test_patched_repo(iso_repo: str):
             sys.modules["ma_compute_worker_side"] = prev
 
 
+try:
+    from distributed import WorkerPlugin as _WorkerPlugin
+except ImportError:
+    _WorkerPlugin = object
+
+
+class OwnTmp(_WorkerPlugin):
+    """One temp dir per local worker, as each VM has (the one-chunk lock lives there)."""
+    name = "ma-selftest-own-tmp"
+
+    def __init__(self, base: str):
+        self.base = base
+
+    def setup(self, worker):
+        import tempfile as tf_
+        d_ = os.path.join(self.base, worker.address.rsplit(":", 1)[-1])
+        os.makedirs(d_, exist_ok=True)
+        os.environ["TMPDIR"] = d_
+        tf_.tempdir = d_
+
+
 def _self_test_durable(ok) -> None:
     """CD1-CD9 (v2 autonomy brief, PR 1D item 2): the dask dispatch loop against a fake client (no cluster).
     A dropped scheduler connection ended the batch and charged what was in flight; an unread scheduler view
@@ -553,13 +574,15 @@ def _self_test_sched(ok) -> None:
        "SR7 the reader is the repo's cloud/worker_side.py, loaded once by path (a models/worker_side.py cannot shadow it)")
 
 
-def _self_test_infra(ok, lc, cc, tmpb) -> None:
+def _self_test_infra(ok) -> None:
     """IR1-IR6 (Nigeria v2 full run, 2026-11-02): at the tail of a 256-point batch the autoscaler
     retired workers that were still running chunks. Each lost chunk was resubmitted once, both
     resubmissions were lost the same way, and 16 rows came back infra; the analysis then failed
     closed. A LocalCluster of 2 workers; every wait is on an event, never a fixed sleep."""
     import tempfile
     import threading
+    import dask
+    from distributed import Client, LocalCluster
 
 
     def until(pred, limit=60.0):
@@ -611,7 +634,9 @@ def _self_test_infra(ok, lc, cc, tmpb) -> None:
             "MA_COMPUTE_EXCLUDE_WORKERS", "MA_COMPUTE_DISPATCH_S", "MA_COMPUTE_NO_WORKER_WAIT_S",
             "MA_COMPUTE_INFRA_BACKOFF_S")
     saved = {k: os.environ.get(k) for k in keys}
-    with tempfile.TemporaryDirectory() as rd, tempfile.TemporaryDirectory() as _iso_td:
+    with tempfile.TemporaryDirectory() as rd, tempfile.TemporaryDirectory() as tmpb, \
+            tempfile.TemporaryDirectory() as _iso_td, \
+            dask.config.set({"distributed.scheduler.active-memory-manager.start": False}):
         rd = os.path.realpath(rd)
         iso_repo = _self_test_iso_repo(_iso_td)
         os.makedirs(os.path.join(rd, "models"))
@@ -628,8 +653,10 @@ def _self_test_infra(ok, lc, cc, tmpb) -> None:
             "        while not os.path.exists(os.path.join(d, p['wait'])):\n"
             "            time.sleep(0.02)\n"
             "    return p['k']\n")
-        with _self_test_patched_repo(iso_repo):
+        with LocalCluster(n_workers=2, threads_per_worker=1, processes=True, dashboard_address=None) as lc, \
+                Client(lc.scheduler_address) as cc, _self_test_patched_repo(iso_repo):
             try:
+                cc.register_plugin(OwnTmp(tmpb))
                 cc.register_plugin(ComputeTagPlugin("compute"))
                 os.environ.update(MA_COMPUTE_SCHEDULER=lc.scheduler_address, MA_COMPUTE_RESOURCE="compute",
                                   MA_COMPUTE_TARGET_WORKERS="2", MA_COMPUTE_PROCS_PER_WORKER="1",
@@ -761,7 +788,8 @@ def _self_test_infra(ok, lc, cc, tmpb) -> None:
                         os.environ[k] = v
 
 
-def _self_test_dask_core(ok, lc) -> None:
+def _self_test_dask_core(ok) -> None:
+    from distributed import LocalCluster
     with tempfile.TemporaryDirectory() as d, tempfile.TemporaryDirectory() as _iso_td:
         iso_repo = _self_test_iso_repo(_iso_td)
         os.makedirs(os.path.join(d, "models"))
@@ -773,9 +801,10 @@ def _self_test_dask_core(ok, lc) -> None:
         open(os.path.join(d, "models", "slow.py"), "w").write(
             "import os, time\ndef sleep(p):\n    time.sleep(p['s']); return {'ok': 1}\n")
         inputs = [{"x": k} for k in range(40)] + [{"x": 0, "boom": True}]
-        os.environ["MA_COMPUTE_SCHEDULER"] = lc.scheduler_address
-        try:
-            with _self_test_patched_repo(iso_repo):
+        with LocalCluster(n_workers=2, threads_per_worker=1, processes=True, dashboard_address=None) as lc, \
+                _self_test_patched_repo(iso_repo):
+            os.environ["MA_COMPUTE_SCHEDULER"] = lc.scheduler_address
+            try:
                 rows, s = map_fn(d, "models/fn.py::f", inputs)
                 ok(s["backend"] == "dask" and rows[7]["result"] == {"y": 21.0} and s["n_failed"] == 1
                    and [r["i"] for r in rows] == list(range(41)), f"C8 dask backend: {s}")
@@ -828,14 +857,15 @@ def _self_test_dask_core(ok, lc) -> None:
                    f"C34 a worker that joined mid-batch got work (pool target 3): {used2} {s2.get('pool_target')}")
                 for k in ("MA_COMPUTE_RESOURCE", "MA_COMPUTE_TARGET_WORKERS"):
                     os.environ.pop(k, None)
-        finally:
-            os.environ.pop("MA_COMPUTE_SCHEDULER", None)
-            os.environ.pop("MA_COMPUTE_EXCLUDE_WORKERS", None)
-            os.environ.pop("MA_COMPUTE_PROCS_PER_WORKER", None)
+            finally:
+                os.environ.pop("MA_COMPUTE_SCHEDULER", None)
+                os.environ.pop("MA_COMPUTE_EXCLUDE_WORKERS", None)
+                os.environ.pop("MA_COMPUTE_PROCS_PER_WORKER", None)
 
 
-def _self_test_p42_dask(ok, lc) -> None:
+def _self_test_p42_dask(ok) -> None:
     import signal
+    from distributed import LocalCluster
     env = {k: v for k, v in os.environ.items() if not k.startswith("MA_COMPUTE_")}
 
     def ledger(d):
@@ -856,7 +886,8 @@ def _self_test_p42_dask(ok, lc) -> None:
             time.sleep(0.01)
         return False, last
 
-    with tempfile.TemporaryDirectory() as d, tempfile.TemporaryDirectory() as _iso_td:
+    with tempfile.TemporaryDirectory() as d, tempfile.TemporaryDirectory() as _iso_td, \
+            LocalCluster(n_workers=1, threads_per_worker=1, processes=True, dashboard_address=None) as lc:
         iso_scripts = os.path.join(_self_test_iso_repo(_iso_td), "scripts")
         os.makedirs(os.path.join(d, "models"))
         open(os.path.join(d, "models", "slow.py"), "w").write(
@@ -890,7 +921,7 @@ def _self_test_p42_dask(ok, lc) -> None:
                 p.wait()
 
 
-def _self_test_p45d(ok, lc, cc, tmpb) -> None:
+def _self_test_p45d(ok) -> None:
     """Phase 45 δ (A16): the chunk loop places chunks on free workers itself.
 
     E7 attempt 8 is emulated on a LocalCluster: an untagged run worker holds a
@@ -900,6 +931,8 @@ def _self_test_p45d(ok, lc, cc, tmpb) -> None:
     worker's queue and work stealing never moves chunks. Every wait is on an
     event (a file the model writes, a scheduler state), never a fixed sleep."""
     import tempfile
+    import dask
+    from distributed import Client, LocalCluster
 
 
     def state(dask_scheduler=None):
@@ -954,7 +987,10 @@ def _self_test_p45d(ok, lc, cc, tmpb) -> None:
             "MA_COMPUTE_EXCLUDE_WORKERS", "MA_COMPUTE_DISPATCH_S")
     saved = {k: os.environ.get(k) for k in keys}
     import threading
-    with tempfile.TemporaryDirectory() as rd, tempfile.TemporaryDirectory() as _iso_td:
+    with tempfile.TemporaryDirectory() as rd, tempfile.TemporaryDirectory() as tmpb, \
+            tempfile.TemporaryDirectory() as _iso_td, \
+            dask.config.set({"distributed.scheduler.default-task-durations": {"hog": "68h"},
+                             "distributed.scheduler.active-memory-manager.start": False}):
         rd = os.path.realpath(rd)
         iso_repo = _self_test_iso_repo(_iso_td)
         os.makedirs(os.path.join(rd, "models"))
@@ -973,10 +1009,12 @@ def _self_test_p45d(ok, lc, cc, tmpb) -> None:
             "    time.sleep(p.get('s', 0))\n"
             "    open(os.path.join(d, 'span_%s_%d' % (p['tag'], p['k'])), 'w').write('%f %f' % (t0, time.time()))\n"
             "    return p['k']\n")
-        w_run = list(lc.scheduler_info["workers"])[0]
-        with _self_test_patched_repo(iso_repo):
+        with LocalCluster(n_workers=1, threads_per_worker=1, processes=True, dashboard_address=None) as lc, \
+                Client(lc.scheduler_address) as cc, _self_test_patched_repo(iso_repo):
+            w_run = list(lc.scheduler_info["workers"])[0]
             try:
                 hog = cc.submit(time.sleep, 600, key=f"hog-{os.urandom(8).hex()}", workers=[w_run], pure=False)
+                cc.register_plugin(OwnTmp(tmpb))
                 cc.register_plugin(ComputeTagPlugin("compute", exclude=[w_run]))
                 lc.scale(2)
                 cc.wait_for_workers(2, timeout=60)
@@ -1385,53 +1423,15 @@ def _self_test() -> int:
     _self_test_durable(ok)
     _self_test_sched(ok)
     try:
-        import dask
-        from distributed import Client, LocalCluster, WorkerPlugin
+        import dask  # noqa: F401
+        from distributed import Client, LocalCluster, WorkerPlugin  # noqa: F401
     except ImportError:
         print("  (LocalCluster dask tests skipped: distributed not installed)")
     else:
-        class OwnTmp(WorkerPlugin):
-            name = "ma-selftest-own-tmp"
-
-            def __init__(self, base):
-                self.base = base
-
-            def setup(self, worker):
-                import tempfile as tf_
-                d_ = os.path.join(self.base, worker.address.rsplit(":", 1)[-1])
-                os.makedirs(d_, exist_ok=True)
-                os.environ["TMPDIR"] = d_
-                tf_.tempdir = d_
-
-        def reset_cluster(lc, cc, target_n):
-            for pname in list(cc.run_on_scheduler(lambda dask_scheduler=None: list(dask_scheduler.plugins))):
-                try:
-                    cc.unregister_scheduler_plugin(pname)
-                except Exception:  # noqa: BLE001
-                    pass
-            try:
-                cc.unregister_worker_plugin(ComputeTagPlugin.name)
-            except Exception:  # noqa: BLE001
-                pass
-            lc.scale(target_n)
-            cc.wait_for_workers(target_n, timeout=60)
-            end = time.time() + 30
-            while time.time() < end and len(cc.scheduler_info().get("workers") or {}) != target_n:
-                time.sleep(0.1)
-
-        with tempfile.TemporaryDirectory() as tmpb, \
-                dask.config.set({"distributed.scheduler.default-task-durations": {"hog": "68h"},
-                                 "distributed.scheduler.active-memory-manager.start": False}):
-            with LocalCluster(n_workers=2, threads_per_worker=1, processes=True, dashboard_address=None) as lc, \
-                    Client(lc.scheduler_address) as cc:
-                cc.register_plugin(OwnTmp(tmpb))
-                _self_test_infra(ok, lc, cc, tmpb)
-                reset_cluster(lc, cc, 2)
-                _self_test_dask_core(ok, lc)
-                reset_cluster(lc, cc, 1)
-                _self_test_p42_dask(ok, lc)
-                reset_cluster(lc, cc, 1)
-                _self_test_p45d(ok, lc, cc, tmpb)
+        _self_test_infra(ok)
+        _self_test_dask_core(ok)
+        _self_test_p42_dask(ok)
+        _self_test_p45d(ok)
         _self_test_isolated_dask(ok)
     if fails:
         print("SELF-TEST FAILURES:", *fails, sep="\n  - ")
