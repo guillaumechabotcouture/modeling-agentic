@@ -279,11 +279,15 @@ REVIEWED: dict = {
                                                   "codex's log next to the review's output, and PR.diff in the "
                                                   "export (" + _TMP_REASON + ")")},
     "scripts/compute.py": {
-        "open-write": (10, "worker init markers, chunk inputs, stderr and the worker's sync record (" + _TMP_REASON + ")"),
-        "os-remove": (5, "stale bundle members and pid files on a worker (" + _TMP_REASON + "); the worker's TLS files"),
-        "shutil": (1, "the worker's own __pycache__"), "os-rename": (1, "a pid file in the worker's call dir"),
-        "os-link": (1, "the claim file in the worker's call dir (atomic claim)"),
-        "os.open-write": (1, "the worker's TLS files (O_EXCL, private dir)")},
+        "os-remove": (1, "stale TLS files on a worker (" + _TMP_REASON + ")"),
+        "os.open-write": (1, "the worker's TLS files (O_EXCL, private dir)"),
+        "open-write": (1, "the worker's TLS files (O_EXCL, private dir)")},
+    "scripts/compute_worker.py": {
+        "open-write": (9, "worker init markers, chunk inputs, stderr, pid/lock and sync records (" + _TMP_REASON + ")"),
+        "os-remove": (4, "stale bundle members and pid files on a worker (" + _TMP_REASON + ")"),
+        "shutil": (1, "the worker's own __pycache__"),
+        "os-rename": (1, "a pid file in the worker's call dir"),
+        "os-link": (1, "the claim file in the worker's call dir (atomic claim)")},
     "scripts/eval_private.py": {"shutil": (4, _EVAL), "open-write": (5, _EVAL)},
     "toolkit/spec/amend.py": {"shutil": (1, "its own .partial child (on refusal)"),
                               "os-rename": (1, "its own .partial child to the new child name it checked")},
@@ -311,8 +315,7 @@ REVIEWED: dict = {
                                                    "--json report the operator names")},
     "toolkit/analysis/figures.py": {"method-write": (2, "savefig / Image.save into an in-memory buffer "
                                                          "(_fig_bytes, contact_sheets), then lib.safe_io")},
-    "toolkit/analysis/run.py": {"open-write": (6, _FIX + " (_resign, _direct_toy, _given_column)"), "os-remove": (1, _FIX),
-                                "shutil": (1, _FIX)},
+    "toolkit/analysis/run.py": {"open-write": (4, _FIX + " (_direct_toy)")},
     "toolkit/engines/benchmark.py": {"open-write": (4, _REPO + " (the benchmark CLI's outputs)")},
     "toolkit/engines/compartmental/benchmarks/compat_proof.py": {
         "open-write": (2, _REPO + " (the proof record and the re-stamped coverage results in the engine's benchmarks/)")},
@@ -542,12 +545,6 @@ def _self_test_round6(ok) -> None:
         os.makedirs(os.path.join(d, "models"))
         open(os.path.join(d, "models", "m.py"), "w").write("def f(p):\n    return {'y': p['x']}\n")
 
-    class _P:
-        def __init__(self, argv, stdout=None, **k):
-            self.pid = os.getpid()
-            if stdout is not None:
-                os.write(stdout.fileno(), b"launched\n")
-
     def call(fn, *a, **kw):
         try:
             try:
@@ -556,41 +553,6 @@ def _self_test_round6(ok) -> None:
                 return fn(*a)                       # before the fix: no run-root parameter
         except (ValueError, OSError):
             return None
-    real_popen = sp.Popen
-    sp.Popen = _P
-    try:
-        with tempfile.TemporaryDirectory() as d, tempfile.TemporaryDirectory() as out:
-            run_dir(d)
-            os.makedirs(os.path.join(out, "batchdir"))
-            os.makedirs(os.path.join(d, "analysis"))
-            os.symlink(os.path.join(out, "batchdir"), os.path.join(d, "analysis", "batch"))
-            call(C._detach, ["map"], os.path.join(d, "analysis", "batch", "r.jsonl"), 1, run_dir=d)
-            ok(os.listdir(os.path.join(out, "batchdir")) == [],
-               f"WA13 the detached launch anchors at the run dir: a linked analysis/batch receives no launch lock, "
-               f"lock, log or job record ({os.listdir(os.path.join(out, 'batchdir'))})")
-        with tempfile.TemporaryDirectory() as d, tempfile.TemporaryDirectory() as out:
-            run_dir(d)
-            os.makedirs(os.path.join(d, "analysis", "batch"))
-            victim = os.path.join(out, "victim")
-            open(victim, "w").write("untouched")
-            log = os.path.join(d, "analysis", "batch", "r.jsonl.log")
-            real_w = SIO.write_nofollow
-
-            def swap(base, rel, data, *a, **k):
-                r = real_w(base, rel, data, *a, **k)
-                if rel.endswith(".log") and os.path.exists(log):
-                    os.unlink(log)
-                    os.link(victim, log)            # the log swapped for a hard link to a file outside the run
-                return r
-            SIO.write_nofollow = swap
-            try:
-                call(C._detach, ["map"], os.path.join(d, "analysis", "batch", "r.jsonl"), 1, run_dir=d)
-            finally:
-                SIO.write_nofollow = real_w
-            ok(open(victim).read() == "untouched",
-               "WA14 the detached log is not reopened by name: a hard-link swap after it is created is refused")
-    finally:
-        sp.Popen = real_popen
     with tempfile.TemporaryDirectory() as d, tempfile.TemporaryDirectory() as out:
         run_dir(d)
         from toolkit.analysis import figures as FG

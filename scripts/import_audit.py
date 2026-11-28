@@ -35,11 +35,10 @@ _RUN_CODE = ("the run's own model code, loaded by path to execute it (the v1 pip
 # {file: {pattern: (count, reason)}}: the dynamic import sites whose names cannot come from a spec, a pack or an
 # artifact. Counts are exact, so a new site in a reviewed file fails too.
 REVIEWED = {
-    "cloud/run_cluster.py": {"spec_from_file_location": (1, "the operator's cloud config file"),
-                             "exec_compile": (1, "its own self-test compiling the two-statement AST guard")},
+    "cloud/run_cluster.py": {"spec_from_file_location": (1, "the operator's cloud config file")},
     "cloud/worker_side.py": {"spec_from_file_location": (1, "a module uploaded by run_cluster.py (repo code)")},
-    "scripts/compute.py": {"spec_from_file_location": (3, _RUN_CODE + "; and the repo's worker_side module (twice: "
-                                                         "the batch runner and the checkpoint-restore self-test)")},
+    "scripts/compute.py": {"spec_from_file_location": (1, "the repo's worker_side module for checkpoint upload")},
+    "scripts/compute_worker.py": {"spec_from_file_location": (1, _RUN_CODE + " (user fn_spec for chunk execution)")},
     "scripts/eval_suite.py": {"spec_from_file_location": (2, "the eval suite's own generators and hidden tests")},
     "scripts/gate_fuzz.py": {"import_module": (5, "gate module names from its own table of gates")},
     "toolkit/engines/built/worker.py": {
@@ -53,7 +52,6 @@ REVIEWED = {
     "toolkit/spec/preconditions.py": {"spec_from_file_location": (1, _REPO_FILE + ": the literal path "
                                                                  "agents/analysis_backend.py, the engine-choice filter "
                                                                  "(a script module, not a package import_guard serves)")},
-    "toolkit/spec/schema.py": {"import_module": (1, "its self-test's literal (module, class) pairs of shipped engines")},
 }
 
 

@@ -28,9 +28,9 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-SCOPE_DIRS = ("scripts/", "toolkit/", "cloud/", "tools/")   # tools/: outside compute.code_fingerprint
+SCOPE_DIRS = ("scripts/", "toolkit/", "cloud/", "tools/", "tests/")   # tools/: outside compute.code_fingerprint
 AGENT_MODULES = (
-    "agents/stage_machine.py", "agents/engine_build_stage.py", "agents/report_render.py",
+    "agents/engine_build_stage.py", "agents/report_render.py",
     "agents/v2_gate.py", "agents/findings_ledger.py", "agents/fix_loop.py",
     "agents/analysis_backend.py", "agents/v2_sdk_tasks.py",
     "agents/acquire.py",
@@ -38,14 +38,20 @@ AGENT_MODULES = (
 # Files (or directory prefixes ending in "/") in scope that have no --self-test, and why.
 EXEMPT = {
     "cloud/configs/": "launch configs (settings, no logic), read by cloud/run_cluster.py",
-    "cloud/worker_side.py": "runs on the cloud workers; exercised by the cloud/run_cluster.py, "
-                            "cloud/vm_job.py and scripts/compute.py self-tests",
-    "toolkit/analysis/artifacts.py": "analysis-engine library; exercised by toolkit/analysis/run.py --self-test",
-    "toolkit/analysis/claims.py": "analysis-engine library; exercised by toolkit/analysis/run.py --self-test",
-    "toolkit/analysis/core.py": "analysis-engine library; exercised by toolkit/analysis/run.py --self-test",
-    "toolkit/analysis/decision_tests.py": "analysis-engine library; exercised by toolkit/analysis/run.py --self-test",
-    "toolkit/analysis/sensitivity.py": "analysis-engine library; exercised by toolkit/analysis/run.py --self-test",
-    "toolkit/analysis/stability.py": "analysis-engine library; exercised by toolkit/analysis/run.py --self-test",
+    "cloud/run_cluster.py": "Coiled cluster launcher; exercised by tests/test_run_cluster.py",
+    "cloud/vm_job.py": "detached VM job runner; exercised by tests/test_vm_job.py",
+    "cloud/worker_side.py": "runs on the cloud workers; exercised by tests/test_run_cluster.py, "
+                            "tests/test_vm_job.py and tests/test_compute.py",
+    "scripts/compute.py": "batch orchestration; exercised by tests/test_compute.py, tests/test_compute_dask.py, "
+                          "and scripts/compute_worker.py",
+    "toolkit/analysis/run.py": "analysis-engine orchestrator; exercised by tests/test_analysis_run.py",
+    "toolkit/analysis/artifacts.py": "analysis-engine library; exercised by tests/test_analysis_run.py",
+    "toolkit/analysis/claims.py": "analysis-engine library; exercised by tests/test_analysis_run.py",
+    "toolkit/analysis/core.py": "analysis-engine library; exercised by tests/test_analysis_run.py",
+    "toolkit/analysis/decision_tests.py": "analysis-engine library; exercised by tests/test_analysis_run.py",
+    "toolkit/analysis/sensitivity.py": "analysis-engine library; exercised by tests/test_analysis_run.py",
+    "toolkit/analysis/stability.py": "analysis-engine library; exercised by tests/test_analysis_run.py",
+    "toolkit/spec/schema.py": "decision-spec validator; exercised by tests/test_schema.py",
     "toolkit/spec/toy_engines.py": "self-test toy engines (refused in production by toolkit/import_guard.py); "
                                    "exercised by toolkit/spec/engine_parameters.py's self-test",
     "toolkit/engines/malaria/model.py": "engine module; exercised by toolkit/engines/malaria/engine.py --self-test",
@@ -136,8 +142,17 @@ WEIGHTS_S = {
     "toolkit/analysis/figures.py": 25, "scripts/pipeline.py": 25, "scripts/validate_critique_yaml.py": 5,
     "agents/analysis_backend.py": 21, "toolkit/analysis/trajectories.py": 19, "toolkit/analysis/model.py": 15,
 }
+for _old in ("agents/stage_machine.py", "cloud/vm_job.py", "scripts/compute.py", "toolkit/analysis/run.py"):
+    WEIGHTS_S.pop(_old, None)
 WEIGHTS_S.update({
-    "agents/stage_machine.py": 300,
+    "tests/test_stage_machine_rounds.py": 260,
+    "tests/test_stage_machine_core.py": 250,
+    "tests/test_vm_job.py": 239,
+    "tests/test_analysis_run.py": 176,
+    "tests/test_compute.py": 140,
+    "tests/test_compute_dask.py": 97,
+    "tests/test_run_cluster.py": 60,
+    "tests/test_schema.py": 30,
     "agents/engine_build_stage.py": 150,
     "agents/report_render.py": 30,
     "agents/v2_gate.py": 30,
@@ -191,8 +206,15 @@ def _run_one(python: str, repo: str, path: str, timeout_s: float | None = None):
         return path, None, (out or "") + f"\n(killed after {timeout_s:.0f}s)", time.time() - t0
 
 
+def filter_excluded(files, exclude_prefixes=()):
+    """Drop paths starting with any prefix in `exclude_prefixes` (applied after discover(), before shard())."""
+    prefixes = tuple(p for p in (exclude_prefixes or ()) if p)
+    return [f for f in files if not f.startswith(prefixes)] if prefixes else list(files)
+
+
 def run_all(python: str, jobs: int, repo: str = REPO, per_test_timeout: float | None = PER_TEST_TIMEOUT_S,
-            files: list | None = None, shard_kn: tuple[int, int] | None = None) -> int:
+            files: list | None = None, shard_kn: tuple[int, int] | None = None,
+            exclude_prefixes: tuple[str, ...] | list[str] = ()) -> int:
     """Run every discovered self-test (or `files`, which skips discovery: the watchdog's own test), or only shard
     `shard_kn` = (K, N) of them. A self-test that runs longer than `per_test_timeout` seconds (0 or None: no limit)
     is killed, named and counted as failed; the others still run. Discovery problems fail every shard."""
@@ -204,6 +226,7 @@ def run_all(python: str, jobs: int, repo: str = REPO, per_test_timeout: float | 
             return 1
     else:
         run, skipped, notes, problems = list(files), [], [], []
+    run = filter_excluded(run, exclude_prefixes)
     if shard_kn:
         total = len(run)
         run = shard(run, *shard_kn)
@@ -342,10 +365,16 @@ def _self_test() -> int:
         lrun = discover()[0]
         loads = [sum(WEIGHTS_S.get(p, DEFAULT_WEIGHT_S) for p in shard(lrun, k, 4)) for k in (1, 2, 3, 4)]
         ok(max(loads) <= max(1.2 * min(loads), max(WEIGHTS_S.values())), f"ST14 live 4-shard loads balance ({loads})")
+        loads8 = [sum(WEIGHTS_S.get(p, DEFAULT_WEIGHT_S) for p in shard(lrun, k, 8)) for k in range(1, 9)]
+        ok(max(loads8) <= max(1.5 * min(loads8), max(WEIGHTS_S.values())), f"ST14b live 8-shard loads balance ({loads8})")
         stale = [p for p in WEIGHTS_S if p not in lrun]
         ok(not stale, f"ST14 every WEIGHTS_S entry names a discovered self-test ({stale})")
     except RuntimeError as e:
         fails.append(f"ST14 git ls-files failed: {e}")
+    # ST15: --exclude-prefix filters paths after discover() and before shard().
+    filtered = filter_excluded(["toolkit/engines/slow/engine.py", "tools/run_console/rc.py", "scripts/a.py"],
+                               ("toolkit/engines/slow/", "tools/"))
+    ok(filtered == ["scripts/a.py"], f"ST15 filter_excluded drops matching prefixes ({filtered})")
     for f in fails:
         print(f"FAIL: {f}")
     if fails:
@@ -364,6 +393,8 @@ def main(argv=None) -> int:
                          f"failed; 0 for no limit (default {PER_TEST_TIMEOUT_S:.0f})")
     ap.add_argument("--shard", metavar="K/N", help="run only shard K of N (CI runs N in parallel); every self-test "
                                                    "is in exactly one shard")
+    ap.add_argument("--exclude-prefix", action="append", default=[], metavar="PREFIX",
+                    help="exclude discovered self-tests whose path starts with PREFIX (repeatable; applied before --shard)")
     ap.add_argument("--self-test", action="store_true")
     a = ap.parse_args(argv)
     if a.self_test:
@@ -379,6 +410,7 @@ def main(argv=None) -> int:
         except RuntimeError as e:
             print(f"ERROR: {e}", file=sys.stderr)
             return 1
+        run = filter_excluded(run, a.exclude_prefix)
         print("\n".join(shard(run, *shard_kn) if shard_kn else run))
         for p, why in skipped:
             print(f"# exempt: {p}: {why}")
@@ -387,7 +419,8 @@ def main(argv=None) -> int:
         for p in problems:
             print(f"# DISCOVERY PROBLEM: {p}")
         return 1 if problems else 0
-    return run_all(a.python, a.jobs, per_test_timeout=a.per_test_timeout, shard_kn=shard_kn)
+    return run_all(a.python, a.jobs, per_test_timeout=a.per_test_timeout, shard_kn=shard_kn,
+                   exclude_prefixes=a.exclude_prefix)
 
 
 if __name__ == "__main__":

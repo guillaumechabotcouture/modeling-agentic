@@ -2021,7 +2021,7 @@ def _test_s20_run_never_decrypts(ok, td):
         for n, v in saved.items():
             setattr(ep, n, v)
         globals()["leak_problems"] = saved_leak
-    for rel in ("cloud/run_cluster.py", "cloud/configs/_eval.py", "cloud/launch_watch.py"):
+    for rel in ("cloud/run_cluster.py", "cloud/configs/_eval.py"):
         with open(os.path.join(REPO, rel)) as f:
             src = f.read()
         ok(not re.search(r"eval_private|decrypt|keychain_key|use_private", src),

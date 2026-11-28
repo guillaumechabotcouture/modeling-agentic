@@ -1,0 +1,1974 @@
+#!/usr/bin/env python3
+"""Tests extracted from cloud/vm_job.py."""
+from __future__ import annotations
+
+import contextlib
+import hashlib
+import io
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tarfile
+import tempfile
+import time
+import types
+from unittest import mock
+
+TESTS_DIR = os.path.dirname(os.path.abspath(__file__))
+REPO = os.path.dirname(TESTS_DIR)
+CLOUD_DIR = os.path.join(REPO, "cloud")
+if CLOUD_DIR not in sys.path:
+    sys.path.insert(0, CLOUD_DIR)
+SCRIPTS_LIB = os.path.join(REPO, "scripts", "lib")
+if SCRIPTS_LIB not in sys.path:
+    sys.path.insert(0, SCRIPTS_LIB)
+
+import coiled_ops as CO
+import eval_paths
+import no_cloud
+import pipeline_id
+import run_cluster as rc
+import vm_job as vj
+import worker_side as ws
+from vm_job import (
+    CHUNK, DONE, HERE, OUT, SECRET_ENV_ALLOWED, TARBALL_SKIP_ANY, TARBALL_SKIP_TOP,
+    Terminated, WorkerGone, _CLEANING, _CapRefused, _ENDED, _all_clusters, _await_claim,
+    _budget_gate, _cap_reading, _client, _clusters, _code_commit, _create, _gone,
+    _job_cluster, _job_record, _job_worker, _launch_commit, _live_vm_types_ok, _poll,
+    _print, _run_locked, _runner, _sigterm_as_interrupt, _slug, _stop_by_id, _tarball,
+    _tarball_filter, _vm_request, _wait_capped, _wait_gate, _write_json, cmd_down,
+    cmd_run, cmd_start, cmd_status, cmd_up, cmd_wait, files_to_fetch, job_env,
+    job_pipeline, local_dir, main as vj_main, run_cluster_name, run_outcome,
+    secret_env, split_command, storage_account, sync_outputs, write_launch_record,
+)
+
+
+@contextlib.contextmanager
+def _patch_vj(mapping):
+    with contextlib.ExitStack() as es:
+        for k, v in mapping.items():
+            if hasattr(vj, k):
+                es.enter_context(mock.patch.object(vj, k, v))
+            if hasattr(CO, k):
+                es.enter_context(mock.patch.object(CO, k, v))
+        yield
+
+
+def main(argv=None) -> int:
+    import argparse
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--self-test", action="store_true")
+    ap.parse_args(argv)
+    with no_cloud.refusing():
+        return _self_test()
+
+
+def _self_test() -> int:
+    import tempfile
+    fails = []
+    try:
+        import no_cloud
+        guarded = no_cloud.active()
+    except ImportError:
+        guarded = False
+    refused = False
+    if guarded:                       # never probed without the guard: unguarded, this would be a real call
+        try:
+            import coiled
+            coiled.list_clusters(workspace="w")
+        except RuntimeError:
+            refused = True
+    if not (guarded and refused):
+        fails.append("G2 vm_job's self-test runs under the shared refusing guard, and a real coiled call is refused")
+
+    def ok(cond, msg):
+        print(("PASS " if cond else "FAIL ") + msg)
+        if not cond:
+            fails.append(msg)
+
+    ok(split_command(["start", "n", "j", "--dir", "d", "--", "python", "x.py", "--dir", "e"])
+       == (["start", "n", "j", "--dir", "d"], ["python", "x.py", "--dir", "e"]) and split_command(["status", "n", "j"])
+       == (["status", "n", "j"], []), "RC34b options before -- are vm_job's; everything after is the job's")
+    ok(files_to_fetch({"a": [1, 2.0], "b": [3, 4.0], "c": [5, 6.0]}, {"a": [1, 2.0], "b": [3, 9.0]}) == ["b", "c"],
+       "RC34 a poll fetches only new or changed files")
+    for bad in ("../x", "a/b", "", "x" * 65, ".."):
+        try:
+            local_dir("n", bad)
+            ok(False, f"RC35 a bad job id is refused: {bad!r}")
+        except ValueError:
+            ok(True, f"RC35 a bad job id is refused: {bad[:10]!r}")
+    now = 1000.0
+    ok(ws.job_view(None, now)["state"] == "missing" and ws.job_view({"state": "running", "heartbeat": now - 10}, now)
+       ["state"] == "running" and ws.job_view({"state": "running", "heartbeat": now - 999}, now)["state"] == "lost"
+       and ws.job_view({"state": "done", "heartbeat": 0}, now)["state"] == "done",
+       "RC36 a running job whose heartbeat stopped reads as lost")
+    with tempfile.TemporaryDirectory() as d:
+        old = ws.JOBS
+        ws.JOBS = os.path.join(d, "vm")
+        try:
+            code = io.BytesIO()
+            with tarfile.open(fileobj=code, mode="w:gz") as t:
+                src = b"import os, time\nfor i in range(3):\n    open(os.path.join(os.environ['JOB_OUT'], f'step{i}.txt'), 'w').write(str(i))\n    print('step', i, flush=True)\n    time.sleep(0.2)\nprint('key set:', bool(os.environ.get('SECRET_X')))\n"
+                ti = tarfile.TarInfo("job.py")
+                ti.size = len(src)
+                t.addfile(ti, io.BytesIO(src))
+            st = ws.job_task("j1", code.getvalue(), [sys.executable, "job.py"], {"SECRET_X": "s3cr3t"}, 1.0,
+                             heartbeat_s=1)
+            ok(st["state"] == "done" and st["rc"] == 0, f"RC37 a job runs to completion in its own tree: {st}")
+            raw = open(os.path.join(ws.JOBS, "j1", "state.json")).read()
+            ok("s3cr3t" not in raw and "SECRET_X" not in raw, "RC38 secrets reach the job's environment, never its state file")
+            run = lambda fn, *a: fn(*a)  # noqa: E731
+            dest = os.path.join(d, "local")
+            s1 = sync_outputs(run, "j1", dest)
+            ok(sorted(s1["fetched"]) == ["job.log", "out/step0.txt", "out/step1.txt", "out/step2.txt"]
+               and open(os.path.join(dest, "out", "step2.txt")).read() == "2"
+               and "key set: True" in open(os.path.join(dest, "job.log")).read(),
+               f"RC39 a poll saves the job's outputs and log locally: {s1['fetched']}")
+            ok(sync_outputs(run, "j1", dest)["fetched"] == [], "RC40 a second poll with nothing new fetches nothing")
+            # RC40b (F6 run 3): a run dir copied out of a live run is marked: its batch records describe the VM's process
+            code2 = io.BytesIO()
+            with tarfile.open(fileobj=code2, mode="w:gz") as t:
+                src = (b"import os\nr = os.path.join(os.environ['JOB_OUT'], 'runs', 'R')\n"
+                       b"os.makedirs(os.path.join(r, 'analysis', 'batch'))\n"
+                       b"open(os.path.join(r, 'run_state.json'), 'w').write('{}')\n"
+                       b"open(os.path.join(r, 'analysis', 'batch', 'results.jsonl.job.json'), 'w').write('{\"pid\": 7}')\n")
+                ti = tarfile.TarInfo("job.py")
+                ti.size = len(src)
+                t.addfile(ti, io.BytesIO(src))
+            ws.job_task("j2", code2.getvalue(), [sys.executable, "job.py"], {}, 1.0, heartbeat_s=1)
+            dest2 = os.path.join(d, "local2")
+            sync_outputs(run, "j2", dest2)
+            try:
+                mk = json.load(open(os.path.join(dest2, "out", "runs", "R", "copied_run.json")))
+            except (OSError, ValueError):
+                mk = {}
+            ok(list(mk.get("files") or {}) == ["analysis/batch/results.jsonl.job.json"] and "j2" in str(mk.get("source")),
+               f"RC40b a copied run dir is marked with its in-flight records ({mk})")
+            # RC40c (Codex review of #256 P1-2): a later poll that fetches another file does not re-mark a record a
+            # local process rewrote in the copy
+            import copied_run as _CR
+            lj = os.path.join(dest2, "out", "runs", "R", "analysis", "batch", "results.jsonl.job.json")
+            open(lj, "w").write('{"pid": 8, "local": true}')
+            open(os.path.join(ws.JOBS, "j2", "out", "runs", "R", "notes.md"), "w").write("new")
+            sync_outputs(run, "j2", dest2)
+            ok(_CR.copied_entry(lj) is None, "RC40c a later poll does not mark a record rewritten locally as copied")
+            # RC40d (Codex re-review of #256): a job record fetched before its run's run_state.json is marked once the
+            # run root appears
+            rj = os.path.join(ws.JOBS, "j2", "out", "runs", "S")
+            os.makedirs(os.path.join(rj, "analysis"))
+            open(os.path.join(rj, "analysis", "b.jsonl.job.json"), "w").write('{"pid": 6}')
+            sync_outputs(run, "j2", dest2)
+            open(os.path.join(rj, "run_state.json"), "w").write("{}")
+            sync_outputs(run, "j2", dest2)
+            ok(_CR.copied_entry(os.path.join(dest2, "out", "runs", "S", "analysis", "b.jsonl.job.json")) is not None,
+               "RC40d a record fetched before its run root is marked when the root arrives")
+            # RC40e (Codex round 4 of #256): a poll interrupted while saving its digests does not leave the manifest
+            # claiming files whose digests were lost: the retry fetches them again and marks them
+            rt = os.path.join(ws.JOBS, "j2", "out", "runs", "T")
+            os.makedirs(os.path.join(rt, "analysis"))
+            open(os.path.join(rt, "run_state.json"), "w").write("{}")
+            open(os.path.join(rt, "analysis", "c.jsonl.job.json"), "w").write('{"pid": 5}')
+            real_dump, boom = json.dump, {"n": 0}
+
+            def flaky(obj, fh, *a, **k):
+                if str(getattr(fh, "name", "")).endswith(".fetched_sha256.json") and not boom["n"]:
+                    boom["n"] += 1
+                    raise OSError("interrupted")
+                return real_dump(obj, fh, *a, **k)
+            json.dump = flaky
+            try:
+                try:
+                    sync_outputs(run, "j2", dest2)
+                except OSError:
+                    pass
+            finally:
+                json.dump = real_dump
+            sync_outputs(run, "j2", dest2)
+            ok(_CR.copied_entry(os.path.join(dest2, "out", "runs", "T", "analysis", "c.jsonl.job.json")) is not None,
+               "RC40e a poll interrupted before its digests are saved is redone and marks the record")
+            # RC40f (Codex round 5): the digest cache is replaced atomically, so an interrupted write keeps the digest of
+            # a record fetched by an earlier poll, before its run root arrived
+            ru = os.path.join(ws.JOBS, "j2", "out", "runs", "U")
+            os.makedirs(os.path.join(ru, "analysis"))
+            open(os.path.join(ru, "analysis", "d.jsonl.job.json"), "w").write('{"pid": 4}')
+            sync_outputs(run, "j2", dest2)
+            open(os.path.join(ru, "run_state.json"), "w").write("{}")
+            boom["n"] = 0
+
+            def flaky2(obj, fh, *a, **k):
+                if ".fetched_sha256.json" in str(getattr(fh, "name", "")) and not boom["n"]:
+                    boom["n"] += 1
+                    raise OSError("interrupted")
+                return real_dump(obj, fh, *a, **k)
+            json.dump = flaky2
+            try:
+                try:
+                    sync_outputs(run, "j2", dest2)
+                except OSError:
+                    pass
+            finally:
+                json.dump = real_dump
+            sync_outputs(run, "j2", dest2)
+            ok(_CR.copied_entry(os.path.join(dest2, "out", "runs", "U", "analysis", "d.jsonl.job.json")) is not None,
+               "RC40f an interrupted digest-cache write keeps an earlier poll's digest")
+            # RC40g (Codex round 6): a write whose flush fails at close never replaces the file
+            wp = os.path.join(d, "w.json")
+            _write_json(wp, {"a": 1})
+            real_open = open
+
+            class _BadClose:
+                def __init__(self, f):
+                    self.f = f
+
+                def write(self, x):
+                    return self.f.write(x)
+
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *e):
+                    self.f.close()
+                    raise OSError("disk full at close")
+            import builtins
+            builtins.open = lambda p_, m="r", *a_, **k_: (_BadClose(real_open(p_, m, *a_, **k_))
+                                                         if str(p_).endswith("w.json.tmp") else real_open(p_, m, *a_, **k_))
+            try:
+                try:
+                    _write_json(wp, {"a": 2})
+                except OSError:
+                    pass
+            finally:
+                builtins.open = real_open
+            ok(json.load(open(wp)) == {"a": 1}, "RC40g a failed close keeps the previous file")
+            for bad in ("work/job.py", "state.json", "../../etc/passwd", "out/../state.json"):
+                try:
+                    ws.job_chunk("j1", bad, 0, 10)
+                    ok(False, f"RC41 job_chunk refuses {bad}")
+                except (ValueError, OSError):
+                    ok(True, f"RC41 job_chunk refuses {bad}")
+            st2 = ws.job_task("j2", None, [sys.executable, "-c", "import time; time.sleep(30)"], None, 1 / 3600,
+                              heartbeat_s=1)
+            ok(st2["state"] == "timed_out", f"RC42 a job past max_hours is stopped: {st2['state']}")
+            st3 = ws.job_task("j3", None, ["--no-such-program-x"], None, 1.0)
+            ok(st3["state"] == "failed" and "FileNotFoundError" in st3.get("error", "")
+               and ws.job_state("j3")["state"]["state"] == "failed",
+               f"RC44 a job that cannot start is recorded as failed, not left 'running': {st3.get('error')}")
+            tok = ws.job_queue("j4")
+            ok(tok and ws.job_view(ws._read_json(os.path.join(ws.JOBS, "j4", "state.json")), time.time() + 60)
+               ["state"] == "queued" and "token" not in ws.job_state("j4")["state"]
+               and ws.job_queue("j4") is None
+               and ws.job_task("j4", None, "true", None, 1.0, token="other")["state"] == "refused"
+               and ws.job_task("j4", None, "true", None, 1.0)["state"] == "refused"
+               and ws.job_task("j4", None, "true", None, 1.0, token=tok)["state"] == "done",
+               "RC45 a submitted job reads as queued until its own task claims it; a second submission is refused")
+            ok(ws.job_view({"state": "queued", "queued": 0.0}, 99999.0)["state"] == "lost",
+               "RC45c a queued job whose task never started reads as lost after an hour")
+            calls = []
+            orig = ws._job_write
+            ws._job_write = lambda d_, st_: (calls.append(st_.get("heartbeat")), orig(d_, st_))
+            try:
+                logf = open(os.path.join(d, "beat.log"), "wb")
+                ws._beat_run([sys.executable, "-c", "import time; time.sleep(1.2)"], logf, os.path.join(ws.JOBS, "j4"),
+                             {"state": "running"}, 60, 0.3)
+                logf.close()
+            finally:
+                ws._job_write = orig
+            ok(len(calls) >= 2, f"RC45d setup commands keep the job's heartbeat up ({len(calls)} beats)")
+            ws._job_write(os.path.join(ws.JOBS, "j2"), {"state": "running", "heartbeat": time.time()})
+            ok(not ws.job_queue("j2"), "RC45b a running job id is not queued again")
+            ok(ws.job_task("j2", None, "true", None, 1.0)["state"] == "refused",
+               "RC43 a job id that is running is not restarted")
+        finally:
+            ws.JOBS = old
+    real_gate = vj._budget_gate
+    vj._budget_gate = lambda a, name, meter=False, reserve=True: None   # cases before RN28 predate it
+    _self_test_sched(ok)
+    _self_test_batch(ok)
+    _self_test_vm_types(ok)
+    _self_test_run(ok, real_gate)
+    _self_test_pipeline(ok)
+    try:
+        _self_test_storage_account(ok)
+    except Exception as e:  # noqa: BLE001 -- before the change these cases fail here
+        ok(False, f"SA: {type(e).__name__}: {e}")
+    if fails:
+        print(f"FAILED: {len(fails)} case(s)")
+        return 1
+    print("OK: all self-test cases passed.")
+    return 0
+
+
+def _self_test_pipeline(ok) -> None:
+    """VP (2026-11-05): a main.py job must state its pipeline (the default changed once, silently),
+    the run learns its launcher, and the job leaves a launch record in the grader's format
+    (assignments.json + result.json, as cloud/run_cluster.py writes them), so a vm_job eval run
+    is graded with its input hashes checked instead of --unverified-inputs."""
+    import inspect
+    import tempfile
+    g = vars(vj)
+    jp = g.get("job_pipeline")
+    ok(jp is not None, "VP1 vm_job reads the pipeline of a main.py command")
+    if jp is None:
+        return
+    for cmd in (["python3", "main.py", "Q?", "--max-rounds", "3"], "python3 main.py 'Q?' && cp -r runs $JOB_OUT/"):
+        try:
+            jp(cmd)
+            ok(False, f"VP1 a main.py command relying on the default pipeline is refused: {cmd}")
+        except SystemExit as e:
+            ok("--v2" in str(e) and "--v1" not in str(e),
+               f"VP1 a main.py command relying on the default pipeline is refused: {e}")
+    ok(jp(["python3", "main.py", "Q?", "--v2"]) == "v2" and jp("bash toolkit/x/validate_once.sh 16") is None
+       and jp(["python3 main.py 'Q?' --v2"]) == "v2",
+       "VP2 an explicit main.py command gives its pipeline (argv, or one shell string); other commands have none")
+    # VP2c (coordinator decision, 2026-11-20): vm_job refuses only a literal main.py --v1 (VP2b) and never a v2
+    # command; a wrapped v1 start (a shell -c string, python -m main, a script) keeps the classification it had before
+    # the retirement. On a tree at or after the retirement, main.py refuses --v1 itself; on an older tree such a start
+    # is not caught here (a documented gap).
+    ok("retired_tree_problem" not in g and "_has_v1_token" not in g, "VP2c vm_job has no wrapper-scanning --v1 check")
+    for cmd in (["bash", "-c", 'case "$1" in v1) python3 main.py --v1 "$2" ;; v2) python3 main.py --v2 "$2" ;; esac',
+                 "_", "v2", "Q"], "python3 main.py --v2 Q && grep -F -- --v1 notes.txt", "python3 main.py --v2 -- --v1",
+                "python3 main.py --v2 'Compare the archived --v1 results'"):
+        try:
+            got = jp(cmd)
+            ok(got in (None, "v2"), f"VP2d a v2 command is never refused: {cmd!r} gave {got}")
+        except SystemExit as e:
+            ok(False, f"VP2d a v2 command is never refused: {cmd!r}: {e}")
+    for cmd in (["python3 main.py 'Q?' --v1"], ["python3", "main.py", "--v1", "--resume", "runs/R1"]):
+        try:
+            got = jp(cmd)
+            ok(False, f"VP2b (v1 retired) a main.py --v1 command is refused: {cmd} gave {got}")
+        except SystemExit as e:
+            ok(pipeline_id.RETIRED_MESSAGE in str(e) and "--v1" not in str(e),
+               f"VP2b (v1 retired) a main.py --v1 command is refused: {e}")
+    src = inspect.getsource(_run_locked)
+    ok("job_pipeline(" in src and src.index("job_pipeline(") < src.index("_create("),
+       "VP3 run refuses an undeclared pipeline before it creates a cluster")
+    ok("job_pipeline(" in inspect.getsource(cmd_start), "VP3b start refuses it too")
+    env = g["job_env"]({"ANTHROPIC_API_KEY": "k"}, "dev", "j1")
+    ok(env == {"ANTHROPIC_API_KEY": "k", "MA_LAUNCHER": "vm_job:dev/j1"} and g["job_env"](None, "dev", "j1")
+       == {"MA_LAUNCHER": "vm_job:dev/j1"}, f"VP4 the job's environment names its launcher for metadata.json ({env})")
+    with tempfile.TemporaryDirectory() as td:
+        dest = os.path.join(td, "dev", "j1")
+        code = io.BytesIO()
+        with tarfile.open(fileobj=code, mode="w:gz") as t:
+            for n, b in (("data/evals/q/a.csv", b"1,2\n"), ("main.py", b"x")):
+                ti = tarfile.TarInfo(n)
+                ti.size = len(b)
+                t.addfile(ti, io.BytesIO(b))
+        rec = g["write_launch_record"](dest, "j1", code.getvalue(), "v2", "abc1234", "dev")
+        sys.path.insert(0, os.path.join(os.path.dirname(HERE), "scripts"))
+        try:
+            import eval_suite
+            run_dir = os.path.join(dest, "out", "runs", "2026-11-05_000000_q")   # where polls save $JOB_OUT/runs
+            os.makedirs(run_dir)
+            got = eval_suite.launch_record_for(run_dir)
+            ok(got is not None and got.get("launch_id") == rec["launch_id"] and got.get("pipeline") == "v2"
+               and got.get("commit") == "abc1234" and "collected_launch_id" not in got
+               and got.get("eval_inputs_sha256", {}).get("data/evals/q/a.csv"),
+               f"VP5 the grader finds the vm_job launch record with its input hashes ({got})")
+        except ImportError as e:
+            ok(False, f"VP5 the grader is importable: {e}")
+        g["write_launch_record"](os.path.join(td, "dev", "j2"), "j2", code.getvalue(), None, "abc1234", "dev")
+        a = json.load(open(os.path.join(td, "dev", "assignments.json")))
+        ok(set(a) == {"j1", "j2"} and a["j2"]["pipeline"] == "none", f"VP6 records of two jobs share the file ({a})")
+        # VP7 (Codex r1 P1): a relaunch of the same job id never adopts the earlier attempt's run.
+        open(os.path.join(dest, ".manifest.json"), "w").write("{}")
+        rec2 = g["write_launch_record"](dest, "j1", code.getvalue(), "v2", "abc1234", "dev")
+        try:
+            got2 = eval_suite.launch_record_for(os.path.join(dest, "out", "runs", "2026-11-05_000000_q"))
+        except NameError:
+            got2 = None
+        ok(rec2["launch_id"] != rec["launch_id"] and not os.path.exists(os.path.join(dest, "out", "runs"))
+           and not os.path.exists(os.path.join(dest, ".manifest.json"))
+           and any(n.startswith("out.before_") for n in os.listdir(dest)),
+           f"VP7 the earlier attempt's runs/ is set aside and the poll index reset ({os.listdir(dest)}, {got2})")
+        # VP8 (Codex r1 P1): the commit comes from the archive that ships.
+        arch = io.BytesIO()
+        with tarfile.open(fileobj=arch, mode="w:gz") as t:
+            for n, b in (("scripts/lib/code_commit.txt", b"0123456789abcdef0123456789abcdef01234567\n"),):
+                ti = tarfile.TarInfo(n)
+                ti.size = len(b)
+                t.addfile(ti, io.BytesIO(b))
+        ok(g["_launch_commit"](arch.getvalue(), "/nonexistent-tree", None) == "0123456",
+           "VP8 the launch record's commit is the archive's, not the checkout's HEAD at submit time")
+        # A small --dir tree holding the unexpanded stamp, as a checkout does (never the repo root: tarring it
+        # read runs/ and .venv into memory, external review 2026-11-17).
+        d8 = os.path.join(td, "src_vp8b")
+        os.makedirs(os.path.join(d8, "scripts", "lib"))
+        open(os.path.join(d8, "scripts", "lib", "code_commit.txt"), "w").write("$Format:%H$\n")
+        ok(g["_launch_commit"](_tarball(None, d8), None, d8) == "unknown",
+           "VP8b (Codex r2) a --dir archive (no stamp) records commit unknown, not the live checkout's HEAD")
+        # VP10 (external review 2026-11-17): a --dir archive leaves out VCS, virtualenv, run outputs and bytecode.
+        d10 = os.path.join(td, "src_vp10")
+        for rel in (".git/HEAD", ".venv/bin/python", "runs/r1/report.md", "__pycache__/a.pyc",
+                    "scripts/__pycache__/b.pyc", "scripts/keep.py", "data/runs_note.txt", "data/x/runs/kept.csv",
+                    "sub/.git/config", "sub/.venv/x"):
+            os.makedirs(os.path.dirname(os.path.join(d10, rel)), exist_ok=True)
+            open(os.path.join(d10, rel), "w").write("x")
+        with tarfile.open(fileobj=io.BytesIO(_tarball(None, d10)), mode="r:gz") as t:
+            names = {n[2:] if n.startswith("./") else n for n in t.getnames()}
+        ok({"scripts/keep.py", "data/runs_note.txt", "data/x/runs/kept.csv", "runs/r1/report.md"} <= names
+           and not any({".git", ".venv", "__pycache__"} & set(n.split("/")) for n in names),
+           f"VP10 a --dir archive excludes .git, .venv and __pycache__ at any depth and keeps a staged runs/ "
+           f"({sorted(names)})")
+        # VP9 (Codex r1 P2): a --dir archive (./-prefixed names) still records its input hashes.
+        d2 = os.path.join(td, "srcdir")
+        os.makedirs(os.path.join(d2, "data", "evals", "q"))
+        open(os.path.join(d2, "data", "evals", "q", "a.csv"), "w").write("1,2\n")
+        r3 = g["write_launch_record"](os.path.join(td, "dev", "j3"), "j3", _tarball(None, d2), "v2", "x", "dev")
+        ok(r3["eval_inputs_sha256"].get("data/evals/q/a.csv"), f"VP9 --dir archives record input hashes ({r3['eval_inputs_sha256']})")
+
+
+def _self_test_storage_account(ok) -> None:
+    """SA1-SA6 (2026-11-21: a job VM's `--store` upload failed "no storage account" while the launcher had
+    $COILED_STORAGE_ACCOUNT set; nothing passed it on). `start` resolves the account name (--store-account, else
+    the launcher's $MA_STORAGE_ACCOUNT / $COILED_STORAGE_ACCOUNT, results_store's order) and passes the name, never
+    a credential, to the job: as the store's account and as $MA_STORAGE_ACCOUNT in the job's environment (a name
+    agents/enforcement.py's cloud-prefix filter leaves alone). A value that is not a storage account name is
+    refused before anything is submitted."""
+    import types
+    from unittest import mock
+    sent = []
+
+    class _C:
+        def submit(self, fn, *args, **kw):
+            sent.append((args, kw))
+            return None
+
+    def start(env, store_account=None, store="outputs/t/sa", code=None, command=("true",), full=False):
+        sent.clear()
+        a = types.SimpleNamespace(name="sa", job_id="sa1", command=list(command), tree=None, dir=None,
+                                  anthropic_key=False, store=store, store_account=store_account, max_hours=1.0, setup_sdk=False,
+                                  cluster_compute=False, shutdown_when_stored=False, _code=code,
+                                  dest=os.path.join(td, "dest"))
+        keep = {k: v for k, v in os.environ.items() if k not in ("MA_STORAGE_ACCOUNT", "COILED_STORAGE_ACCOUNT")}
+        with mock.patch.dict(os.environ, {**keep, **env}, clear=True), \
+                _patch_vj({"_client": lambda *x, **k: (_C(), "w1"),
+                                            "_runner": lambda c, w: (lambda fn, *x: "tok")}), \
+                mock.patch.dict(sys.modules, {"distributed": types.SimpleNamespace(fire_and_forget=lambda f: None)}), \
+                contextlib.redirect_stdout(io.StringIO()):
+            cmd_start(a, cluster=object())
+        args, kw = sent[0]
+        return (args, kw) if full else ((args[3] or {}), (kw.get("store") or {}))
+
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        env, st = start({"COILED_STORAGE_ACCOUNT": "launcheracct"})
+        ok(env.get("MA_STORAGE_ACCOUNT") == "launcheracct" and st.get("account") == "launcheracct",
+           f"SA1 the launcher's $COILED_STORAGE_ACCOUNT reaches the job's environment and its store ({env}, {st})")
+        env, st = start({"COILED_STORAGE_ACCOUNT": "launcheracct", "MA_STORAGE_ACCOUNT": "maacct"})
+        ok(env.get("MA_STORAGE_ACCOUNT") == "maacct" and st.get("account") == "maacct",
+           f"SA2 $MA_STORAGE_ACCOUNT wins over $COILED_STORAGE_ACCOUNT, as results_store reads them ({env}, {st})")
+        env, st = start({"COILED_STORAGE_ACCOUNT": "launcheracct"}, store_account="flagacct")
+        ok(env.get("MA_STORAGE_ACCOUNT") == "flagacct" and st.get("account") == "flagacct",
+           f"SA3 --store-account wins over the launcher's environment ({env}, {st})")
+        env, st = start({})
+        ok("MA_STORAGE_ACCOUNT" not in env and st.get("account") is None,
+           f"SA4 with no account anywhere nothing is invented: the worker's own configuration still applies ({env})")
+        env, _ = start({"COILED_STORAGE_ACCOUNT": "launcheracct"}, store=None)
+        ok(env.get("MA_STORAGE_ACCOUNT") == "launcheracct",
+           f"SA5 a job without --store still gets the account name, for its own storage reads ({env})")
+        # VS1-VS3 (W0-J supervisor): --secret-env passes a named launcher variable to the job's environment only
+        tok = "github_pat_" + "Q" * 30
+        sent.clear()
+        a = types.SimpleNamespace(name="sa", job_id="vs1", command=["true"], tree=None, dir=None, anthropic_key=False,
+                                  store=None, store_account=None, max_hours=1.0, setup_sdk=False, cluster_compute=False,
+                                  shutdown_when_stored=False, _code=None, dest=os.path.join(td, "vs"),
+                                  secret_env=["GH_TOKEN"])
+        for env_, want in (({"GH_TOKEN": tok}, "pass"), ({}, "refuse")):
+            sent.clear()
+            try:
+                with mock.patch.dict(os.environ, env_), \
+                        _patch_vj({"_client": lambda *x, **k: (_C(), "w1"),
+                                                    "_runner": lambda c, w: (lambda fn, *x: "tok")}), \
+                        mock.patch.dict(sys.modules, {"distributed": types.SimpleNamespace(fire_and_forget=lambda f: None)}), \
+                        contextlib.redirect_stdout(io.StringIO()):
+                    if not env_:
+                        os.environ.pop("GH_TOKEN", None)
+                    cmd_start(a, cluster=object())
+                got = (sent[0][0][3] or {}).get("GH_TOKEN") if sent else None
+                rec = open(os.path.join(td, "vs", "job.json")).read()
+                ok(want == "pass" and got == tok and tok not in rec,
+                   "VS1 --secret-env GH_TOKEN reaches the job's environment, never job.json")
+            except SystemExit as e:
+                ok(want == "refuse" and not sent and "GH_TOKEN" in str(e), f"VS2 a named variable that is not set is refused ({e})")
+        a.secret_env = ["ANTHROPIC_API_KEY_X"]
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                cmd_start(a, cluster=object())
+            ok(False, "VS3 a variable outside the allow-list is refused")
+        except SystemExit as e:
+            ok("allow" in str(e), f"VS3 a variable outside the allow-list is refused before submit ({e})")
+        for bad in ("DefaultEndpointsProtocol=https;AccountName=x;AccountKey=abc==", "https://x.blob.core.windows.net",
+                    "Acct", "ab"):
+            try:
+                start({"COILED_STORAGE_ACCOUNT": bad})
+                ok(False, f"SA6 a value that is not a storage account name is refused: {bad[:20]!r}")
+            except SystemExit as e:
+                ok(bool(sent) is False and "storage account" in str(e) and bad not in str(e),
+                   f"SA6 a value that is not a storage account name is refused before submit, unechoed: {bad[:20]!r}")
+    import inspect
+    src = inspect.getsource(_run_locked)
+    ok("storage_account(" in src and src.index("storage_account(") < src.index("_create("),
+       "SA7 (Codex r1) `run` refuses a bad storage account value before it creates a cluster")
+    ok("secret_env(" in src and src.index("secret_env(") < src.index("_create("),
+       "VS4 (Codex r1 of W0-J) `run` refuses a bad --secret-env before it creates a cluster")
+    # VS5 (W0-J smoke, 2026-11-22: `start` exited right after fire_and_forget, the 5 MB task never reached the
+    # scheduler and the job stayed queued): `start` waits until the job has claimed its id, and says so if it never does
+    seq = iter(["queued", "queued", "running"])
+    t = [0.0]
+    got = getattr(vj, "_await_claim", None) and _await_claim(lambda fn, j: {"state": {"state": next(seq)}}, "j", timeout_s=60,
+                                                 every_s=5, clock=lambda: t[0], sleep=lambda s: t.__setitem__(0, t[0] + s))
+    ok(got == "running" and t[0] == 10.0, f"VS5 start waits until the job leaves 'queued' ({got}, {t})")
+    try:
+        getattr(vj, "_await_claim", None) and _await_claim(lambda fn, j: {"state": {"state": "queued"}}, "j", timeout_s=20,
+                                               every_s=5, clock=lambda: t[0], sleep=lambda s: t.__setitem__(0, t[0] + s))
+        ok(False, "VS5b a job that never leaves 'queued' fails `start`")
+    except SystemExit as e:
+        ok("queued" in str(e), f"VS5b a job that never leaves 'queued' fails `start` ({e})")
+    ok("_await_claim(" in inspect.getsource(cmd_start), "VS5c cmd_start calls it after fire_and_forget")
+
+    # SA8 (Codex r1): the submitted task, run as the worker runs it with no storage variable of its own, gives the
+    # job's process $MA_STORAGE_ACCOUNT and uploads and reads back with the launcher's account.
+    class _Rec(_FakeStore):
+        def __init__(self, root):
+            super().__init__(root)
+            self.accounts = []
+
+        def upload_retry(self, path, blob, account=None):
+            self.accounts.append(("up", account))
+            return super().upload_retry(path, blob, account)
+
+        def download(self, blob, path, account=None):
+            self.accounts.append(("down", account))
+            return super().download(blob, path, account)
+    job = (b"import os\nopen(os.path.join(os.environ['JOB_OUT'], 'acct.txt'), 'w')"
+           b".write(os.environ.get('MA_STORAGE_ACCOUNT', ''))\n")
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as t:
+        ti = tarfile.TarInfo("job.py")
+        ti.size = len(job)
+        t.addfile(ti, io.BytesIO(job))
+    with tempfile.TemporaryDirectory() as td:
+        args, kw = start({"COILED_STORAGE_ACCOUNT": "launcheracct"}, code=buf.getvalue(),
+                         command=(sys.executable, "job.py"), full=True)
+        old, ws.JOBS = ws.JOBS, os.path.join(td, "vm")
+        fs = _Rec(os.path.join(td, "blob"))
+        clean = {k: v for k, v in os.environ.items() if k not in ("MA_STORAGE_ACCOUNT", "COILED_STORAGE_ACCOUNT")}
+        try:
+            with mock.patch.dict(os.environ, clean, clear=True):
+                st = ws.job_task(*args, store=kw["store"], store_mod=fs)
+            got = open(os.path.join(td, "blob", "outputs", "t", "sa", "acct.txt")).read()
+        finally:
+            ws.JOBS = old
+        ok(st["state"] == "done" and (st.get("stored") or {}).get("verified") is True and got == "launcheracct"
+           and fs.accounts and set(fs.accounts) == {("up", "launcheracct"), ("down", "launcheracct")},
+           f"SA8 the job's process sees $MA_STORAGE_ACCOUNT and its outputs upload and read back with that account "
+           f"({st['state']}, {got!r}, {fs.accounts})")
+
+
+def _self_test_sched(ok) -> None:
+    """`_client` reads the VM's worker table through worker_side's bounded reader (PR #99's
+    race; no network): Client.scheduler_info() is {} while the client is not connected."""
+    import types
+    from unittest import mock
+
+    class FakeClient:
+        def __init__(self, infos, status="running"):
+            self.infos, self.status, self.uploads = list(infos), status, 0
+
+        def scheduler_info(self):
+            return self.infos.pop(0) if len(self.infos) > 1 else self.infos[0]
+
+        def upload_file(self, *a):
+            self.uploads += 1
+
+    table = {"tls://10.0.0.7:1": {}, "tls://10.0.0.5:1": {}}
+
+    def attach(clients):
+        it = iter(clients)
+        return lambda name: types.SimpleNamespace(get_client=lambda: next(it, clients[-1]))
+
+    sleeps = []
+    with mock.patch.object(time, "sleep", sleeps.append):
+        c = FakeClient([{}, {"workers": table}])
+        with mock.patch.object(CO, "attach", attach([c])):
+            try:
+                got = _client("vm1")
+            except BaseException as e:  # noqa: BLE001
+                got = f"{type(e).__name__}: {e}"
+        ok(got == (c, "tls://10.0.0.5:1") and c.uploads == 1 and len(sleeps) == 1,
+           f"VJ1 _client waits out an unpopulated identity, then uses the first worker: {got}")
+        closed, fresh = FakeClient([{}], status="closed"), FakeClient([{"workers": table}])
+        with mock.patch.object(CO, "attach", attach([closed, fresh])):
+            try:
+                got = _client("vm1")
+            except BaseException as e:  # noqa: BLE001
+                got = f"{type(e).__name__}: {e}"
+        ok(got == (fresh, "tls://10.0.0.5:1") and fresh.uploads == 1 and not closed.uploads,
+           f"VJ2 a closed client is replaced from the cluster before the upload: {got}")
+        with mock.patch.object(CO, "attach", attach([FakeClient([{}])])):
+            try:
+                _client("vm1")
+                ok(False, "VJ3 a worker table that never appears stops with a clear message")
+            except SystemExit as e:
+                ok("vm1" in str(e) and "worker table unavailable" in str(e) and "no worker yet" not in str(e),
+                   f"VJ3 a worker table that never appears stops with a clear message, not 'no worker yet': {e}")
+            except BaseException as e:  # noqa: BLE001
+                ok(False, f"VJ3 a worker table that never appears stops with SystemExit, not {type(e).__name__}: {e}")
+        with mock.patch.object(CO, "attach", attach([FakeClient([{"workers": {}}])])):
+            try:
+                _client("vm1")
+                ok(False, "VJ4 a connected scheduler with no worker still says so")
+            except SystemExit as e:
+                ok("no worker yet" in str(e), f"VJ4 a connected scheduler with no worker still says so: {e}")
+
+
+class _FakeStore:
+    """results_store's interface over a local directory; `corrupt` changes what a download returns."""
+
+    def __init__(self, root, corrupt=False):
+        self.root, self.corrupt, self.uploads = root, corrupt, []
+
+    def is_sensitive_path(self, rel):
+        return rel.split("/")[0].startswith("_truth") or rel.endswith(".env")
+
+    def upload_retry(self, path, blob, account=None):
+        self.uploads.append(blob)
+        dest = os.path.join(self.root, blob)
+        os.makedirs(os.path.dirname(dest), exist_ok=True)
+        shutil.copy(path, dest)
+        return {"blob": blob}
+
+    def download(self, blob, path, account=None):
+        os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+        shutil.copy(os.path.join(self.root, blob), path)
+        if self.corrupt:
+            open(path, "a").write("x")
+        return {"blob": blob}
+
+
+def _self_test_batch(ok) -> None:
+    """One cluster, one scheduler, N workers for a whole batch, stopping itself once the outputs are verified in
+    storage (the Nigeria re-run used 6 one-worker clusters, each with its own scheduler, ~5 min start-up and a
+    20-minute idle tail after its shard ended, shut down from a laptop watcher). No network: fake coiled, store and
+    shutdown."""
+    import tempfile
+    import types
+    from unittest import mock
+
+    def case(label, fn):
+        try:
+            fn()
+        except BaseException as e:  # noqa: BLE001 -- a missing function is a failing case, not a crash
+            ok(False, f"{label} ({type(e).__name__}: {e})")
+
+    def oc1():
+        made, states = [], [["stopping"], ["stopping"], ["stopped"]]
+
+        class FakeCluster:
+            def __init__(self, **kw):
+                made.append(kw)
+
+            def get_client(self):
+                return types.SimpleNamespace(wait_for_workers=lambda n, timeout=None: made.append(("wait", n)))
+        fake = types.SimpleNamespace(Cluster=FakeCluster)
+        a = types.SimpleNamespace(name="b1", cpu=8, memory="32 GiB", idle_timeout="10 minutes", workers=6)
+        with mock.patch.dict(sys.modules, {"coiled": fake}), mock.patch.object(time, "sleep", lambda s: None), \
+                mock.patch.object(CO, "cluster_states", lambda n: states.pop(0) if len(states) > 1 else states[0]):
+            cmd_up(a)
+        kw = made[0] if made and isinstance(made[0], dict) else {}
+        import budget
+        tab = budget.vm_table()
+        ok(len([m for m in made if isinstance(m, dict)]) == 1 and kw.get("n_workers") == 6
+           and kw.get("scheduler_vm_types") and all(tab[t]["vcpu"] == 2 for t in kw["scheduler_vm_types"])
+           and kw.get("worker_vm_types") and all(tab[t]["vcpu"] == 8 and tab[t]["memory_gib"] >= 32
+                                                 for t in kw["worker_vm_types"]) and kw.get("shutdown_on_close") is False
+           and kw.get("workspace") == CO.WORKSPACE and ("wait", 1) in made and not states[:-1],
+           f"OC1 `up --workers 6` makes one cluster (one 2-vCPU scheduler, 6 workers) only after a stopping one has "
+           f"stopped, and waits for the first worker: {kw}")
+    case("OC1", oc1)
+
+    def oc1b():
+        ap_err = []
+        with mock.patch("argparse.ArgumentParser.error", lambda self, m: (ap_err.append(m), (_ for _ in ()).throw(
+                SystemExit(2)))):
+            for argv in (["start", "b1", "j", "--cap-usd", "5", "--shutdown-when-stored", "--", "true"],
+                         ["start", "b1", "j", "--cap-usd", "5", "--cluster-compute", "--", "true"]):
+                try:
+                    vj_main(argv)
+                except SystemExit:
+                    pass
+        ok(len(ap_err) == 2 and "--store" in ap_err[0] and "--tree" in ap_err[1],
+           f"OC1b --shutdown-when-stored needs --store, and --cluster-compute needs the shipped tree: {ap_err}")
+    case("OC1b", oc1b)
+
+    with tempfile.TemporaryDirectory() as d:
+        old = ws.JOBS
+        ws.JOBS = os.path.join(d, "vm")
+        downs = []
+        job = ("import os\nopen(os.path.join(os.environ['JOB_OUT'], 'shard.jsonl'), 'w').write('{}\\n')\n"
+               "os.makedirs(os.path.join(os.environ['JOB_OUT'], 'sub'))\n"
+               "open(os.path.join(os.environ['JOB_OUT'], 'sub', 'b.json'), 'w').write('[]')\n"
+               "os.makedirs(os.path.join(os.environ['JOB_OUT'], '_truth'))\n"
+               "open(os.path.join(os.environ['JOB_OUT'], '_truth', 'key.csv'), 'w').write('secret')\n"
+               "print('sched', os.environ.get('MA_COMPUTE_SCHEDULER'))\n"
+               "raise SystemExit(int(os.environ.get('RC', '0')))\n")
+        code = io.BytesIO()
+        with tarfile.open(fileobj=code, mode="w:gz") as t:
+            ti = tarfile.TarInfo("job.py")
+            ti.size = len(job)
+            t.addfile(ti, io.BytesIO(job.encode()))
+        code = code.getvalue()
+        try:
+            with mock.patch.object(ws, "_cluster_env", lambda work: {"MA_COMPUTE_SCHEDULER": "tls://sched:8786"},
+                                   create=True), \
+                    mock.patch.object(ws, "_shutdown_cluster", lambda: downs.append(1), create=True):
+                def oc2():
+                    fs = _FakeStore(os.path.join(d, "blob1"))
+                    st = ws.job_task("b1", code, [sys.executable, "job.py"], None, 1.0, cluster_compute=True,
+                                     store={"prefix": "outputs/t/b1", "account": "acct"}, shutdown_when_stored=True,
+                                     store_mod=fs)
+                    log = open(os.path.join(ws.JOBS, "b1", "job.log")).read()
+                    ok("sched tls://sched:8786" in log,
+                       f"OC2 a batch job's run_map reaches this cluster's scheduler (MA_COMPUTE_SCHEDULER): {log[-80:]}")
+                    sto = st.get("stored") or {}
+                    ok(st["state"] == "done" and sto.get("verified") is True
+                       and sorted(fs.uploads) == ["outputs/t/b1/shard.jsonl", "outputs/t/b1/sub/b.json"]
+                       and sto.get("skipped") == ["_truth/key.csv"] and len(downs) == 1 and st.get("shutdown") is True,
+                       f"OC3 when the job is done and every output (no sensitive file) is read back from storage with "
+                       f"the same sha256, the job shuts its cluster down itself: {sto}, shutdowns {len(downs)}")
+                    ok(ws.job_state("b1")["state"].get("stored", {}).get("verified") is True,
+                       "OC3b the verification is recorded in the job's state")
+                case("OC2", oc2)
+
+                def oc4():
+                    downs.clear()
+                    fs = _FakeStore(os.path.join(d, "blob2"), corrupt=True)
+                    st = ws.job_task("b2", code, [sys.executable, "job.py"], None, 1.0, store={"prefix": "outputs/t/b2"},
+                                     shutdown_when_stored=True, store_mod=fs)
+                    ok(st["state"] == "done" and (st.get("stored") or {}).get("verified") is False and not downs
+                       and not st.get("shutdown") and "sha256" in str((st.get("stored") or {}).get("why")),
+                       f"OC4 a stored copy that differs is not verified, and the cluster is left to its idle timeout "
+                       f"for collection: {st.get('stored')}")
+                case("OC4", oc4)
+
+                def oc5():
+                    downs.clear()
+                    fs = _FakeStore(os.path.join(d, "blob3"))
+                    with mock.patch.dict(os.environ, {"RC": "3"}):
+                        st = ws.job_task("b3", code, [sys.executable, "job.py"], None, 1.0,
+                                         store={"prefix": "outputs/t/b3"}, shutdown_when_stored=True, store_mod=fs)
+                    ok(st["state"] == "failed" and not downs and fs.uploads,
+                       f"OC5 a failed job stores what it wrote but never shuts the cluster down: {st['state']}, "
+                       f"{len(fs.uploads)} uploads, shutdowns {len(downs)}")
+                case("OC5", oc5)
+
+                def oc6():
+                    downs.clear()
+                    st = ws.job_task("b4", code, [sys.executable, "job.py"], None, 1.0,
+                                     store={"prefix": "outputs/t/b4"}, shutdown_when_stored=True)
+                    ok(st["state"] == "done" and (st.get("stored") or {}).get("verified") is False and not downs
+                       and "results_store" in str((st.get("stored") or {}).get("why")),
+                       f"OC6 storage requested without the shipped tree's results_store fails closed (no shutdown): "
+                       f"{st.get('stored')}")
+                case("OC6", oc6)
+        finally:
+            ws.JOBS = old
+
+
+def _self_test_vm_types(ok) -> None:
+    """VT (2026-11-13): `--cpu 8` with the default --memory got Standard_F8s_v2, which cloud/vm_prices.yaml lacked.
+    budget.py refused it only once the cluster existed: the cap stopped it, and every later launch in the f6 scope was
+    refused until #230 priced it. Now `up` and `run` pin the cluster's VM types from the price table before anything
+    is created or reserved, and `start` refuses a live cluster running an unpriced type. No network: fake coiled, a
+    temporary price table without F8s_v2, and a recording budget gate."""
+    import contextlib
+    import tempfile
+    import types
+    from unittest import mock
+    import budget
+
+    def case(label, fn):
+        try:
+            fn()
+        except BaseException as e:  # noqa: BLE001 -- a missing function is a failing case, not a crash
+            ok(False, f"{label} ({type(e).__name__}: {e})")
+
+    with tempfile.TemporaryDirectory() as d:
+        nof8 = os.path.join(d, "vm_prices.yaml")
+        open(nof8, "w").write("margin: 1.0\ncredits_per_vcpu_hour: 0\ntypes:\n"
+                              "  Standard_D2_v5: {vcpu: 2, memory_gib: 8, usd_per_hour: 0.096}\n"
+                              "  Standard_D8_v5: {vcpu: 8, memory_gib: 32, usd_per_hour: 0.384}\n"
+                              "  Standard_D8as_v5: {vcpu: 8, memory_gib: 32, usd_per_hour: 0.344}\n")
+        priced = set(budget.load_prices(nof8))
+
+        def up(cpu, memory, cmd="up"):
+            made, gates, listed = [], [], []
+
+            class FakeCluster:
+                def __init__(self, **kw):
+                    made.append(kw)
+
+                def get_client(self):
+                    return types.SimpleNamespace(wait_for_workers=lambda n, timeout=None: None)
+            a = types.SimpleNamespace(name="lw-smoke-vt", cpu=cpu, memory=memory, idle_timeout="10 minutes", workers=1,
+                                      budget_scope="f6", cap_usd=1.0)
+            gate = lambda a_, name, meter=False, reserve=True: gates.append(name)   # noqa: E731
+            msg = None
+            with mock.patch.dict(sys.modules, {"coiled": types.SimpleNamespace(Cluster=FakeCluster)}), \
+                    mock.patch.object(budget, "PRICES_FILE", nof8), \
+                    _patch_vj({"_budget_gate": gate}), \
+                    mock.patch.object(CO, "cluster_states", lambda n: listed.append(n) or []), \
+                    contextlib.redirect_stdout(io.StringIO()):
+                try:
+                    cmd_up(a)
+                except SystemExit as e:
+                    msg = str(e.code)
+            return made, gates, listed, msg
+
+        def vt1():
+            made, gates, _, msg = up(8, "16 GiB")
+            kw = made[0] if made else {}
+            wt, st = list(kw.get("worker_vm_types") or []), list(kw.get("scheduler_vm_types") or [])
+            ok(msg is None and len(made) == 1 and wt and st and set(wt) <= priced and set(st) <= priced
+               and "Standard_F8s_v2" not in wt
+               and not {"worker_cpu", "worker_memory", "scheduler_cpu", "scheduler_memory"} & set(kw),
+               f"VT1 the F8s_v2 case: `up --cpu 8 --memory '16 GiB'` on a table without F8s_v2 pins the workers and the "
+               f"scheduler to priced types (no cpu/memory left for Coiled to pick from): msg={msg} {kw}")
+        case("VT1", vt1)
+
+        def vt2():
+            made, gates, listed, msg = up(12, "16 GiB")
+            ok(msg is not None and "vm_prices.yaml" in msg and "12" in msg and not made and not gates and not listed,
+               f"VT2 `up` with a request no priced type matches is refused before any listing, budget reservation or "
+               f"cluster: msg={msg} made={len(made)} gates={gates} listed={listed}")
+        case("VT2", vt2)
+
+        def vt3():
+            made, gates, msg = [], [], None
+            fake = types.SimpleNamespace(Cluster=lambda **kw: made.append(kw), list_clusters=lambda workspace=None: [])
+            gate = lambda a_, name, meter=False, reserve=True: gates.append(name)   # noqa: E731
+            src = os.path.join(d, "src")
+            os.makedirs(src, exist_ok=True)
+            open(os.path.join(src, "job.py"), "w").write("print(1)\n")
+            out = io.StringIO()
+            with mock.patch.dict(sys.modules, {"coiled": fake}), mock.patch.object(budget, "PRICES_FILE", nof8), \
+                    _patch_vj({"_budget_gate": gate}), contextlib.redirect_stdout(out):
+                try:
+                    vj_main(["run", "lw-smoke-vt", "j3", "--dir", src, "--out", os.path.join(d, "local"), "--cpu", "4",
+                          "--cap-usd", "1", "--store", "outputs/t/j3", "--", sys.executable, "job.py"])
+                except SystemExit as e:
+                    msg = str(e.code)
+            wt = list((made[0] if made else {}).get("worker_vm_types") or [])
+            ok(len(made) == 1 and gates and wt and set(wt) <= priced and "WARNING" in out.getvalue()
+               and "closest" in out.getvalue(),
+               f"VT3 (owner: fail soft) `run --cpu 4` on a table with no 4-vCPU type launches on the closest priced "
+               f"types that satisfy it (8 vCPUs), with a warning: types {wt} gates={gates} out={out.getvalue()[:300]!r}")
+        case("VT3", vt3)
+
+        def start_on(vm, listed=None, extra=()):
+            attached, msg, out = [], None, io.StringIO()
+
+            def proc(t, cand):
+                return {"current_state": {"state": "started"}, "spec": {"prioritized_instance_types": cand},
+                        "instance": {"instance_type_id": t, "current_state": {"state": "started"}}}
+            det = {"id": 7, "scheduler": proc("Standard_D2_v5", ["Standard_D2_v5"]),
+                   "workers": [proc(vm, [vm] if listed is None else listed), *extra]}
+            src = types.SimpleNamespace(details=lambda cid: det)
+            a = types.SimpleNamespace(name="lw-smoke-vt", command=["true"], budget_scope="f6", cap_usd=1.0, tree=None,
+                                      dir=None, anthropic_key=False, job_id="j4")
+
+            def attach(name):
+                attached.append(name)
+                raise SystemExit("attached")
+            with mock.patch.object(budget, "PRICES_FILE", nof8), mock.patch.object(budget, "CoiledSource", lambda: src), \
+                    mock.patch.object(CO, "live_id", lambda n, lister=None: 7), mock.patch.object(CO, "attach", attach), \
+                    mock.patch.object(ws, "attach_existing", lambda n, w_, cid: attach((n, cid))), \
+                    _patch_vj({"_budget_gate": lambda *x, **k: None}), \
+                    mock.patch.dict(sys.modules, {"distributed": types.SimpleNamespace(fire_and_forget=lambda f: None)}), \
+                    contextlib.redirect_stdout(out):
+                try:
+                    cmd_start(a)
+                except SystemExit as e:
+                    msg = str(e.code)
+            return attached, msg, out.getvalue()
+
+        def vt4():
+            # owner, 2026-11-13: spend controls fail soft. Each case below attaches (to the checked id) and warns.
+            here = [("lw-smoke-vt", 7)]
+            attached, msg, out = start_on("Standard_F8s_v2")
+            ok(attached == here and msg == "attached" and "WARNING" in out and "Standard_F8s_v2" in out,
+               f"VT4 the F8s_v2 case: `start` on a live cluster whose worker runs an unpriced type goes ahead with a "
+               f"warning naming it (budget.py counts it at the fallback rate): msg={msg} out={out[:200]!r}")
+            attached, msg, out = start_on("Standard_D8_v5")
+            ok(attached == here and msg == "attached" and "WARNING" not in out,
+               f"VT4b `start` on a cluster running priced types attaches to that cluster id only, with no warning "
+               f"(Codex r2: not a replacement of the same name): msg={msg} attached={attached}")
+            attached, msg, out = start_on("Standard_D8_v5",
+                                          extra=({"current_state": {"state": "pending"}, "instance": None},))
+            ok(attached == here and "WARNING" in out and "no VM type yet" in out,
+               f"VT4c a live (pending) worker with no VM record is warned about, not skipped silently: {out[:200]!r}")
+            attached, msg, out = start_on("Standard_D8_v5", listed=["Standard_D8_v5", "Fake_D8ls_v5"])
+            ok(attached == here and "WARNING" in out and "Fake_D8ls_v5" in out,
+               f"VT4d an unpriced candidate type (spec.prioritized_instance_types, as cluster 2376181 had) is warned "
+               f"about: {out[:200]!r}")
+            attached, msg, out = start_on("Standard_D8_v5", listed=[])
+            ok(attached == here and "WARNING" in out and "candidate" in out,
+               f"VT4e a missing candidate list is warned about: {out[:200]!r}")
+        case("VT4", vt4)
+
+        def vt5():
+            import inspect
+            srcs = {f.__name__: inspect.getsource(f) for f in (_create, rc._launch_locked, rc.start_overflow,
+                                                                rc.start_keeper, ws.attach_existing)}
+            bad = {n: k for n, s in srcs.items() for k in ("worker_cpu=", "worker_memory=", "scheduler_cpu=",
+                                                            "scheduler_memory=") if k in s}
+            pinned = {n: ("scheduler_vm_types=" in s and "worker_vm_types=" in s) or "**_vm_request(a)" in s
+                      for n, s in srcs.items()}
+            ok(not bad and all(pinned.values()),
+               f"VT5 every cluster constructor in vm_job and run_cluster pins worker and scheduler VM types (no "
+               f"cpu/memory request Coiled could resolve to an unpriced type): cpu/memory {bad}, pinned {pinned}")
+        case("VT5", vt5)
+
+        def vt6():
+            # F6 rerun prep (2026-11-18): decision-test outputs differed across machines in CI. --cpu/--memory give a
+            # list across VM families (Standard_D8_v5 and Standard_D8as_v5 here: Intel and AMD); --pin-vm-type
+            # pins exactly one priced type, and refuses an unpriced one or one whose vCPUs differ from --cpu.
+            vt6 = os.path.join(d, "vm_prices_vt6.yaml")
+            open(vt6, "w").write(open(nof8).read() + "  Standard_E8s_v5: {vcpu: 8, memory_gib: 64, usd_per_hour: 0.504}\n")
+
+            def one(t, cpu=8, memory="32 GiB"):
+                made, msg, gates, listed = [], None, [], []
+                a = types.SimpleNamespace(name="lw-smoke-vt", cpu=cpu, memory=memory, idle_timeout="10 minutes",
+                                          workers=1, budget_scope="f6", cap_usd=1.0, pin_vm_type=t)
+
+                class FakeCluster:
+                    def __init__(self, **kw):
+                        made.append(kw)
+
+                    def get_client(self):
+                        return types.SimpleNamespace(wait_for_workers=lambda n, timeout=None: None)
+                with mock.patch.dict(sys.modules, {"coiled": types.SimpleNamespace(Cluster=FakeCluster)}), \
+                        mock.patch.object(budget, "PRICES_FILE", vt6), \
+                        _patch_vj({"_budget_gate": lambda a_, n, **k: gates.append(n)}), \
+                        mock.patch.object(CO, "cluster_states", lambda n: listed.append(n) or []), \
+                        contextlib.redirect_stdout(io.StringIO()):
+                    try:
+                        cmd_up(a)
+                    except SystemExit as e:
+                        msg = str(e.code)
+                return made, msg, gates, listed
+
+            def refused(label, r, *words):
+                made, msg, gates, listed = r
+                ok(not made and not gates and not listed and msg and all(x in msg for x in words),
+                   f"{label} before any listing, budget reservation or cluster: msg={msg} gates={gates} listed={listed}")
+            made, msg, _, _ = one(None)
+            ok(msg is None and len((made[0] if made else {}).get("worker_vm_types") or []) >= 2,
+               f"VT6a without --pin-vm-type the request resolves to every matching priced type: {made} {msg}")
+            made, msg, _, _ = one("Standard_D8_v5")
+            ok(msg is None and made and made[0].get("worker_vm_types") == ["Standard_D8_v5"],
+               f"VT6b --pin-vm-type pins the workers to exactly that type: {made} {msg}")
+            refused("VT6c an unpriced --pin-vm-type is refused", one("Standard_F8s_v2"), "Standard_F8s_v2")
+            refused("VT6d a --pin-vm-type whose vCPUs differ from --cpu is refused", one("Standard_D2_v5"),
+                    "Standard_D2_v5", "--cpu 8")
+            # Codex review of #274 (P1): the pin must also satisfy --memory, and an empty value is not "absent"
+            refused("VT6e a --pin-vm-type with less memory than --memory is refused", one("Standard_D8_v5",
+                                                                                        memory="64 GiB"), "64 GiB")
+            refused("VT6f an empty --pin-vm-type is refused, not read as absent", one(""), "--pin-vm-type")
+            # Codex re-review of #274 (P1): a new flag must not make an existing abbreviation (--worker) ambiguous
+            seen = {}
+            with _patch_vj({"cmd_up": lambda a_: seen.update(workers=a_.workers)}), \
+                    contextlib.redirect_stderr(io.StringIO()):
+                try:
+                    vj_main(["up", "lw-smoke-vt", "--worker", "2", "--cap-usd", "1"])
+                except SystemExit as e:
+                    seen["exit"] = e.code
+            ok(seen.get("workers") == 2 and "exit" not in seen, f"VT6g `--worker 2` still parses as --workers: {seen}")
+        case("VT6", vt6)
+
+
+def _self_test_run(ok, real_gate=None) -> None:
+    """RN: `run` brings the cluster up, submits at once, waits with status lines, then stops it. On 2026-11-03 an
+    agent ran `up`, ended its turn to wait, never sent `start`, and the VM idled out after 20 minutes with no job:
+    about two hours lost. No network: a fake coiled module (Cluster, list_clusters, delete_cluster), fake client and
+    store; vm_job's own guard, client and stop code run unmocked, and the job runs for real (worker_side.job_task)
+    in a temporary JOBS directory. Any coiled.Cluster call after the one creation counts as an attach by name."""
+    import contextlib
+    import tempfile
+    import types
+    from unittest import mock
+
+    def case(label, fn):
+        try:
+            fn()
+        except BaseException as e:  # noqa: BLE001 -- a missing function is a failing case, not a crash
+            ok(False, f"{label} ({type(e).__name__}: {e})")
+
+    real_sleep = time.sleep
+    LIVE = ("pending", "starting", "running", "ready")
+
+    def world(d, jid, job_rc=0, pre=None, corrupt=False, wait_fails=False, ctor_fail=None, interrupt_at=None,
+              drop_at=None, job_stop="deferred", extra=(), store=True, prog="job.py", threaded=False, job_sleep=0,
+              appear=None, after_submit=None, ctor_side=None, then=(), pre_names=None, gate=None, job_src=None,
+              term_at=None):
+        """Run `vm_job.py run` against a fake Coiled; returns (W, exit message or None, stdout, exception).
+        `threaded`: the job runs in its own thread from submission, concurrently with `run`'s polls, and its own
+        stop is real (time scaled down 600x). Its grace (two poll intervals plus a minute, RN3) ends once `run` has
+        stopped the cluster (at most 15 s): scaled down, the grace was 0.3 s, which a loaded machine can overrun
+        between `run`'s read of the final state and its stop, so the job's stop came first (flaky RN20, RN29).
+        `appear`: (n, id) another launcher's cluster of the same name appears after n cluster listings."""
+        W = {"clusters": dict(pre or {}), "next": 100, "events": [], "ctor": [], "pending": None, "submit_kw": None,
+             "deferred": [], "polls": 0, "list_fail": 0, "stops": 0, "list_calls": 0, "thread": None,
+             "table": ["tls://w1"], "job_worker": None, "polled": [], "names": dict(pre_names or {}), "then": []}
+        ev = W["events"]
+        src = os.path.join(d, f"src_{jid}")
+        os.makedirs(src, exist_ok=True)
+        open(os.path.join(src, "job.py"), "w").write(job_src or (
+            f"import os, time\ntime.sleep({job_sleep})\n"
+            "open(os.path.join(os.environ['JOB_OUT'], 'result.txt'), 'w').write('42')\n"
+            f"print('job ran', flush=True)\nraise SystemExit({job_rc})\n"))
+        fs = _FakeStore(os.path.join(d, f"blob_{jid}"), corrupt=corrupt)
+        import threading
+        run_stopped = threading.Event()     # `run` has asked for the cluster's stop (threaded: the job's grace ends)
+
+        def stop(cid, who):
+            if W["clusters"].get(cid) in LIVE:
+                W["clusters"][cid] = "stopped"
+                W["stops"] += 1
+                ev.append((who, cid))
+            else:
+                ev.append((who + "_noop", cid))
+            if who != "job_shutdown":
+                run_stopped.set()
+
+        def list_clusters(workspace=None):
+            W["list_calls"] += 1
+            if appear and W["list_calls"] > appear[0] and appear[1] not in W["clusters"]:
+                W["clusters"][appear[1]] = "running"
+            if W["list_fail"] > 0:
+                W["list_fail"] -= 1
+                raise RuntimeError("listing failed")
+            return [{"id": i, "name": W["names"].get(i, "vm1"), "current_state": {"state": s}}
+                    for i, s in W["clusters"].items()]
+
+        def delete_cluster(name=None, cluster_id=None, workspace=None, pause=False):
+            if name is not None:
+                ev.append("delete_by_name")
+            stop(cluster_id, "delete")
+
+        class FC:
+            status = "running"
+
+            def __init__(self, cid):
+                self.cid = cid
+
+            def scheduler_info(self):
+                return {"workers": {w: {} for w in W["table"]}}
+
+            def upload_file(self, *a):
+                pass
+
+            def wait_for_workers(self, n, timeout=None):
+                ev.append("wait_workers")
+                if wait_fails:
+                    raise TimeoutError("no worker within 1500 s")
+
+            def run(self, fn, *a, workers=None, wait=True, on_error="raise"):
+                if fn is ws.job_state:
+                    W["polls"] += 1
+                    W["polled"].append(workers[0])
+                    if workers[0] != W["job_worker"]:     # another VM's disk has no record of this job
+                        return {workers[0]: {"state": {"state": "missing"}, "files": {}, "log_tail": ""}}
+                    if W["polls"] in (interrupt_at if isinstance(interrupt_at, tuple) else (interrupt_at,)):
+                        raise KeyboardInterrupt
+                    if W["polls"] == term_at:
+                        import signal as _sig
+                        os.kill(os.getpid(), _sig.SIGTERM)
+                        real_sleep(0.2)        # the handler runs here
+                    if W["polls"] == drop_at:
+                        W["list_fail"] = 2     # the gone-check's listing fails too
+                        raise RuntimeError("connection dropped")
+                r = fn(*a)
+                if fn is ws.job_state:
+                    ev.append("poll")
+                    if W["pending"]:      # the task starts after the first poll, so that poll reads 'queued'
+                        task, W["pending"] = W["pending"], None
+                        task()
+                    elif job_stop == "after_read" and r["state"].get("state") in DONE and W["deferred"]:
+                        W["deferred"].pop(0)()    # the grace ran out just after this poll read the final state
+                return {workers[0]: r}
+
+            def submit(self, fn, *args, **kw):
+                ev.append("submit")
+                W["submit_kw"] = dict(kw)
+                W["job_worker"] = kw["workers"][0]
+                if after_submit == "joins":       # a worker that sorts first joins after submission
+                    W["table"] = ["tls://w0", "tls://w1"]
+                elif after_submit == "leaves":    # the job's worker leaves; another remains
+                    W["table"] = ["tls://w0"]
+                elif after_submit == "empty":     # the job's (only) worker leaves
+                    W["table"] = []
+                jkw = {k: v for k, v in kw.items() if k not in ("workers", "allow_other_workers", "pure", "key")}
+                task = lambda: fn(*args, store_mod=fs, **jkw)  # noqa: E731
+                if threaded:
+                    W["thread"] = threading.Thread(target=task, daemon=True)
+                    W["thread"].start()
+                else:
+                    W["pending"] = task
+                return object()
+
+        class FakeCluster:
+            def __init__(self, **kw):
+                W["ctor"].append(kw)
+                cid = W["next"]
+                W["next"] += 1
+                W["clusters"][cid] = "pending"     # allocated before the constructor returns
+                W["names"][cid] = kw.get("name")
+                if ctor_side is not None:          # another launcher allocates meanwhile
+                    W["clusters"][ctor_side[0]], W["names"][ctor_side[0]] = "running", ctor_side[1]
+                if ctor_fail is not None:
+                    raise ctor_fail
+                W["clusters"][cid] = "running"
+                self.cluster_id = cid
+                ev.append("create")
+
+            def get_client(self):
+                if W["clusters"].get(self.cluster_id) not in LIVE:
+                    raise RuntimeError("cluster is gone")
+                return FC(self.cluster_id)
+
+            def shutdown(self):
+                stop(self.cluster_id, "cl_shutdown")
+
+        def attach_by_id(name, workspace, cid):     # ws.attach_existing: refuses any cluster but the checked id
+            ev.append(("attach_id", cid))
+            if W["clusters"].get(cid) not in LIVE:
+                raise SystemExit(f"cluster {cid} is not live")
+            cl = FakeCluster.__new__(FakeCluster)
+            cl.cluster_id = cid
+            return cl
+
+        def job_down():
+            ev.append("job_shutdown_request")
+            cid = max(W["clusters"])
+            if threaded:      # its grace has run once `run` has stopped the cluster (bounded: see the docstring)
+                run_stopped.wait(15)
+                stop(cid, "job_shutdown")
+            elif job_stop == "now":     # the job stops the cluster now (its grace has run)
+                stop(cid, "job_shutdown")
+            else:
+                W["deferred"].append(lambda: stop(cid, "job_shutdown"))
+
+        def no_attach(name):
+            ev.append(("attach", name))
+            raise SystemExit("rc.attach called")
+
+        launcher_sleeps = [0]
+
+        def sleep(s):
+            ev.append(("sleep", s))
+            # Only `run`'s own sleeps count (Codex on #322): the threaded job sleeps here while it polls its child,
+            # and a job that waits on the meter must not exhaust `run`'s runaway-poll guard.
+            if not threaded or threading.current_thread() is threading.main_thread():
+                launcher_sleeps[0] += 1
+            if launcher_sleeps[0] > 400:
+                raise RuntimeError("test: `run` is still polling after 400 sleeps (it would wait to its deadline)")
+            real_sleep(s / 600 if threaded else min(s, 0.01))
+
+        argv = ["run", "vm1", jid, "--dir", src, "--out", os.path.join(d, "local"), "--every", "60", "--cap-usd", "5",
+                *extra]
+        if store:
+            argv += ["--store", f"outputs/t/{jid}"]
+        argv += ["--", sys.executable, prog]
+        out, msg, exc = io.StringIO(), None, None
+        fake_coiled = types.SimpleNamespace(Cluster=FakeCluster, list_clusters=list_clusters,
+                                            delete_cluster=delete_cluster)
+        fake_dist = types.SimpleNamespace(fire_and_forget=lambda f: None)
+        with mock.patch.dict(sys.modules, {"coiled": fake_coiled, "distributed": fake_dist}), \
+                mock.patch.object(CO, "attach", no_attach), \
+                mock.patch.object(ws, "_shutdown_cluster", job_down), \
+                mock.patch.object(ws, "attach_existing", attach_by_id), \
+                mock.patch.object(time, "sleep", sleep), contextlib.redirect_stdout(out), \
+                _patch_vj({"_budget_gate": gate} if gate else {}), \
+                contextlib.redirect_stderr(io.StringIO()):
+            try:
+                vj_main(argv)
+            except SystemExit as e:
+                msg = str(e.code) if e.code not in (None, 0) else None
+            except BaseException as e:  # noqa: BLE001 -- an interrupt is the case under test
+                exc = e
+            if W["thread"] is not None:
+                W["thread"].join(20)
+            for extra_argv in then:     # later commands against the same fake (status, wait, down)
+                try:
+                    vj_main(list(extra_argv))
+                    W["then"].append(None)
+                except BaseException as e:  # noqa: BLE001
+                    W["then"].append(e)
+            W["after"] = lambda: [f() for f in W["deferred"]]
+        return W, msg, out.getvalue(), exc
+
+    def clean(W):
+        ev = W["events"]
+        return (len(W["ctor"]) <= 1 and "delete_by_name" not in ev
+                and not any(isinstance(e, tuple) and e[0] == "attach" for e in ev))
+
+    import budget as _budget
+    ALERTS = []                         # spend alerts, captured (never written to the real budget directory)
+
+    def _json_or(default, path):
+        try:
+            return json.load(open(path))
+        except (OSError, ValueError):
+            return default
+
+    with tempfile.TemporaryDirectory() as d, \
+            mock.patch.object(_budget, "alert", lambda kind, **f: ALERTS.append(dict(kind=kind, **f)) or {}):
+        old = ws.JOBS
+        ws.JOBS = os.path.join(d, "vm")
+        try:
+            def rn1():
+                W, msg, out, exc = world(d, "r1")
+                ev = W["events"]
+                first = ev[:ev.index("submit") + 1] if "submit" in ev else ev
+                ok(len(W["ctor"]) == 1 and first[:1] == ["create"] and "submit" in first
+                   and not [e for e in first if isinstance(e, tuple)] and W["ctor"][0].get("shutdown_on_close") is False,
+                   f"RN1 `run` submits the job right after the cluster is up, with no wait in between: {first}")
+                polls = [i for i, e in enumerate(ev) if e == "poll"]
+                ok(msg is None and exc is None and len(polls) >= 2 and ("sleep", 60.0) in ev[polls[0]:polls[1]]
+                   and ("delete", 100) in ev and W["clusters"][100] == "stopped" and W["stops"] == 1 and clean(W)
+                   and "queued" in out and "done" in out
+                   and os.path.exists(os.path.join(d, "local", "vm1", "r1", "out", "result.txt")),
+                   f"RN2 `run` waits with a status line per poll, saves the outputs, and stops the cluster by id "
+                   f"(no attach by name): msg={msg} exc={exc!r} events={ev}")
+                try:
+                    W["after"]()
+                    second = None
+                except BaseException as e:  # noqa: BLE001
+                    second = e
+                ok(second is None and W["stops"] == 1 and ("job_shutdown_noop", 100) in ev and clean(W),
+                   f"RN2b the job's own shutdown arriving after `run` stopped the cluster is harmless: {second!r}")
+                kw = W["submit_kw"] or {}
+                grace = kw.get("shutdown_grace_s") or 0
+                ok(kw.get("shutdown_always") is True and kw.get("shutdown_when_stored") is True and grace >= 60,
+                   f"RN3 under `run` the job always stops its own cluster after a grace of at least one poll "
+                   f"interval, whatever the outcome: {({k: kw.get(k) for k in ('shutdown_always', 'shutdown_grace_s')})}")
+            case("RN1-3", rn1)
+
+            def rn4():
+                W, msg, out, exc = world(d, "r4", job_rc=3)
+                ev = W["events"]
+                ok(msg is not None and "failed" in msg and "rc=3" in msg and ("delete", 100) in ev and clean(W)
+                   and max(i for i, e in enumerate(ev) if e == "poll") < ev.index(("delete", 100))
+                   and os.path.exists(os.path.join(d, "local", "vm1", "r4", "job.log")),
+                   f"RN4 a failed job: `run` exits non-zero with the reason, after saving the log, and stops the "
+                   f"cluster: msg={msg} events={ev}")
+            case("RN4", rn4)
+
+            def rn5():
+                W, msg, out, exc = world(d, "r5", corrupt=True)
+                ok(msg is not None and "verified" in msg and ("delete", 100) in W["events"] and clean(W),
+                   f"RN5 a done job whose stored copy differs is a failure (non-zero) and the cluster is stopped: {msg}")
+            case("RN5", rn5)
+
+            def rn6():
+                W, msg, out, exc = world(d, "r6", job_rc=3, extra=("--keep-on-failure",))
+                kw = W["submit_kw"] or {}
+                ok(msg is not None and "rc=3" in msg and W["stops"] == 0 and W["clusters"].get(100) == "running"
+                   and "down" in out and kw.get("shutdown_always") is False and kw.get("shutdown_when_stored") is True,
+                   f"RN6 --keep-on-failure keeps the cluster up for debugging (the job stops it only on success) and "
+                   f"says how to stop it: {msg} {kw.get('shutdown_always')}")
+            case("RN6", rn6)
+
+            def rn7():
+                W, msg, out, exc = world(d, "r7", pre={7: "running"})
+                ok(msg is not None and not W["ctor"] and "submit" not in W["events"] and W["stops"] == 0
+                   and W["clusters"][7] == "running" and "vm1" in msg and clean(W),
+                   f"RN7 a cluster of that name already running is neither reused nor stopped (no second launch): "
+                   f"{msg} {W['events']}")
+            case("RN7", rn7)
+
+            def rn8():
+                W, msg, out, exc = world(d, "r8", wait_fails=True)
+                ok(msg is not None and len(W["ctor"]) == 1 and "submit" not in W["events"]
+                   and W["clusters"][100] == "stopped" and clean(W),
+                   f"RN8 a cluster whose first worker never arrives is stopped and `run` exits non-zero: {msg}")
+            case("RN8", rn8)
+
+            def rn9():
+                W, msg, out, exc = world(d, "r9", job_stop="now")
+                ok(msg is not None and "final state" in msg and clean(W),
+                   f"RN9 a cluster that stops before `run` reads the job's final state is reported, not taken as "
+                   f"success, and never attached by name or re-created: {msg} {W['events'][-4:]}")
+            case("RN9", rn9)
+
+            def rn11():
+                W, msg, out, exc = world(d, "r11", interrupt_at=2)
+                ok(isinstance(exc, KeyboardInterrupt) and ("delete", 100) in W["events"] and clean(W),
+                   f"RN11 Ctrl-C while polling stops the cluster: exc={exc!r} events={W['events'][-3:]}")
+                W, msg, out, exc = world(d, "r11k", interrupt_at=2, extra=("--keep-on-failure",))
+                ok(isinstance(exc, KeyboardInterrupt) and W["stops"] == 0 and W["clusters"][100] == "running",
+                   f"RN11b Ctrl-C with --keep-on-failure keeps it: {exc!r} stops={W['stops']}")
+            case("RN11", rn11)
+
+            def rn12():
+                W, msg, out, exc = world(d, "r12", drop_at=2)
+                ok(msg is None and exc is None and ("delete", 100) in W["events"] and clean(W) and "retrying" in out,
+                   f"RN12 a dropped connection and a failing cluster listing while polling are retried, not raised; "
+                   f"the job finishes and the cluster is stopped: msg={msg} exc={exc!r}")
+            case("RN12", rn12)
+
+            def rn13():
+                for label, err in (("RuntimeError", RuntimeError("allocation failed")), ("Ctrl-C", KeyboardInterrupt())):
+                    W, msg, out, exc = world(d, f"r13{label[0]}", pre={7: "stopped"}, ctor_fail=err)
+                    ok((msg is not None or isinstance(exc, KeyboardInterrupt)) and ("delete", 100) in W["events"]
+                       and W["clusters"][7] == "stopped" and ("delete", 7) not in W["events"] and clean(W),
+                       f"RN13 {label} inside cluster construction: the allocated cluster is found by id and stopped; "
+                       f"the earlier stopped one is not touched: {msg} {exc!r} {W['events']}")
+            case("RN13", rn13)
+
+            def rn15():
+                W, msg, out, exc = world(d, "r15", job_stop="after_read")
+                ok(msg is None and exc is None and W["stops"] == 1 and ("job_shutdown", 100) in W["events"]
+                   and clean(W),
+                   f"RN15 the job stops the cluster just after `run` read the final state: `run`'s own stop is "
+                   f"harmless and it exits 0: msg={msg} exc={exc!r} {W['events'][-3:]}")
+            case("RN15", rn15)
+
+            def rn16():
+                W, msg, out, exc = world(d, "../bad")
+                ok(msg is not None and not W["ctor"],
+                   f"RN16 an invalid job id is refused before any cluster is created: {msg} ctor={len(W['ctor'])}")
+                W, msg, out, exc = world(d, "r16", store=False)
+                ok(msg is not None and not W["ctor"],
+                   f"RN17 `run` without --store is refused before any cluster is created (no unverified success): "
+                   f"{msg}")
+            case("RN16-17", rn16)
+
+            def rn14():
+                W, msg, out, exc = world(d, "r14k", extra=("--keep-on-failure",))
+                kw_keep = dict(W["submit_kw"] or {})
+                W, msg, out, exc = world(d, "r14", job_rc=3)
+                kw = dict(W["submit_kw"] or {})
+                code = _tarball(None, os.path.join(d, "src_r14"))
+                jkw = {k: v for k, v in kw.items() if k not in ("workers", "allow_other_workers", "pure", "key",
+                                                                 "token")}
+                grace = kw.get("shutdown_grace_s") or 0
+                rows = []
+                for label, cmd, kws, corrupt, want in (
+                        ("failed", [sys.executable, "job.py"], jkw, False, 1),
+                        ("cannot start", ["--no-such-program-x"], jkw, False, 1),
+                        ("unverified", [sys.executable, "-c", "import os; open(os.path.join(os.environ['JOB_OUT'],"
+                                        "'a'), 'w').write('1')"], jkw, True, 1),
+                        ("done", [sys.executable, "-c", "import os; open(os.path.join(os.environ['JOB_OUT'],"
+                                  "'a'), 'w').write('1')"], jkw, False, 1),
+                        ("failed, --keep-on-failure", [sys.executable, "job.py"],
+                         {k: v for k, v in kw_keep.items() if k in jkw}, False, 0)):
+                    downs, sleeps = [], []
+                    jid = "lap" + str(len(rows))
+                    with mock.patch.object(ws, "_shutdown_cluster", lambda: downs.append(len(sleeps))), \
+                            mock.patch.object(time, "sleep", lambda s: (sleeps.append(s), real_sleep(min(s, 0.01)))):
+                        ws.job_task(jid, code, cmd, None, **dict(kws, store_mod=_FakeStore(
+                            os.path.join(d, "blob_" + jid), corrupt=corrupt)))
+                    good = len(downs) == want and (not want or (grace and grace in sleeps[:downs[0]]))
+                    rows.append((label, len(downs), good))
+                ok(all(g for _, _, g in rows),
+                   f"RN14 with the laptop gone the job stops its own cluster after the grace period for every outcome "
+                   f"(and keeps it only for a failure under --keep-on-failure): {rows}")
+                calls = []
+
+                def gone():
+                    calls.append(1)
+                    raise RuntimeError("scheduler already shut down")
+                with mock.patch.dict(sys.modules, {"distributed": types.SimpleNamespace(get_client=gone)}):
+                    try:
+                        ws._shutdown_cluster()
+                        err = None
+                    except BaseException as e:  # noqa: BLE001
+                        err = e
+                ok(calls and err is None,
+                   f"RN14b the job's shutdown request on a cluster that is already stopping is harmless: {err!r}")
+            case("RN14", rn14)
+
+            def rn18():
+                class SlowStore(_FakeStore):
+                    """An upload that takes longer than the job's heartbeat interval; records the state file's
+                    heartbeat age seen during it."""
+                    ages = []
+
+                    def upload_retry(self, path, blob, account=None):
+                        t_end = time.time() + 2.0
+                        while time.time() < t_end:
+                            raw = ws._read_json(os.path.join(ws.JOBS, "slow", "state.json")) or {}
+                            self.ages.append(time.time() - float(raw.get("heartbeat") or 0))
+                            real_sleep(0.05)
+                        return super().upload_retry(path, blob, account)
+                fs = SlowStore(os.path.join(d, "blob_slow"))
+                st = ws.job_task("slow", None, [sys.executable, "-c", "import os; open(os.path.join(os.environ["
+                                 "'JOB_OUT'], 'a'), 'w').write('1')"], None, 1.0, heartbeat_s=0.2,
+                                 store={"prefix": "outputs/t/slow"}, store_mod=fs)
+                worst = max(SlowStore.ages or [99.0])
+                ok(st["state"] == "done" and worst < 1.0,
+                   f"RN18 the job keeps its heartbeat up while it uploads and verifies its outputs, so a long upload "
+                   f"never reads as 'lost' (worst heartbeat age {worst:.2f} s with a 0.2 s interval)")
+            case("RN18", rn18)
+
+            def rn19():
+                W, msg, out, exc = world(d, "r19", appear=(1, 8))
+                ok(W["clusters"].get(8) == "running" and ("delete", 8) not in W["events"] and clean(W),
+                   f"RN19 another launcher's cluster of the same name that appears while `run` starts is never "
+                   f"stopped by `run`'s cleanup: msg={msg} events={W['events'][-3:]}")
+            case("RN19", rn19)
+
+            def rn20():
+                W, msg, out, exc = world(d, "r20", threaded=True, job_sleep=0.3)
+                ok(msg is None and exc is None and W["stops"] == 1 and W["clusters"][100] == "stopped"
+                   and ("job_shutdown_noop", 100) in W["events"] and clean(W)
+                   and not (W["thread"] and W["thread"].is_alive()),
+                   f"RN20 with the job running concurrently in its own thread, `run` reads its final state within "
+                   f"the job's grace period and stops the cluster; the job's later stop is a no-op: msg={msg} "
+                   f"exc={exc!r} stops={W['stops']} events={[e for e in W['events'] if not isinstance(e, tuple) or e[0] != 'sleep'][-5:]}")
+            case("RN20", rn20)
+
+            def rn21():
+                W, msg, out, exc = world(d, "r21", after_submit="joins")
+                ok(msg is None and exc is None and set(W["polled"]) == {"tls://w1"} and ("delete", 100) in W["events"],
+                   f"RN21 with several workers, every poll goes to the job's own worker, not the first in the table "
+                   f"(a worker that joined later reads 'missing'): msg={msg} polled={W['polled']}")
+            case("RN21", rn21)
+
+            def rn22():
+                W, msg, out, exc = world(d, "r22", after_submit="leaves")
+                ok(msg is not None and "lost" in msg and ("delete", 100) in W["events"]
+                   and "tls://w0" not in W["polled"],
+                   f"RN22 the job's worker leaving the cluster reads as lost (non-zero, cluster stopped), never as "
+                   f"another worker's 'missing': msg={msg} polled={W['polled']}")
+            case("RN22", rn22)
+
+            def rn23():
+                import re
+                for label, err, other in (("RuntimeError", RuntimeError("allocation failed"), "vm1"),
+                                          ("Ctrl-C", KeyboardInterrupt(), "vm1-r23c-a1b2c3")):
+                    jid = "r23" + label[0].lower()
+                    W, msg, out, exc = world(d, jid, ctor_fail=err, ctor_side=(8, other))
+                    mine = W["names"].get(100) or ""
+                    ok(re.fullmatch(rf"vm1-{jid}-[0-9a-f]{{6}}", mine) and ("delete", 100) in W["events"]
+                       and ("delete", 8) not in W["events"] and W["clusters"][8] == "running" and clean(W),
+                       f"RN23 {label} in a constructor that returns no id: only the cluster with this run's unique "
+                       f"name is stopped, never a concurrent launcher's {other!r}: mine={mine!r} {W['events']}")
+            case("RN23", rn23)
+
+            def rn24():
+                import re
+                local = os.path.join(d, "local")
+                W, msg, out, exc = world(d, "r24", job_rc=3, extra=("--keep-on-failure",),
+                                         then=(["status", "vm1", "r24", "--out", local],
+                                               ["wait", "vm1", "r24", "--out", local, "--every", "1"],
+                                               ["down", "vm1", "r24", "--out", local]))
+                name = (W["ctor"][0] if W["ctor"] else {}).get("name") or ""
+                rec = ws._read_json(os.path.join(local, "vm1", "r24", "job.json")) or {}
+                ok(re.fullmatch(r"vm1-r24-[0-9a-f]{6}", name) and len(name) <= 63
+                   and rec.get("cluster") == name and rec.get("cluster_id") == 100,
+                   f"RN24 `run` names its cluster <name>-<job_id>-<6 hex> and records the name and id in job.json: "
+                   f"{name!r} {({k: rec.get(k) for k in ('cluster', 'cluster_id')})}")
+                attaches = [e[1] for e in W["events"] if isinstance(e, tuple) and e[0] == "attach"]
+                ok(attaches and set(attaches) == {name} and ("delete", 100) in W["events"]
+                   and W["clusters"][100] == "stopped",
+                   f"RN24b `status`, `wait` and `down <name> <job_id>` find the run's cluster through job.json (no "
+                   f"suffix typed); `down` stops it by id: attaches={attaches} then={W['then']}")
+                got = run_cluster_name("V" * 40, "J_" * 32)
+                ok(len(got) <= 63 and re.fullmatch(r"[a-z][a-z0-9-]*-[0-9a-f]{6}", got) is not None,
+                   f"RN24c the unique name stays within 63 lowercase characters for long names and ids: {got!r}")
+            case("RN24", rn24)
+
+            def rn25():
+                import fcntl
+                dest = os.path.join(d, "local", "vm1", "r25")
+                os.makedirs(dest, exist_ok=True)
+                held = open(os.path.join(dest, ".run.lock"), "w")
+                fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)     # another `run` of this job holds it
+                try:
+                    W, msg, out, exc = world(d, "r25")
+                finally:
+                    held.close()
+                ok(msg is not None and not W["ctor"] and "r25" in msg,
+                   f"RN25 a second `run` of the same job while the first holds its lock is refused before any "
+                   f"cluster is created (the listing check alone races): {msg} ctor={len(W['ctor'])}")
+                jid = "j" * 60
+                other = run_cluster_name("vm1", jid, "abcdef")
+                W, msg, out, exc = world(d, jid, pre={9: "running"}, pre_names={9: other})
+                ok(msg is not None and not W["ctor"] and W["clusters"][9] == "running",
+                   f"RN25b a job already running on a cluster whose long name was truncated is still found, and the "
+                   f"second launch refused: {other!r} -> {msg} ctor={len(W['ctor'])}")
+            case("RN25", rn25)
+
+            def rn22b():
+                W, msg, out, exc = world(d, "r22b", after_submit="empty")
+                ok(msg is not None and "lost" in msg and ("delete", 100) in W["events"],
+                   f"RN22b the job's only worker leaving (an empty worker table) reads as lost after three polls, "
+                   f"not as retries until the deadline: msg={msg}")
+            case("RN22b", rn22b)
+
+            def rn26():
+                import errno
+                rows = []
+                for label, cmd in (("ends", [sys.executable, "-c", "pass"]), ("cannot start", ["--no-such-program-x"])):
+                    downs, orig = [], ws._job_write
+
+                    def failing(d_, st_, orig=orig):
+                        if st_.get("state") in ("done", "failed", "timed_out") or st_.get("ended"):
+                            raise OSError(errno.ENOSPC, "No space left on device")
+                        return orig(d_, st_)
+                    jid = "wf" + str(len(rows))
+                    with mock.patch.object(ws, "_job_write", failing), \
+                            mock.patch.object(ws, "_shutdown_cluster", lambda: downs.append(1)):
+                        try:
+                            ws.job_task(jid, None, cmd, None, 1.0, shutdown_always=True, shutdown_grace_s=0)
+                            raised = None
+                        except OSError as e:
+                            raised = e
+                    rows.append((label, len(downs), type(raised).__name__ if raised else None))
+                ok(all(n == 1 for _, n, _ in rows),
+                   f"RN26 a final-state write that fails (disk full) still stops the cluster under shutdown_always: "
+                   f"{rows}")
+            case("RN26", rn26)
+
+            def rn27():
+                import errno
+                downs, orig = [], ws._job_write
+                tok = ws.job_queue("init1")
+
+                def failing(d_, st_):
+                    if st_.get("state") == "running":       # the first write after the claim
+                        raise OSError(errno.ENOSPC, "No space left on device")
+                    return orig(d_, st_)
+                with mock.patch.object(ws, "_job_write", failing), \
+                        mock.patch.object(ws, "_shutdown_cluster", lambda: downs.append(1)):
+                    try:
+                        ws.job_task("init1", None, ["true"], None, 1.0, token=tok, shutdown_always=True,
+                                    shutdown_grace_s=0)
+                        raised = None
+                    except OSError as e:
+                        raised = e
+                    refused = ws.job_task("init1", None, ["true"], None, 1.0, token="not-mine", shutdown_always=True)
+                ok(len(downs) == 1 and refused.get("state") == "refused",
+                   f"RN27 a claimed job whose initial running-state write fails (disk full) still stops its cluster "
+                   f"under shutdown_always; a refused submission stops nothing: stops={len(downs)} "
+                   f"raised={type(raised).__name__ if raised else None} refused={refused.get('state')}")
+            case("RN27", rn27)
+
+            def rn28():
+                import budget
+                for label, scope, verdict in (("over budget", "f6", (False, "spent 96.00 + cap 5.00 > 100.00")),
+                                              ("no scope", None, (True, "ok"))):
+                    seen = []
+                    lbo = lambda s_, c, name=None, **k: (seen.append((s_, c, name)), verdict)[1]  # noqa: E731
+                    with mock.patch.object(budget, "launch_budget_ok", lbo), \
+                            mock.patch.object(budget, "scope_for_name", lambda n, *a: scope):
+                        W, msg, out, exc = world(d, f"r28{label[0]}", gate=real_gate)
+                    uniq = f"vm1-r28{label[0]}-"
+                    named = [(s_, c, len(n) == len(uniq) + 6 and n.startswith(uniq)) for s_, c, n in seen]
+                    ok(msg and ("budget" in msg or "scope" in msg) and not W["ctor"] and W["list_calls"] == 0
+                       and "submit" not in W["events"] and named == ([("f6", 5.0, True)] if scope else []),
+                       f"RN28 {label}: `run` refuses before listing or creating any cluster: {msg} {seen}")
+            case("RN28", rn28)
+
+            def rn29():
+                # RN29 (owner decision, 2026-11-17: no hard dollar ceilings). Each reading is of the job's own
+                # cluster; past the cap and past 1.5 x it the job runs on, each crossing alerted once, every reading
+                # in cap_projection.json; the cluster is stopped when the job ends, as without a cap.
+                # The job writes 'b' only once a reading has seen 'a' (a file the meter writes, waited for up to
+                # 30 s), not after a fixed 0.6 s that a slow first poll could overrun: one reading is always over the
+                # cap and under 1.5 x it before the reading past 1.5 x it.
+                prog = ("import os, time\nout = os.environ['JOB_OUT']\n"
+                        "open(os.path.join(out, 'progress.txt'), 'w').write('a')\n"
+                        "go, t0 = os.path.join(os.path.dirname(out), 'metered_a'), time.time()\n"
+                        "while not os.path.exists(go) and time.time() - t0 < 30:\n    time.sleep(0.01)\n"
+                        "open(os.path.join(out, 'progress.txt'), 'w').write('b')\ntime.sleep(1)\n")
+                seen = []
+
+                def meter(cid, jid="r29a"):     # past 1.5 x the cap once the job has written 'b' on its VM
+                    seen.append(cid)
+                    if cid != 100:
+                        return 1000.0
+                    p = os.path.join(ws.JOBS, jid, "out", "progress.txt")
+                    now = open(p).read() if os.path.exists(p) else ""
+                    if now == "a":
+                        open(os.path.join(ws.JOBS, jid, "metered_a"), "w").close()
+                    return 8.0 if now == "b" else 6.0
+                ALERTS.clear()
+                W, msg, out, exc = world(d, "r29a", gate=lambda a, name, meter=False, m=meter: m, threaded=True,
+                                         extra=("--keep-on-failure",), job_src=prog)
+                proj = _json_or({}, os.path.join(d, "local", "vm1", "r29a", "cap_projection.json"))
+                kinds = [x["kind"] for x in ALERTS if x.get("job_id") == "r29a"]
+                ok(msg is None and exc is None and ("delete", 100) in W["events"] and set(seen) == {100}
+                   and kinds == ["over_cap", "far_over_cap"] and proj.get("level") == "far_over_cap"
+                   and all({"job_id", "cluster_id", "usd", "cap_usd", "usd_per_hour", "projected_usd_at_deadline"}
+                           <= set(x) for x in ALERTS)
+                   and "WARNING" in out and clean(W),
+                   f"RN29 past the cap and past 1.5 x it the job runs on and finishes; each crossing is alerted once "
+                   f"and recorded: {msg} {exc!r} alerts={kinds} proj={proj}")
+                vals = [RuntimeError("api")] * 3
+
+                def bad(cid):
+                    v = vals.pop(0) if vals else 1.0
+                    if isinstance(v, Exception):
+                        raise v
+                    return v
+                ALERTS.clear()
+                W, msg, out, exc = world(d, "r29b", gate=lambda a, name, meter=False, m=bad: m, threaded=True,
+                                         job_sleep=2)
+                ok(msg is None and [x["kind"] for x in ALERTS] == ["cost_unreadable"] and clean(W),
+                   f"RN29b three failed cost readings in a row are alerted, and the job runs on to its end: {msg} "
+                   f"{ALERTS}")
+                # RN29d (2026-11-20): the laptop lost DNS and v2's meter stopped a running fit after three
+                # ClientConnectorDNSError readings ("fail closed"). The same error is now a warning: the job runs on.
+                class ClientConnectorDNSError(OSError):
+                    pass
+                dns = [ClientConnectorDNSError("Cannot connect to host cloud.coiled.io:443 ssl:default "
+                                               "[nodename nor servname provided, or not known]")] * 6
+
+                def dns_meter(cid):
+                    if dns:
+                        raise dns.pop(0)
+                    return 1.0
+                ALERTS.clear()
+                W, msg, out, exc = world(d, "r29d", gate=lambda a, name, meter=False, m=dns_meter: m, threaded=True,
+                                         job_sleep=2)
+                ok(msg is None and exc is None and [x["kind"] for x in ALERTS] == ["cost_unreadable"]
+                   and "ClientConnectorDNSError" in ALERTS[0].get("error", "") and "fail closed" not in out
+                   and clean(W),
+                   f"RN29d `run`: a cost that cannot be read because DNS fails (ClientConnectorDNSError) is alerted "
+                   f"once, and the job runs on to its end: {msg} {exc!r} {ALERTS}")
+                ALERTS.clear()
+                W, msg, out, exc = world(d, "r29c", job_rc=3, gate=lambda a, name, meter=False, m=lambda c: 9.0: m,
+                                         extra=("--keep-on-failure",))
+                ok(msg and "rc=3" in msg and W["stops"] == 0 and "far_over_cap" in [x["kind"] for x in ALERTS],
+                   f"RN29c a failed job past its cap is alerted; --keep-on-failure keeps its cluster as without a cap: "
+                   f"{msg} stops={W['stops']}")
+            case("RN29", rn29)
+
+            def rn29f():
+                res = []
+
+                def unreadable(cid):
+                    raise RuntimeError("api")
+                for meter in (unreadable, lambda cid: 99.0):
+                    a = types.SimpleNamespace(name="vmx", job_id="j29f", cap_usd=5.0, every=60, max_hours=0.0)
+                    with _patch_vj({"_client": lambda *x, **k: (_ for _ in ()).throw(
+                            RuntimeError("drop")), "_gone": lambda n, c: False, "_job_worker": lambda dest: "w"}), \
+                            mock.patch.object(time, "sleep", lambda s: None), contextlib.redirect_stdout(io.StringIO()):
+                        try:
+                            res.append(_poll(a, d, gone_ok=True, deadline=time.time() - 1, cid=100, meter=meter))
+                        except SystemExit as e:
+                            res.append("deadline" if "still not finished" in str(e.code) else str(e.code))
+                ok(res == ["deadline", "deadline"],
+                   f"RN29f the polling deadline (the job's --max-hours plus 1 h) is the stop, whatever the cost: {res}")
+            case("RN29f", rn29f)
+
+            def rn34():
+                # RN34: `run` had no SIGTERM handler, so a SIGTERM skipped the finally that stops the cluster by id
+                # (SIGINT ran it). A SIGTERM now ends `run` as Ctrl-C does: the cluster is stopped by id.
+                import signal as _sig
+
+                class _Default(BaseException):
+                    pass
+
+                def default(signum, frame):        # stands in for the default action (the process would just die)
+                    raise _Default("SIGTERM reached the default handler")
+                prev = _sig.signal(_sig.SIGTERM, default)
+                try:
+                    W, msg, out, exc = world(d, "r34", term_at=2)
+                    after = _sig.getsignal(_sig.SIGTERM)
+                finally:
+                    _sig.signal(_sig.SIGTERM, prev)
+                ok(isinstance(exc, KeyboardInterrupt) and "SIGTERM" in str(exc) and ("delete", 100) in W["events"]
+                   and W["stops"] == 1 and after is default and clean(W),
+                   f"RN34 SIGTERM while polling stops the cluster by id, and the previous handler is restored: "
+                   f"exc={exc!r} events={W['events'][-3:]}")
+            case("RN34", rn34)
+
+            def rn34b():
+                # RN34b (Codex re-review of #265, P1): a SIGTERM that arrives once `run` is stopping the cluster is
+                # ignored, so the stop by id completes.
+                import signal as _sig
+                got = None
+                try:
+                    with _sigterm_as_interrupt():
+                        _CLEANING[0] = True
+                        os.kill(os.getpid(), _sig.SIGTERM)
+                        time.sleep(0.2)
+                        got = "survived"
+                except BaseException as e:  # noqa: BLE001
+                    got = repr(e)
+                finally:
+                    _CLEANING[0] = False
+                ok(got == "survived", f"RN34b a SIGTERM during the cleanup does not interrupt the stop: {got}")
+            case("RN34b", rn34b)
+
+            def rn32l():
+                # RN32l (Codex re-review of #265, P1): `wait --cap-usd` stops the cluster only on a confirmed end of
+                # the job ('done', 'failed', ...), never on 'missing' (one unreadable state file) or 'lost' (a stale
+                # heartbeat), which do not show the process exited.
+                res = {}
+                for state in ("missing", "lost", "done", "failed", "failed_pid"):
+                    stops = []
+                    a = types.SimpleNamespace(name="vmx", job_id="j32l", cap_usd=5.0, every=60, max_hours=1.0)
+                    with _patch_vj({
+                            "_job_record": lambda dest: {"cluster": "vmx-c", "cluster_id": 7},
+                            "_wait_gate": lambda *x, **k: (lambda cid: 1.0),
+                            "_poll": lambda *x, s_=state, **k: {"state": (
+                                {"job_id": "j32l", "state": "failed", "pid": 4242} if s_ == "failed_pid" else
+                                {"job_id": "j32l", "state": s_, **({"rc": 3} if s_ == "failed" else {})})},
+                            "_stop_by_id": lambda name, cid, why: stops.append(cid)}), \
+                            mock.patch.object(ws, "attach_existing", lambda *x: object()), \
+                            contextlib.redirect_stdout(io.StringIO()):
+                        _wait_capped(a, d)
+                    res[state] = stops
+                ok(res == {"missing": [], "lost": [], "done": [7], "failed": [7], "failed_pid": []},
+                   f"RN32l `wait --cap-usd` stops the cluster only once the job has ended for certain; a 'failed' record "
+                   f"with a pid and no return code (Codex round 3 on #265) is not an end: {res}")
+            case("RN32l", rn32l)
+
+
+            def rn30():
+                import budget
+                a = types.SimpleNamespace(cap_usd=5.0, budget_scope="f6")
+                with mock.patch.object(budget, "launch_budget_ok", lambda s_, c, name=None, **k: (True, "ok")), \
+                        mock.patch.object(budget, "job_meter", lambda s_: ("meter", s_)):
+                    got = real_gate(a, "lw-smoke-x", meter=True)
+                ok(got == ("meter", "f6"), f"RN30 a covered launch gets the scope's meter: {got}")
+                asked = []
+                with mock.patch.object(budget, "launch_budget_ok",
+                                       lambda s_, c, name=None, **k: (asked.append((c, k.get("warn_over"))),
+                                                                       (True, "ok"))[1]), \
+                        contextlib.redirect_stdout(io.StringIO()):
+                    real_gate(a, "lw-smoke-x")
+                ok(asked == [(5.0, True)],
+                   f"RN30e the launch check asks for the cap with warn_over (owner decision, 2026-11-17: no launch is "
+                   f"refused for dollars): {asked}")
+                # RN30f (Codex round 4 on #265): the launch check accepted, then building the meter fails because
+                # DNS fails: the launch goes on, alerted, with a meter rebuilt at each reading.
+                class ClientConnectorDNSError(OSError):
+                    pass
+                builds = []
+
+                def flaky_meter(s_):
+                    builds.append(s_)
+                    if len(builds) == 1:
+                        raise ClientConnectorDNSError("Cannot connect to host [nodename nor servname provided]")
+                    return lambda cid: 2.0
+                ALERTS.clear()
+                with mock.patch.object(budget, "launch_budget_ok", lambda s_, c, name=None, **k: (True, "ok")), \
+                        mock.patch.object(budget, "job_meter", flaky_meter), contextlib.redirect_stdout(io.StringIO()):
+                    try:
+                        got = real_gate(a, "lw-smoke-x", meter=True)
+                        got_usd = got(100) if callable(got) else None
+                    except BaseException as e:  # noqa: BLE001
+                        got, got_usd = e, None
+                ok(got_usd == 2.0 and [x["kind"] for x in ALERTS] == ["cost_unreadable"],
+                   f"RN30f a meter that cannot be built after the launch check accepted (DNS) never refuses the "
+                   f"launch: it is alerted and rebuilt at each reading: {got!r} {got_usd} {ALERTS}")
+                made = []
+                b = types.SimpleNamespace(name="vm3", cpu=4, memory="16 GiB", idle_timeout="20 minutes", workers=1,
+                                          cap_usd=5.0, budget_scope="f6")
+                calls = []
+                lbo = lambda s_, c, name=None, reserve=True, **k_: (calls.append(reserve), (False, "over"))[1]  # noqa: E731
+                for states in ([], ["running"]):
+                    calls.clear(), made.clear()
+                    with mock.patch.object(budget, "launch_budget_ok", lbo), \
+                            mock.patch.dict(sys.modules, {"coiled": types.SimpleNamespace(
+                                Cluster=lambda **k: made.append(k))}), \
+                            _patch_vj({"_budget_gate": real_gate}), \
+                            mock.patch.object(CO, "cluster_states", lambda n, s_=states: s_), \
+                            contextlib.redirect_stdout(io.StringIO()):
+                        try:
+                            cmd_up(b)
+                            msg = None
+                        except SystemExit as e:
+                            msg = str(e)
+                    if not states:
+                        ok(msg and "over" in msg and not made and calls == [True],
+                           f"RN30b `up` is refused before the constructor: {msg}")
+                    else:
+                        ok(msg is None and not made and calls == [],
+                           f"RN30d an `up` that finds the cluster already up reserves nothing: {msg} {calls}")
+                errs = []
+                with mock.patch("argparse.ArgumentParser.error", lambda self, m: (errs.append(m), (_ for _ in ()).throw(
+                        SystemExit(2)))), contextlib.redirect_stderr(io.StringIO()):
+                    for argv in (["run", "v", "j", "--store", "p", "--", "true"], ["up", "v"]):
+                        try:
+                            vj_main(argv)
+                        except SystemExit:
+                            pass
+                ok(len(errs) == 2 and all("--cap-usd" in e for e in errs), f"RN30c run and up require --cap-usd: {errs}")
+            case("RN30", rn30)
+
+            def rn31():
+                import budget
+                reached = []
+                a = types.SimpleNamespace(name="lw-smoke-v", job_id="j31", command=["true"], cap_usd=5.0,
+                                          budget_scope=None, tree=None, dir=None, anthropic_key=False)
+                with mock.patch.object(budget, "launch_budget_ok",
+                                       lambda s_, c, name=None, reserve=True, **k_: (reached.append(reserve), (False, "over"))[1]), \
+                        mock.patch.object(budget, "scope_for_name", lambda n, *x: "f6"), \
+                        _patch_vj({"_budget_gate": real_gate, "_live_vm_types_ok": lambda n: None,
+                                                    "_client": lambda *x, **k: (_ for _ in ()).throw(RuntimeError("client"))}):
+                    try:
+                        cmd_start(a)
+                        msg = None
+                    except SystemExit as e:
+                        msg = str(e)
+                    except RuntimeError as e:
+                        msg = f"reached {e}"
+                    try:
+                        cmd_start(a, cluster=object())
+                        msg2 = None
+                    except BaseException as e:  # noqa: BLE001
+                        msg2 = str(e)
+                ok(msg and "over" in msg and reached == [False],
+                   f"RN31 interactive `start` is refused when the budget no longer covers its cap: {msg} {reached}")
+                ok(msg2 == "client" and reached == [False],
+                   f"RN31b under `run` (its own cluster object) start does not check twice: {msg2}")
+                errs = []
+                with mock.patch("argparse.ArgumentParser.error", lambda self, m: (errs.append(m), (_ for _ in ()).throw(
+                        SystemExit(2)))), contextlib.redirect_stderr(io.StringIO()):
+                    try:
+                        vj_main(["start", "v", "j", "--", "true"])
+                    except SystemExit:
+                        pass
+                ok(errs and "--cap-usd" in errs[0], f"RN31c start requires --cap-usd: {errs}")
+            case("RN31", rn31)
+
+            def rn32():
+                # RN32 (2026-11-13): a session restart killed the `run` metering cluster 2375765, which ran on with no
+                # cap. `wait --cap-usd` re-attaches it: the recorded id, metered as `run` does, stopped by id.
+                import budget
+
+                def rewait(label, readings, cap="5", argv_cap=True, lbo_ok=True, meter_fails=False, interrupt=1,
+                           build_err=None):
+                    jid, seen, lbo_calls, built = f"r32{label}", [], [], []
+
+                    def meter(cid):
+                        seen.append(cid)
+                        v = readings[min(len(seen), len(readings)) - 1]
+                        if isinstance(v, Exception):
+                            raise v
+                        return v
+                    def reattach(s_, c, name, cid, clusters_file, warn_over=False):     # budget.reattach_budget_ok
+                        spent = meter(cid)
+                        lbo_calls.append((s_, round(c, 2), cid, os.path.basename(clusters_file), warn_over))
+                        if spent >= c and warn_over:
+                            return True, f"WARNING: cluster {cid} has already spent ${spent:.2f}"
+                        if spent >= c:
+                            return False, f"cluster {cid} has already spent ${spent:.2f}"
+                        return lbo_ok, "f6: ok" if lbo_ok else "f6: outside the signed prefixes"
+
+                    def lifetime(s_):
+                        built.append(s_)           # meter_fails: True always fails, an int n fails the first n builds
+                        if meter_fails is True or (meter_fails and len(built) <= meter_fails):
+                            raise build_err or RuntimeError("details unavailable")
+                        return meter
+                    wait = ["wait", "vm1", jid, "--out", os.path.join(d, "local"), "--every", "60"]
+                    if argv_cap:
+                        wait += ["--cap-usd", cap, "--budget-scope", "f6"]
+                    with mock.patch.object(budget, "lifetime_meter", lifetime, create=True), \
+                            mock.patch.object(budget, "reattach_budget_ok", reattach, create=True), \
+                            mock.patch.object(budget, "job_meter", lambda s_: (_ for _ in ()).throw(AssertionError)), \
+                            mock.patch.object(budget, "launch_budget_ok", lambda *x, **k: (False, "not this check")):
+                        W, msg, out, exc = world(d, jid, interrupt_at=interrupt, extra=("--keep-on-failure",),
+                                                 then=[wait])
+                    ev = W["events"]
+                    return W, ev, W["then"][0], seen, lbo_calls, isinstance(exc, KeyboardInterrupt)
+
+                RC = ("f6", 5.0, 100, "reattach_clusters.json", True)
+                ALERTS.clear()
+                W, ev, res, seen, lbo_calls, killed = rewait("a", [1.0, 8.0])
+                ok(killed and res is None and ("attach_id", 100) in ev and ("delete", 100) in ev and W["stops"] == 1
+                   and set(seen) == {100} and lbo_calls == [RC] and "far_over_cap" in [x["kind"] for x in ALERTS]
+                   and clean(W),
+                   f"RN32a after the launcher died, `wait --cap-usd` meters the recorded cluster id (warn_over), "
+                   f"alerts past the cap without stopping, and stops the cluster by id when the job ends: {res!r} "
+                   f"{lbo_calls} {ev}")
+                W, ev, res, seen, lbo_calls, killed = rewait("b", [1.0])
+                ok(killed and res is None and ("attach_id", 100) in ev and ("delete", 100) in ev and W["stops"] == 1
+                   and len(seen) >= 2 and clean(W),
+                   f"RN32b a job that ends under a re-attached cap has its cluster stopped by id: {res!r} {ev}")
+                W, ev, res, seen, lbo_calls, killed = rewait("c", [1.0], argv_cap=False)
+                ok(killed and isinstance(res, SystemExit) and "rc.attach" in str(res.code) and not seen
+                   and not lbo_calls and ("attach_id", 100) not in ev and W["stops"] == 0
+                   and W["clusters"][100] == "running",
+                   f"RN32c without --cap-usd `wait` is unchanged (its attach, no meter, no budget, no stop): {res!r}")
+                W, ev, res, seen, lbo_calls, killed = rewait("d", [3.0], cap="2")
+                ok(res is None and ("attach_id", 100) in ev and ("delete", 100) in ev and W["stops"] == 1,
+                   f"RN32d a cluster already past the cap is accepted (warned) and metered, never refused for "
+                   f"dollars: {res!r}")
+                W, ev, res, seen, lbo_calls, killed = rewait("e", [1.0], lbo_ok=False)
+                ok(isinstance(res, SystemExit) and "budget" in str(res.code) and ("attach_id", 100) not in ev
+                   and W["stops"] == 0, f"RN32e a refusal that is not about dollars still refuses: {res!r}")
+                ALERTS.clear()
+                W, ev, res, seen, lbo_calls, killed = rewait("f", [RuntimeError("api")])
+                ok(isinstance(res, SystemExit) and "left as it was" in str(res.code) and ("attach_id", 100) not in ev
+                   and W["stops"] == 0 and [x["kind"] for x in ALERTS] == ["cost_unreadable"],
+                   f"RN32f a budget that cannot be read before it accepts the cap is alerted, and the cluster is "
+                   f"left as it was (no ownership taken, Codex on #265): {res!r} {ALERTS}")
+                for label, readings, mf in (("h", [1.0], True),
+                                            ("g", [1.0, RuntimeError("api")], False), ("j", [1.0], 3)):
+                    ALERTS.clear()
+                    W, ev, res, seen, lbo_calls, killed = rewait(label, readings, meter_fails=mf)
+                    ok(res is None and ("attach_id", 100) in ev and ("delete", 100) in ev and W["stops"] == 1
+                       and (label == "g" or "cost_unreadable" in [x["kind"] for x in ALERTS]),
+                       f"RN32{label} a cost or meter that cannot be read is alerted, never a stop; the cluster is "
+                       f"stopped by id when the job ends: {res!r} {ALERTS} {ev[-4:]}")
+                # RN32m (2026-11-20): `wait --cap-usd` after the gate accepted, with DNS failing for every meter build
+                # and reading (ClientConnectorDNSError): alerted, never a stop; the cluster is stopped only at the end.
+                class ClientConnectorDNSError(OSError):
+                    pass
+                DNS = ClientConnectorDNSError("Cannot connect to host cloud.coiled.io:443 ssl:default "
+                                              "[nodename nor servname provided, or not known]")
+                ALERTS.clear()
+                W, ev, res, seen, lbo_calls, killed = rewait("m", [1.0, DNS], meter_fails=True, build_err=DNS)
+                ok(res is None and ("attach_id", 100) in ev and ("delete", 100) in ev and W["stops"] == 1
+                   and "cost_unreadable" in [x["kind"] for x in ALERTS]
+                   and not any("fail closed" in str(x) for x in ALERTS),
+                   f"RN32m `wait --cap-usd`: a cost that cannot be read because DNS fails is alerted, never a stop; "
+                   f"the cluster is stopped by id only when the job ends: {res!r} {ALERTS} {ev[-4:]}")
+                W, ev, res, seen, lbo_calls, killed = rewait("k", [1.0], interrupt=(1, 2))
+                ok(killed and isinstance(res, KeyboardInterrupt) and ("attach_id", 100) in ev and W["stops"] == 0
+                   and W["clusters"][100] == "running",
+                   f"RN32k a `wait --cap-usd` monitor that is interrupted while the job runs leaves the cluster "
+                   f"running (it never stops a detached job): {res!r} stops={W['stops']}")
+                W, ev, res, seen, lbo_calls, killed = rewait("i", [2.0, 8.0, 8.0], meter_fails=1)
+                ok(res is None and ("delete", 100) in ev and W["stops"] == 1 and lbo_calls == [("f6", 5.0, 100,
+                   "reattach_clusters.json", True)],
+                   f"RN32i once the cap is accepted the gate is not re-run (Codex re-review of #232): {res!r} "
+                   f"{lbo_calls}")
+            case("RN32", rn32)
+        finally:
+            ws.JOBS = old
+
+    def rn10():
+        class FakeCluster:
+            def __init__(self, **kw):
+                pass
+
+            def get_client(self):
+                return types.SimpleNamespace(wait_for_workers=lambda n, timeout=None: None)
+        a = types.SimpleNamespace(name="vm2", cpu=4, memory="16 GiB", idle_timeout="20 minutes", workers=1)
+        out = io.StringIO()
+        with mock.patch.dict(sys.modules, {"coiled": types.SimpleNamespace(Cluster=FakeCluster)}), \
+                mock.patch.object(CO, "cluster_states", lambda n: []), contextlib.redirect_stdout(out):
+            cmd_up(a)
+        text = out.getvalue()
+        ok("WARNING" in text and "20 minutes" in text and "`start`" in text and "`run`" in text,
+           f"RN10 `up` warns that the cluster stops after its idle timeout unless `start` follows: {text!r}")
+    case("RN10", rn10)
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
