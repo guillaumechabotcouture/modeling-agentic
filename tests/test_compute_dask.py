@@ -1322,95 +1322,95 @@ def _self_test_isolated_dask(ok) -> None:
         open(os.path.join(d, "models", "helper.py"), "w").write("def scale():\n    return float(open('data/scale.txt').read())\n")
         open(os.path.join(d, "models", "fn.py"), "w").write(
             "from helper import scale\ndef f(p):\n    if p.get('boom'):\n        raise ValueError('bad draw')\n    return {'y': p['x'] * scale()}\n")
-    # C33: a scheduler and worker started outside this repo cannot import
-    # this module (as on Coiled); the task must still run.
-    try:
-        import distributed  # noqa: F401
-    except ImportError:
-        pass
-    else:
-        iso = tempfile.mkdtemp(prefix="ma_iso_")
-        sf = os.path.join(iso, "sched.json")
-        envi = {k: v for k, v in os.environ.items() if k not in ("PYTHONPATH",)}
-        dask_cli = os.path.join(os.path.dirname(sys.executable), "dask")
-        procs_ = [_sp.Popen([dask_cli, "scheduler", "--scheduler-file", sf,
-                             "--host", "127.0.0.1", "--port", "0", "--no-dashboard"], cwd=iso, env=envi,
-                            stdout=_sp.DEVNULL, stderr=open(os.path.join(iso, "sched.err"), "w"))]
+        # C33: a scheduler and worker started outside this repo cannot import
+        # this module (as on Coiled); the task must still run.
         try:
-            end = time.time() + 60
-            while not os.path.exists(sf) and time.time() < end:
-                time.sleep(0.2)
-            time.sleep(1.0)       # the file is written just before the scheduler listens
-            procs_.append(_sp.Popen([dask_cli, "worker", "--scheduler-file", sf,
-                                     "--nthreads", "1", "--no-dashboard"], cwd=iso, env=envi,
-                                    stdout=_sp.DEVNULL, stderr=_sp.DEVNULL))
-            os.environ["MA_COMPUTE_SCHEDULER"] = json.load(open(sf))["address"]
-            from distributed import Client as _C
-            with _C(os.environ["MA_COMPUTE_SCHEDULER"]) as cc:
-                cc.wait_for_workers(1, timeout=60)
-            with tempfile.TemporaryDirectory() as _iso_td:
-                iso_scripts = os.path.join(_self_test_iso_repo(_iso_td), "scripts")
-                # Imported as a module, as propagate_uncertainty.py does (run as
-                # __main__, dask would ship the functions by value and hide this).
-                code = ("import json, sys; sys.path.insert(0, %r); import compute; "
-                        "rows, s = compute.map_fn(%r, 'models/fn.py::f', [{'x': 0}, {'x': 1}, {'x': 2}], ledger=False); "
-                        "print(json.dumps([r.get('result') or r.get('error') for r in rows]))") % (iso_scripts, d)
-                code_tag = ("import json, os, sys; sys.path.insert(0, %r); import compute; "
-                            "from distributed import Client; "
-                            "c = Client(os.environ['MA_COMPUTE_SCHEDULER']); compute.register_compute_tags(c, exclude=[]); "
-                            "os.environ.update(MA_COMPUTE_RESOURCE='compute', MA_COMPUTE_TARGET_WORKERS='1'); "
-                            "rows, s = compute.map_fn(%r, 'models/fn.py::f', [{'x': 0}, {'x': 1}], ledger=False); "
+            import distributed  # noqa: F401
+        except ImportError:
+            pass
+        else:
+            iso = tempfile.mkdtemp(prefix="ma_iso_")
+            sf = os.path.join(iso, "sched.json")
+            envi = {k: v for k, v in os.environ.items() if k not in ("PYTHONPATH",)}
+            dask_cli = os.path.join(os.path.dirname(sys.executable), "dask")
+            procs_ = [_sp.Popen([dask_cli, "scheduler", "--scheduler-file", sf,
+                                 "--host", "127.0.0.1", "--port", "0", "--no-dashboard"], cwd=iso, env=envi,
+                                stdout=_sp.DEVNULL, stderr=open(os.path.join(iso, "sched.err"), "w"))]
+            try:
+                end = time.time() + 60
+                while not os.path.exists(sf) and time.time() < end:
+                    time.sleep(0.2)
+                time.sleep(1.0)       # the file is written just before the scheduler listens
+                procs_.append(_sp.Popen([dask_cli, "worker", "--scheduler-file", sf,
+                                         "--nthreads", "1", "--no-dashboard"], cwd=iso, env=envi,
+                                        stdout=_sp.DEVNULL, stderr=_sp.DEVNULL))
+                os.environ["MA_COMPUTE_SCHEDULER"] = json.load(open(sf))["address"]
+                from distributed import Client as _C
+                with _C(os.environ["MA_COMPUTE_SCHEDULER"]) as cc:
+                    cc.wait_for_workers(1, timeout=60)
+                with tempfile.TemporaryDirectory() as _iso_td:
+                    iso_scripts = os.path.join(_self_test_iso_repo(_iso_td), "scripts")
+                    # Imported as a module, as propagate_uncertainty.py does (run as
+                    # __main__, dask would ship the functions by value and hide this).
+                    code = ("import json, sys; sys.path.insert(0, %r); import compute; "
+                            "rows, s = compute.map_fn(%r, 'models/fn.py::f', [{'x': 0}, {'x': 1}, {'x': 2}], ledger=False); "
                             "print(json.dumps([r.get('result') or r.get('error') for r in rows]))") % (iso_scripts, d)
-                # C33b first, on a worker that has never received this module
-                r2 = _sp.run([sys.executable, "-c", code_tag], capture_output=True, text=True, timeout=300,
-                             env=dict(os.environ, PYTHONPATH=""))
-                got2 = r2.stdout.strip().splitlines()[-1] if r2.stdout.strip() else r2.stderr[-400:]
-                ok(got2 == json.dumps([{"y": 0.0}, {"y": 3.0}]),
-                   f"C33b the compute-tag plugin works on a cluster that cannot import this module: {got2}")
-                r = _sp.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=300,
-                            env=dict(os.environ, PYTHONPATH=""))
-                got = r.stdout.strip().splitlines()[-1] if r.stdout.strip() else r.stderr[-500:]
-                ok(got == json.dumps([{"y": 0.0}, {"y": 3.0}, {"y": 6.0}]),
-                   f"C33 runs on a cluster that cannot import this module: {got}")
-                # P35-D: on the dask path a pool broken inside a chunk heals there, and
-                # a repeated model error stops the whole call.
-                open(os.path.join(d, "models", "p35d.py"), "w").write(
-                    "import os, time\n"
-                    "def f(p):\n"
-                    "    if p.get('crash') and os.environ.get('MA_COMPUTE_SELFTEST_ONCE') is None:\n"
-                    "        flag = os.path.join(p['dir'], str(p['x']))\n"
-                    "        if not os.path.exists(flag):\n"
-                    "            open(flag, 'w').close(); os._exit(9)\n"
-                    "    time.sleep(0.2)\n"
-                    "    return {'x': p['x']}\n"
-                    "def raises(p):\n    raise ValueError('diverged')\n")
-                flags = tempfile.mkdtemp(prefix="ma_p35d_")
-                code_d = ("import json, sys; sys.path.insert(0, %r); import compute; "
-                          "ins = [{'x': k, 'dir': %r, 'crash': k in (2, 9)} for k in range(12)]; "
-                          "rows, s = compute.map_fn(%r, 'models/p35d.py::f', ins, ledger=False, max_workers=1); "
-                          "r2, s2 = compute.map_fn(%r, 'models/p35d.py::raises', [{}] * 40, ledger=False, max_workers=1); "
-                          "print(json.dumps([s['n_failed'], [r['result']['x'] for r in rows if r['ok']], "
-                          "s2['stopped'] or '', s2['failed_by_kind']]))") % (iso_scripts, flags, d, d)
-                r3 = _sp.run([sys.executable, "-c", code_d], capture_output=True, text=True, timeout=300,
-                             env=dict(os.environ, PYTHONPATH="", MA_COMPUTE_PROCS_PER_WORKER="2"))
-                try:
-                    nf, xs, stop2, kinds2 = json.loads(r3.stdout.strip().splitlines()[-1])
-                except (ValueError, IndexError):
-                    nf, xs, stop2, kinds2 = None, None, "", {}
-                ok(nf == 0 and xs == list(range(12)),
-                   f"P35-D1 a process death inside a dask chunk is healed in the chunk: {r3.stdout[-300:]} {r3.stderr[-300:]}")
-                ok("same model error" in stop2 and kinds2.get("stopped", 0) > 0,
-                   f"P35-D2 a repeated model error stops a dask call: {stop2} {kinds2}")
+                    code_tag = ("import json, os, sys; sys.path.insert(0, %r); import compute; "
+                                "from distributed import Client; "
+                                "c = Client(os.environ['MA_COMPUTE_SCHEDULER']); compute.register_compute_tags(c, exclude=[]); "
+                                "os.environ.update(MA_COMPUTE_RESOURCE='compute', MA_COMPUTE_TARGET_WORKERS='1'); "
+                                "rows, s = compute.map_fn(%r, 'models/fn.py::f', [{'x': 0}, {'x': 1}], ledger=False); "
+                                "print(json.dumps([r.get('result') or r.get('error') for r in rows]))") % (iso_scripts, d)
+                    # C33b first, on a worker that has never received this module
+                    r2 = _sp.run([sys.executable, "-c", code_tag], capture_output=True, text=True, timeout=300,
+                                 env=dict(os.environ, PYTHONPATH=""))
+                    got2 = r2.stdout.strip().splitlines()[-1] if r2.stdout.strip() else r2.stderr[-400:]
+                    ok(got2 == json.dumps([{"y": 0.0}, {"y": 3.0}]),
+                       f"C33b the compute-tag plugin works on a cluster that cannot import this module: {got2}")
+                    r = _sp.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=300,
+                                env=dict(os.environ, PYTHONPATH=""))
+                    got = r.stdout.strip().splitlines()[-1] if r.stdout.strip() else r.stderr[-500:]
+                    ok(got == json.dumps([{"y": 0.0}, {"y": 3.0}, {"y": 6.0}]),
+                       f"C33 runs on a cluster that cannot import this module: {got}")
+                    # P35-D: on the dask path a pool broken inside a chunk heals there, and
+                    # a repeated model error stops the whole call.
+                    open(os.path.join(d, "models", "p35d.py"), "w").write(
+                        "import os, time\n"
+                        "def f(p):\n"
+                        "    if p.get('crash') and os.environ.get('MA_COMPUTE_SELFTEST_ONCE') is None:\n"
+                        "        flag = os.path.join(p['dir'], str(p['x']))\n"
+                        "        if not os.path.exists(flag):\n"
+                        "            open(flag, 'w').close(); os._exit(9)\n"
+                        "    time.sleep(0.2)\n"
+                        "    return {'x': p['x']}\n"
+                        "def raises(p):\n    raise ValueError('diverged')\n")
+                    flags = tempfile.mkdtemp(prefix="ma_p35d_")
+                    code_d = ("import json, sys; sys.path.insert(0, %r); import compute; "
+                              "ins = [{'x': k, 'dir': %r, 'crash': k in (2, 9)} for k in range(12)]; "
+                              "rows, s = compute.map_fn(%r, 'models/p35d.py::f', ins, ledger=False, max_workers=1); "
+                              "r2, s2 = compute.map_fn(%r, 'models/p35d.py::raises', [{}] * 40, ledger=False, max_workers=1); "
+                              "print(json.dumps([s['n_failed'], [r['result']['x'] for r in rows if r['ok']], "
+                              "s2['stopped'] or '', s2['failed_by_kind']]))") % (iso_scripts, flags, d, d)
+                    r3 = _sp.run([sys.executable, "-c", code_d], capture_output=True, text=True, timeout=300,
+                                 env=dict(os.environ, PYTHONPATH="", MA_COMPUTE_PROCS_PER_WORKER="2"))
+                    try:
+                        nf, xs, stop2, kinds2 = json.loads(r3.stdout.strip().splitlines()[-1])
+                    except (ValueError, IndexError):
+                        nf, xs, stop2, kinds2 = None, None, "", {}
+                    ok(nf == 0 and xs == list(range(12)),
+                       f"P35-D1 a process death inside a dask chunk is healed in the chunk: {r3.stdout[-300:]} {r3.stderr[-300:]}")
+                    ok("same model error" in stop2 and kinds2.get("stopped", 0) > 0,
+                       f"P35-D2 a repeated model error stops a dask call: {stop2} {kinds2}")
 
-        except Exception:
-            print(open(os.path.join(iso, "sched.err")).read()[-3000:])
-            raise
-        finally:
-            os.environ.pop("MA_COMPUTE_SCHEDULER", None)
-            for pr in procs_:
-                pr.terminate()
-            for pr in procs_:
-                pr.wait(10)
+            except Exception:
+                print(open(os.path.join(iso, "sched.err")).read()[-3000:])
+                raise
+            finally:
+                os.environ.pop("MA_COMPUTE_SCHEDULER", None)
+                for pr in procs_:
+                    pr.terminate()
+                for pr in procs_:
+                    pr.wait(10)
 
 
 def _self_test() -> int:
