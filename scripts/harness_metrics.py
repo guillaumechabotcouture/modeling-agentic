@@ -171,8 +171,8 @@ def completion(run) -> dict:
         return no("status_mismatch", f"run_state.json {st['status']}, metadata.json {meta.get('status')}")
     if run.get("pause_mismatch"):
         return no("status_mismatch", run["pause_mismatch"])
-    # Every withhold path moves report.md away (stage_machine._quarantine_report), so a regular report.md is the
-    # delivered one; a report_withheld.md beside it is a repaired draft's leftover (baseline hb2 §5 fix 8).
+    # Every withhold path moves report.md away (stage_machine._withhold_report), so a regular report.md is the
+    # delivered one; a report_withheld.md beside it is a leftover (baseline hb2 §5 fix 8).
     ok = bool(status in COMPLETES and run["report"])
     cls = "completes" if ok else ("not_accepted" if status in NOT_ACCEPTED else "not_completed")
     why = ("a stale report_withheld.md remains beside the delivered report.md" if ok and run["withheld"]

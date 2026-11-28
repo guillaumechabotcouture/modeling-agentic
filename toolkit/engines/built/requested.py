@@ -953,33 +953,6 @@ class RequestedEngine:
                     return bad
         return bad
 
-    def check_plan_summary(self) -> dict:
-        """Summary of generated admission checks and coverage gaps for the pre-sign sheet."""
-        r = self.request
-        n_inputs = len(r.get("parameters") or []) + len(r.get("components") or {}) + len(r.get("unit_attributes") or {})
-        reds = r.get("reductions") or []
-        trials = r.get("trials") or []
-        reached = set()
-        for red in reds:
-            for path in (red.get("compare") or {}):
-                parts = str(path).split(".")
-                if (len(parts) == 3 and parts[0] == "per_capita") or (len(parts) == 2 and parts[0] == "per_capita_all"):
-                    reached.add(parts[1])
-        uncovered_outputs = [o for o in r["outputs"]["per_capita"] if o not in reached]
-        trial_comps = {tr.get("component") for tr in trials}
-        uncovered_components = [c for c in r["components"] if c not in trial_comps]
-        checks = {
-            "A1_conformance": len(r["components"]) + 4,
-            "A2_determinism": 9,
-            "A4_reductions": len(reds) * 3,
-            "A5_mass_balance": 6 if self.kind == "starsim_module" else 0,
-            "A6_liveness": len(r.get("parameters") or []) + len(r.get("components") or {}),
-            "A8_trials": len(trials),
-            "A11_reference": 1,
-        }
-        return {"checks": checks, "uncovered_outputs": uncovered_outputs,
-                "uncovered_components": uncovered_components}
-
     def run(self, params: dict, unit: UnitSpec, package: Package, horizon: Horizon, seed: int) -> Outcomes:
         raise EngineNotBuilt(f"requested engine {self.id!r} has not been built and admitted")
 
@@ -995,7 +968,6 @@ def sheet_lines(build: Mapping, full_registry_rows: list[dict] | None = None) ->
         return lines + [""]
     eng = RequestedEngine(build)
     card = eng.describe()
-    plan = eng.check_plan_summary()
     lines += [
         f"- **Engine id:** `{eng.id}` (`{eng.kind}`, request sha256 `{request_sha256(build)[:16]}`)",
         f"- **Justification:** {build['why']}",
@@ -1009,16 +981,6 @@ def sheet_lines(build: Mapping, full_registry_rows: list[dict] | None = None) ->
     for p in eng.parameters():
         rng = f"[{p.lo}, {p.hi}]" if p.lo is not None and p.hi is not None else "-"
         lines.append(f"| `{p.name}` | {p.kind} | {p.value} | {rng} | {p.source} |")
-    lines += ["", "### Generated check plan", "", "| Check | Planned cases |", "|---|---|"]
-    for ck, n in plan["checks"].items():
-        lines.append(f"| {ck} | {n} |")
-    lines += [
-        "",
-        "- **Per-capita outputs not reached by any reduction:** "
-        + (", ".join(f"`{o}`" for o in plan["uncovered_outputs"]) or "none"),
-        "- **Components with no trial declaration:** "
-        + (", ".join(f"`{c}`" for c in plan["uncovered_components"]) or "none"),
-    ]
     if full_registry_rows:
         lines += ["", "### Full-registry eligibility check", ""]
         for r in full_registry_rows:

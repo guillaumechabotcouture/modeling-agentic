@@ -67,8 +67,8 @@ only the owner can amend the signed spec.
    computed; never interpolate a price that no computation produced.
 
 Principles 8 to 12 (owner, 2026-11-23) name five reasons an outside benchmark found models stopping at "good"
-rather than "excellent". The domain and red-team critics answer each one in their checklist every round (pass,
-finding or not applicable, with a reason).
+rather than "excellent". Critics check whether any of these gaps applies and raise a blocker when one affects
+the run.
 
 8. Compare arms symmetrically. Every arm carries the background or standard-of-care components the comparator
    and the other arms carry, so arms differ only in what they add; a standalone arm without the backup the others

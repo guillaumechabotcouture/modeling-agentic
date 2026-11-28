@@ -46,13 +46,13 @@ RESOLUTIONS = ("fix", "decision_test", "owner_decision")
 # target_stage / stage (today's vocabulary) -> the machine state that can change the finding.
 OWNER_STATE = {
     "PLAN": "SPEC", "PLAN_CRITERIA": "SPEC", "BRIEF": "SPEC", "SPEC": "SPEC",
-    "DATA": "CONFIGURE", "MODEL": "CONFIGURE", "PRE_MODEL": "CONFIGURE", "IDENTIFIABILITY": "CONFIGURE",
-    "MULTI_STRUCTURAL": "CONFIGURE", "CALIBRATION": "CONFIGURE", "CONFIGURE": "CONFIGURE",
+    "DATA": "ANALYZE", "MODEL": "ANALYZE", "PRE_MODEL": "ANALYZE", "IDENTIFIABILITY": "ANALYZE",
+    "MULTI_STRUCTURAL": "ANALYZE", "CALIBRATION": "ANALYZE", "CONFIGURE": "ANALYZE",
     "EVIDENCE": "EVIDENCE", "ENGINE": "ENGINE_CHOICE",
     "ANALYZE": "ANALYZE", "UQ": "ANALYZE", "OPTIMIZATION": "ANALYZE", "SENSITIVITY": "ANALYZE",
     "GATE": "ANALYZE", "DECISION": "ANALYZE",
     "CRITIQUE": "CRITIQUE",
-    "WRITE": "WRITE", "PRESENTATION": "PRESENTATION",
+    "WRITE": "WRITE", "PRESENTATION": "WRITE",
 }
 _SEV_ORDER = {"HIGH": 0, "MEDIUM": 1, "LOW": 2}
 CONFLICT_KIND = "evidence_conflict_declared"      # W0-F: toolkit/analysis/conflicts.py FINDING_KIND
@@ -389,48 +389,22 @@ def finding_fingerprint(f) -> str:
     return answer_fingerprint(f.id, kind=f.kind, fix_requires=f.fix_requires, claim=f.claim)
 
 
-def legacy_fingerprint(fid: str, claim, fix_requires) -> str:
-    """The fingerprint answers were recorded under before hb2 fix 3 (the finding, its claim and remedy as asked): an
-    answer a run recorded then still binds the finding as it was asked (Codex r1 of #357, P1-1: a resumed run never
-    loses a recorded decline, nor lets a lead answer over it)."""
-    return hashlib.sha256(json.dumps({"finding": fid, "claim": claim, "fix_requires": fix_requires},
-                                     sort_keys=True).encode()).hexdigest()[:16]
-
-
 def answer_for(answers: dict, fid: str, *, kind, fix_requires, claim) -> dict | None:
-    """The recorded answer that binds this finding as it reads now, under its fingerprint or the legacy one. When both
-    hold an answer, the owner's comes before the lead's and a decline before an accept (Codex r2 of #357, P1-1/P1-2:
-    a provisional lead accept or an older accept never stands over the owner's decline)."""
-    got = [a for fp in (answer_fingerprint(fid, kind=kind, fix_requires=fix_requires, claim=claim),
-                        legacy_fingerprint(fid, claim, fix_requires))
-           for a in [answers.get(fp)] if isinstance(a, dict) and str(a.get("finding")) == fid]
-    best = min(got, key=lambda a: (a.get("by") != "owner", a.get("decision") != "decline"), default=None)
+    """The recorded answer that binds this finding as it reads now. A lead answer never stands over the owner's decline
+    of this finding (same id and kind) under any wording."""
+    fp = answer_fingerprint(fid, kind=kind, fix_requires=fix_requires, claim=claim)
+    a = answers.get(fp)
+    best = a if isinstance(a, dict) and str(a.get("finding")) == fid else None
     if best is None or best.get("by") == "lead":
-        # the lead never answers over the owner's decline of this finding (same id and kind) under any wording, an
-        # older one included (Codex r3 of #357, P1-3); the owner is asked again under the owner's own sign-off
-        dec = next((a for a in answers.values() if isinstance(a, dict) and str(a.get("finding")) == fid
-                    and a.get("by") == "owner" and a.get("decision") == "decline"
-                    and str(a.get("kind") or kind or "") == str(kind or "")), None)
-        if dec is not None and (best is not None or any(isinstance(a, dict) and a.get("by") == "lead"
-                                                        for a in answers.values())):
+        # the lead never answers over the owner's decline of this finding (same id and kind) under any wording;
+        # the owner is asked again under the owner's own sign-off
+        dec = next((x for x in answers.values() if isinstance(x, dict) and str(x.get("finding")) == fid
+                    and x.get("by") == "owner" and x.get("decision") == "decline"
+                    and str(x.get("kind") or kind or "") == str(kind or "")), None)
+        if dec is not None and (best is not None or any(isinstance(x, dict) and x.get("by") == "lead"
+                                                        for x in answers.values())):
             return dec
     return best
-
-
-def harness_gap_key(f) -> str:
-    """What a declared harness gap binds: the finding's answer fingerprint (its id, kind and remedy class; a harness
-    finding's claim and remedy as well), as an owner answer does. Not the critic's wording of the remedy: in harness
-    baseline hb3 (fix 6) a critic reworded a declared gap's remedy within its class, the gap no longer matched and the
-    fix planner declared it again, one round later. A remedy of another class (a fix become an owner amendment) or
-    another kind is looked at again."""
-    return finding_fingerprint(f)
-
-
-def legacy_harness_gap_key(f) -> str:
-    """The key a harness gap was recorded under before hb3 fix 6 (the fingerprint and the remedy as written): a resumed
-    run's gap still holds while its remedy reads as it did then."""
-    return hashlib.sha256(json.dumps({"fp": finding_fingerprint(f), "fix_requires": f.fix_requires},
-                                     sort_keys=True).encode()).hexdigest()[:16]
 
 
 # hb2 fix 1: gate kinds whose resolution is the owner's (agents/stage_machine.py DECISION_BEARING_KINDS)
@@ -438,44 +412,6 @@ OWNER_RESOLUTION_KINDS = ("decision_test_changes_plan",)
 # hb3 fix 4: a declared decision test that did not run (toolkit/analysis/contract.py DECISION_TEST_NOT_RUN_KIND). The
 # harness check computes it at every gate, so its absence means the test ran: an owner answer to it is moot
 NOT_RUN_KINDS = ("decision_test_not_run",)
-HARNESS_GAP = "harness_gap"          # the ledger event a declared harness gap leaves on its finding (agents/fix_loop.py)
-
-
-def harness_gaps(led: dict) -> set[str]:
-    """Open findings the fix planner declared harness gaps (no file a fix task may edit can fix them) as they read now:
-    the gap's event carries harness_gap_key, so a finding whose kind or remedy class was revised since is not one (hb2
-    fix 4: no task can work on it, so it is declared, not sent to the fix loop again; hb3 fix 6: a reworded remedy of
-    the same class still is one, unless it now names a file a fix task may edit: Codex r1 of #375, P1-1)."""
-    return {f.id for f in led.values() if f.status in ("open", "declared")
-            and any(_gap_holds(f, e) for e in f.events or [])}
-
-
-_PATH_TOKEN = re.compile(r"[\w][\w./-]*")
-
-
-def names_editable_file(text) -> bool:
-    """The text names a file a fix task may edit (agents/fix_loop.py in_edit_scope, FIX_EDITABLE). Unknown (the
-    scope cannot be read) counts as naming one, so the planner looks at the finding again (fail closed)."""
-    try:
-        import fix_loop as FX           # lazy: fix_loop imports this module
-    except Exception:  # noqa: BLE001
-        return True
-    toks = (t.rstrip(".,;:") for t in _PATH_TOKEN.findall(str(text or "")))
-    return any(("/" in t or "." in t) and FX.in_edit_scope(t) for t in toks)
-
-
-def _gap_holds(f, e) -> bool:
-    """One harness-gap event still declares f: its key binds f as it reads now (the remedy as written, the earlier
-    key; or the remedy class), and a remedy reworded since it was declared names no file a fix task may edit."""
-    if not (isinstance(e, dict) and e.get("status") == HARNESS_GAP):
-        return False
-    if e.get("key") == legacy_harness_gap_key(f):
-        return True                     # the remedy reads as it did when the gap was declared
-    if e.get("key") != harness_gap_key(f):
-        return False
-    if "remedy" in e and e.get("remedy") == f.fix_requires:
-        return True
-    return not names_editable_file(f.fix_requires)
 
 
 def owner_answers(run_dir: str, lead_ok: bool = False) -> dict[str, dict]:
@@ -712,8 +648,8 @@ def _self_test() -> int:
             "param_not_in_code:itn_rr", "required_artifact_missing"} <= set(led), f"L2 identities {sorted(led)}")
         ok(led["figure_validator_missing"].instances == 2 and not led["figure_validator_missing"].blocking,
            "L3 a key-less gate kind is one row with its instance count, non-blocking when MEDIUM")
-        ok(led["benchmark_drift:B15"].blocking and led["benchmark_drift:B15"].owner_state == "CONFIGURE",
-           "L4 a blocking gate finding maps MODEL -> CONFIGURE")
+        ok(led["benchmark_drift:B15"].blocking and led["benchmark_drift:B15"].owner_state == "ANALYZE",
+           "L4 a blocking gate finding maps MODEL -> ANALYZE")
         ok(led["R-002"].owner_state == "WRITE" and led["R-001"].done_when, "L5 critic rows keep owner state and done_when")
         ok(led["odd_thing"].owner_state == "NOVEL_STAGE" and not led["odd_thing"].owner_state_known,
            "L6 an unknown stage is kept as given and flagged, not guessed")
@@ -873,84 +809,23 @@ def _self_test() -> int:
             got = sync(d, {"rigor_violations": [], "unresolved_high": []}, 2, post_write=post)[0][nf.id]
             ok(got.status == "fixed" and not got.blocking,
                f"L19b an answered not-run test the gate no longer reports is fixed (post_write={post}: {got.status})")
-    # L20 (hb2 fix 4, dengue R2 R-001): a declared harness gap is one while the finding keeps its kind and remedy class
-    f20 = Finding(id="R-001", kind="critique_blocker", severity="MEDIUM", source="critique-redteam",
-                  fix_requires="The ANALYZE stage emits claims.")
-    _event(f20, 1, HARNESS_GAP, "fix_planner", "only harness code", key=harness_gap_key(f20))
-    g1 = harness_gaps({"R-001": f20})
-    f20.claim = "reworded"
-    g2 = harness_gaps({"R-001": f20})
-    # hb3 fix 6 (tb_acf R1 D-001): the critic reworded the gap's remedy in round 2, within its class; the gap holds
-    f20.fix_requires = "The owner must authorise it: the change is outside the fix loop's edit scope (reworded)."
-    g3 = harness_gaps({"R-001": f20})
-    f20.fix_requires = "Owner amendment: give the two weights ranges."           # another remedy class: looked at again
-    g4 = harness_gaps({"R-001": f20})
-    f20.fix_requires = "The ANALYZE stage emits claims."
-    f20.kind = "another_kind"                                                     # another kind: looked at again
-    g5 = harness_gaps({"R-001": f20})
-    f21 = Finding(id="R-002", kind="critique_blocker", severity="MEDIUM", source="critique-redteam")
-    _event(f21, 1, HARNESS_GAP, "fix_planner", "an older event without a key")
-    ok(g1 == g2 == g3 == {"R-001"} and g4 == g5 == set() and harness_gaps({"R-002": f21}) == set(),
-       f"L20 a harness gap binds the finding's id, kind and remedy class, not the remedy's wording "
-       f"({g1}, {g2}, {g3}, {g4}, {g5})")
-    # L20c (Codex r1 of #375 P1-1): a remedy reworded, within its class, into one that names a file the fix loop may
-    # edit (fix_loop.FIX_EDITABLE) reopens the gap: the loop can act on it now. The remedy as declared does not.
-    f23 = Finding(id="R-005", kind="critique_blocker", severity="MEDIUM", source="critique-redteam",
-                  fix_requires="Change the harness to increase the uncertainty draws.")
-    _event(f23, 1, HARNESS_GAP, "fix_planner", "only harness code", key=harness_gap_key(f23), remedy=f23.fix_requires)
-    c1 = harness_gaps({"R-005": f23})
-    f23.fix_requires = "Increase the draws in the harness code (reworded)."
-    c2 = harness_gaps({"R-005": f23})
-    f23.fix_requires = "Set `analysis_settings.yaml` uncertainty.draws to 64."
-    c3 = harness_gaps({"R-005": f23})
-    f23.fix_requires = "Add the missing draw step in models/ext/draws.py."
-    c4 = harness_gaps({"R-005": f23})
-    f24 = Finding(id="R-006", kind="critique_blocker", severity="MEDIUM", source="critique-redteam",
-                  fix_requires="Raise analysis_settings.yaml uncertainty.draws; the harness caps it.")
-    _event(f24, 1, HARNESS_GAP, "fix_planner", "the cap is harness code", key=harness_gap_key(f24),
-           remedy=f24.fix_requires)
-    c5 = harness_gaps({"R-006": f24})
-    ok(c1 == c2 == {"R-005"} and c3 == c4 == set() and c5 == {"R-006"},
-       f"L20c a reworded remedy naming an editable file reopens the gap; one without, or the remedy as declared, "
-       f"does not ({c1}, {c2}, {c3}, {c4}, {c5})")
-    # L20b: a gap recorded under the key used before hb3 fix 6 (the remedy as written) holds while the remedy reads so
-    f22 = Finding(id="R-003", kind="critique_blocker", severity="MEDIUM", source="critique-redteam",
-                  fix_requires="Only harness code can draw it.")
-    _event(f22, 1, HARNESS_GAP, "fix_planner", "only harness code", key=legacy_harness_gap_key(f22))
-    h1 = harness_gaps({"R-003": f22})
-    ok(h1 == {"R-003"} and legacy_harness_gap_key(f22) != harness_gap_key(f22),
-       f"L20b a gap recorded under the earlier key still holds on a resumed run ({h1})")
     _fa = answer_fingerprint("k:x", kind="k", fix_requires="r", claim="verdict A")
     ok(_fa != answer_fingerprint("k:x", kind="k", fix_requires="r", claim="verdict B")
        and answer_fingerprint("D-1", kind=CRITIC_KIND, fix_requires="r", claim="a")
        == answer_fingerprint("D-1", kind=CRITIC_KIND, fix_requires="r2", claim="b"),
        "L21 a harness finding's measured claim stays bound; a critic's wording and remedy text within a class do not")
-    # L22 (Codex r1 of #357, P1-1): an answer recorded under the fingerprint used before hb2 fix 3 still binds the
-    # finding as it was asked, so a resumed run keeps a recorded decline
-    with tempfile.TemporaryDirectory() as d:
-        import scope_signoff as SS
-        claim, fix = "the comparator omits the funded plan", "Owner amendment: add it."
-        json.dump({"answers": {legacy_fingerprint("D-033", claim, fix): {"finding": "D-033", "decision": "decline",
-                                                                        "by": "owner"}}},
-                  open(os.path.join(d, "scope_signoff.json"), "w"))
-        SS.harness_record(d)
-        save(d, {"D-033": Finding(id="D-033", kind=CRITIC_KIND, severity="HIGH", source="critique-domain",
-                                  claim=claim, fix_requires=fix)})
-        st22 = sync(d, None, 2)[0]["D-033"].status
-        ok(st22 == "owner_declined", f"L22 an answer under the legacy fingerprint still binds the finding ({st22})")
-    # L23 (Codex r2 of #357, P1-1/P1-2): the owner's decline under either fingerprint stands over an accept (an older
-    # wording's, or the lead's provisional one under the new fingerprint), and an owner_accepted row turns declined
+    # L23: the owner's decline stands over a lead provisional accept, and an owner_accepted row turns declined
     claim, fix = "the comparator omits the funded plan", "Owner amendment: add it."
     fpn = answer_fingerprint("D-034", kind=CRITIC_KIND, fix_requires=fix, claim=claim)
     ans23 = {fpn: {"finding": "D-034", "decision": "accept", "by": "lead", "provisional": True},
-             legacy_fingerprint("D-034", claim, fix): {"finding": "D-034", "decision": "decline", "by": "owner"}}
+             "old_fp_d034": {"finding": "D-034", "decision": "decline", "by": "owner", "kind": CRITIC_KIND}}
     a23 = answer_for(ans23, "D-034", kind=CRITIC_KIND, fix_requires=fix, claim=claim)
     with tempfile.TemporaryDirectory() as d:
         import scope_signoff as SS
-        json.dump({"answers": {legacy_fingerprint("D-035", "wording A", fix): {"finding": "D-035", "decision": "accept",
-                                                                             "by": "owner"},
-                               legacy_fingerprint("D-035", "wording B", fix): {"finding": "D-035", "decision": "decline",
-                                                                             "by": "owner"}}},
+        json.dump({"answers": {"old_fp_d035": {"finding": "D-035", "decision": "decline", "by": "owner",
+                                               "kind": CRITIC_KIND},
+                               answer_fingerprint("D-035", kind=CRITIC_KIND, fix_requires=fix): {
+                                   "finding": "D-035", "decision": "accept", "by": "lead", "provisional": True}}},
                   open(os.path.join(d, "scope_signoff.json"), "w"))
         SS.harness_record(d)
         save(d, {"D-035": Finding(id="D-035", kind=CRITIC_KIND, severity="HIGH", source="critique-domain",
@@ -963,7 +838,7 @@ def _self_test() -> int:
                        open(os.path.join(d, CRITIQUE_FILES["critique-domain"]), "w"))
         st23 = sync(d, None, 2, lead_ok=True)[0]["D-035"].status
     ok((a23 or {}).get("decision") == "decline" and st23 == "owner_declined",
-       f"L23 the owner's decline stands over an accept under the other fingerprint ({a23}, {st23})")
+       f"L23 the owner's decline stands over a lead accept ({a23}, {st23})")
     # L24 (Codex r2 of #357, P1-8, P2-12): an accepted plan-changing test stays non-blocking over repeated syncs, and a
     # post-write gate that no longer reports it closes it
     with tempfile.TemporaryDirectory() as d:
@@ -976,11 +851,10 @@ def _self_test() -> int:
         b24 = sync(d, g24, 1)[0]["decision_test_changes_plan:DT1"].blocking
         s24 = sync(d, {"rigor_violations": [], "unresolved_high": []}, 1, post_write=True)[0][
             "decision_test_changes_plan:DT1"].status
-    # L25 (Codex r3 of #357): the lead never answers over an owner's decline under an older wording (P1-3); the
-    # accept of the version this gate read is the record (P1-4); a malformed gate document is a problem (P2-15)
+    # L25: the lead never answers over an owner's decline; the accept of the version this gate read is the record;
+    # a malformed gate document is a problem
     fx_ = "Owner amendment: add it."
-    ans25 = {legacy_fingerprint("D-036", "old wording", fx_): {"finding": "D-036", "decision": "decline",
-                                                              "by": "owner", "kind": CRITIC_KIND},
+    ans25 = {"old_fp_d036": {"finding": "D-036", "decision": "decline", "by": "owner", "kind": CRITIC_KIND},
              answer_fingerprint("D-036", kind=CRITIC_KIND, fix_requires=fx_, claim="new"): {
                  "finding": "D-036", "decision": "accept", "by": "lead", "provisional": True}}
     a25 = answer_for(ans25, "D-036", kind=CRITIC_KIND, fix_requires=fx_, claim="new wording")

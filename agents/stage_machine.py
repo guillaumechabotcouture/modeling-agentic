@@ -11,16 +11,12 @@ Design: docs/design/v2c-orchestration.md. Code owns the flow: the state, every
 transition and every number. LLMs do bounded tasks (agents/v2_tasks.py). The state is
 persisted in run_state.json after every transition, so a run resumes where it stopped.
 
-States: SPEC -> SIGN -> EVIDENCE (stub) -> ENGINE_CHOICE -> CONFIGURE -> ANALYZE ->
-CRITIQUE -> GATE -> FIX_LOOP | WRITE | OWNER_DECISION | back-edges -> ... -> WRITE ->
-PRESENTATION -> GATE (post-write) -> FINAL.
+States: ACQUIRE -> SPEC -> EVIDENCE -> SIGN -> ENGINE_CHOICE ->
+ANALYZE -> CRITIQUE -> GATE -> FIX_LOOP | WRITE | OWNER_DECISION | back-edges -> FINAL.
 
-The gate's rules are not reimplemented. GATE calls today's validator: the CLI exactly
-as main.py's final gate does (`gate_mode: legacy`, for runs with today's artifacts), or
-the same rule functions in-process on the v2 findings (`gate_mode: v2`):
-validate_critique_yaml.decide, _apply_done_when, _defer_write_findings and
-_incorporate_rigor_violations, which end in _recompute_action. `route_gate` maps the
-action to the next state, following lead prompt STAGE 7 Step 3 and STAGE 8.9.
+The gate's rules live in agents/v2_gate.py, wrapping validate_critique_yaml, mechanical
+done_when checks, and owner sign-off; report rendering lives in agents/report_render.py;
+built-engine handlers and locking live in agents/engine_build_stage.py.
 """
 from __future__ import annotations
 
@@ -44,90 +40,133 @@ for _p in (REPO, os.path.join(REPO, "scripts"), HERE):
 import analysis_backend as AB  # noqa: E402
 import findings_ledger as FL  # noqa: E402
 import fix_loop as FX  # noqa: E402
+from agents.engine_build_stage import (  # noqa: E402
+    AWAITING_BUDGET,
+    AWAITING_ENGINE_SIGNOFF,
+    ENGINE_BUILD_CAP_MAX_USD,
+    ENGINE_BUILD_CAP_USD,
+    ENGINE_BUILD_TRY_CAP_USD,
+    ENGINE_ADMIT_COMPUTE_CAP_USD,
+    ENGINE_DECLINED,
+    ENGINE_NOT_ADMITTED,
+    ENGINE_REFERENCE_CAP_USD,
+    ENGINE_REVIEW_CAP_USD,
+    EngineBuildMixin,
+    MAX_CRITIQUE_ROUNDS,
+    MAX_ENGINE_BUILD_TRIES,
+    MAX_ENGINE_REFERENCE_TRIES,
+    MAX_ENGINE_REPAIRS,
+    MIN_TASK_ALLOWANCE_USD,
+    POST_CHOICE_STATES,
+    POST_ENGINE_SIGN_STATES,
+    RUN_LOCK,
+    RunLocked,
+    _now,
+    _run_lock,
+    spec_has_engine_build,
+)
+from agents.report_render import (  # noqa: E402
+    ACCEPTED_STATUSES,
+    AMENDMENT_RECORD,
+    DECLARED_FILE,
+    DELIVERED_STATUSES,
+    PROTECTED_BY_FIX,
+    SCOPE_SIGNOFF,
+    SIGNOFF_FILE,
+    SIGNOFF_SHEET,
+    SPEC_RETHINK_REQUEST,
+    STATE_FILE,
+    STATUS_MARK,
+    _STATUS_LINES,
+    _draft_file_problems,
+    _lead_may_accept,
+    _ledger_claims,
+    _plan_changing,
+    _put,
+    _quoted,
+    _render_stale,
+    _retire_stale_withheld,
+    _spec_signed_sha,
+    _special_files,
+    _status_line,
+    _withhold_report,
+    _write_deliverable,
+    _write_json,
+    amendment_lines,
+    deliverable_problems,
+    dependence_lines,
+    harness_owned,
+    owned_path,
+    provisional_lines,
+    render_report,
+    report_claim_findings,
+    signed_hash,
+    write_declared,
+)
+from agents.v2_gate import (  # noqa: E402
+    CRITICS,
+    DECISION_BEARING_KINDS,
+    DT_DISPOSITION,
+    INTERVAL_KIND,
+    OWNER_LIFECYCLE_WIRED,
+    _answer_counts,
+    _bearing_fp,
+    _bearing_item,
+    _bearing_record,
+    _owner_rule,
+    apply_held_rule,
+    apply_medium_rule,
+    apply_owner_declines,
+    apply_owner_rule,
+    held_entry_id,
+    open_findings,
+    owner_accepted_now,
+    owner_held,
+    require_judged,
+    rethink_target,
+    route_gate,
+    scope_request_view,
+    v2_gate,
+)
 
-STATE_FILE = "run_state.json"
-SIGNOFF_FILE = "decision_spec.signoff.json"
-SCOPE_SIGNOFF = "scope_signoff.json"      # Phase 49 β (PR #85)
-SIGNOFF_SHEET = "decision_spec.signoff_sheet.md"   # v2-derived-inputs: what signing accepts beyond the spec's text
 STATES = ("ACQUIRE", "SPEC", "EVIDENCE", "SIGN", "ENGINE_CHOICE",
           "ENGINE_BUILD", "ENGINE_ADMIT", "ENGINE_REVIEW", "ENGINE_SIGN",
-          "PREREGISTER", "CONFIGURE", "ANALYZE", "SCORE", "CRITIQUE",
-          "GATE", "FIX_LOOP", "OWNER_DECISION", "WRITE", "PRESENTATION", "FINAL")
+          "ANALYZE", "CRITIQUE",
+          "GATE", "FIX_LOOP", "OWNER_DECISION", "WRITE", "FINAL")
 # The state table: every transition the machine may take. A transition outside it is a bug
 # (raised, never taken).
 EDGES = {
-    # v2 ACQUIRE (docs/design/acquire.md §2.1): public data acquisition before SPEC, with at most one pre-SIGN top-up.
     "ACQUIRE": {"SPEC", "ACQUIRE", "FINAL"},
-    # v2 autonomy 1B-ii (D1): EVIDENCE drafts the evidence dossier before SIGN, so the signer sees it (a run signed
-    # under the earlier order, SIGN before EVIDENCE, goes back to SIGN, which checks its signature); SIGN -> EVIDENCE
-    # | SPEC is the lead's repair of a refused sign-off (at most MAX_SIGN_REPAIRS), only before any signature.
     "SPEC": {"EVIDENCE", "SPEC", "ACQUIRE", "FINAL"},
     "EVIDENCE": {"SIGN", "SPEC", "ACQUIRE", "FINAL"},
     "SIGN": {"ENGINE_CHOICE", "EVIDENCE", "SPEC", "SIGN", "FINAL"},
-    "ENGINE_CHOICE": {"ENGINE_BUILD", "PREREGISTER", "CONFIGURE", "FINAL"},
-    # Agent-built engine lane (#363, docs/design/agent-built-engines.md §2.2)
+    "ENGINE_CHOICE": {"ENGINE_BUILD", "ANALYZE", "FINAL"},
     "ENGINE_BUILD": {"ENGINE_ADMIT", "ENGINE_BUILD", "FINAL"},
     "ENGINE_ADMIT": {"ENGINE_REVIEW", "ENGINE_BUILD", "SPEC", "FINAL"},
     "ENGINE_REVIEW": {"ENGINE_SIGN", "ENGINE_BUILD", "ENGINE_REVIEW", "FINAL"},
-    "ENGINE_SIGN": {"PREREGISTER", "CONFIGURE", "ENGINE_SIGN", "ENGINE_BUILD", "FINAL"},
-    # The world model (docs/design/v2c-orchestration.md §14): beliefs anchored before the engine batch, scored after
-    # the analysis. Fail soft: neither state can end the run or change what the analysis computes.
-    "PREREGISTER": {"CONFIGURE", "FINAL"},
-    "CONFIGURE": {"ANALYZE", "FINAL"},
-    # A refused calibration goes back to SPEC (its revision), at most MAX_CALIBRATION_REFUSALS times
-    "ANALYZE": {"SCORE", "CRITIQUE", "SPEC", "FINAL"},
-    "SCORE": {"CRITIQUE", "FINAL"},
+    "ENGINE_SIGN": {"ANALYZE", "ENGINE_SIGN", "ENGINE_BUILD", "FINAL"},
+    "ANALYZE": {"CRITIQUE", "SPEC", "FINAL"},
     "CRITIQUE": {"GATE", "WRITE", "FINAL"},
-    "GATE": {"WRITE", "FIX_LOOP", "SPEC", "ENGINE_CHOICE", "ENGINE_BUILD", "OWNER_DECISION", "CRITIQUE", "PRESENTATION", "FINAL"},
+    "GATE": {"WRITE", "FIX_LOOP", "SPEC", "ENGINE_CHOICE", "ENGINE_BUILD", "OWNER_DECISION", "CRITIQUE", "FINAL"},
     "FIX_LOOP": {"CRITIQUE", "SPEC", "ENGINE_CHOICE", "ENGINE_BUILD", "WRITE", "OWNER_DECISION", "FINAL"},
     "OWNER_DECISION": {"GATE", "OWNER_DECISION", "FINAL"},
-    # hb1 cause G: a draft revised for write-up findings as a new round is re-reviewed (CRITIQUE) before the gate
-    "WRITE": {"PRESENTATION", "GATE", "FINAL"},
-    "PRESENTATION": {"GATE", "CRITIQUE", "FINAL"},
+    "WRITE": {"CRITIQUE", "GATE", "FINAL"},
     "FINAL": set(),
 }
-LLM_STATES = ("ACQUIRE", "SPEC", "ENGINE_CHOICE", "ENGINE_BUILD", "ENGINE_REVIEW", "CRITIQUE", "FIX_LOOP", "PRESENTATION")
-CRITICS = ("critique-domain", "critique-redteam")
-# The owner signs the whole decision_spec.yaml (its sha256). Fix tasks never edit it: they edit
-# analysis_settings.yaml, which holds only computational leaves (analysis_backend.SETTINGS_PATHS;
-# workstream B's schema.SETTINGS_PATHS), and the engine the harness chose is in engine_choice.json.
-PROTECTED_BY_FIX = (AB.SPEC_FILE, AB.SETTINGS_FILE)
+LLM_STATES = ("ACQUIRE", "SPEC", "ENGINE_CHOICE", "ENGINE_BUILD", "ENGINE_REVIEW", "CRITIQUE", "FIX_LOOP", "WRITE")
 TASK_CAP_USD = 3.0            # one bounded task's allowance, at most what the run has left
 READBACK_CAP_USD = 0.25       # one crash read-back (resume for one tool-less turn), at most what is left
-# F6 run 3: a draft_spec started with a $0.13 allowance failed at once. A paid task is not started below this
-# allowance: the run pauses for the owner (paused:awaiting_budget, resumable with a higher --max-budget-usd).
-MIN_TASK_ALLOWANCE_USD = 0.50
-AWAITING_BUDGET = "awaiting_budget"
 OWNER_REQUEST = "scope_signoff_request.json"   # scripts/scope_signoff.py REQUEST: `show` / `sign` read it
 
 
 class AwaitingBudget(Exception):
     """Raised by Machine._task when the next paid task's allowance is below MIN_TASK_ALLOWANCE_USD; step() pauses."""
-# Findings whose resolution bears on the primary decision: Phase 49 β's owner rule decides
-# whether they may be declared. Without that rule they are not declarable (fail closed).
-DECISION_BEARING_KINDS = ("decision_test_changes_plan",)
-# hb3 fix 5 (lead on #377): a degenerate headline interval is an owner item too (toolkit/analysis/contract.py marks it
-# decision_bearing), but not one whose accept lets the run ACCEPT: accepted, the limitation is declared (rule 3o)
-INTERVAL_KIND = "analysis_interval_degenerate"
+
+
 MAX_SPEC_TRIES = 3
 MAX_SCHEMA_REPAIRS = 2
-CHECKLIST_MISSING = "missing required key 'checklist'"     # toolkit/spec/critique_checklist.py's error for a file without it
-MAX_SIGN_REPAIRS = 2          # a refused lead sign-off goes back to EVIDENCE or SPEC at most this often, then waits
 MAX_CALIBRATION_REFUSALS = 2  # a refused calibration goes back to SPEC at most this often, then the run ends run_failed
 CALIBRATION_REFUSED = "calibration_refused"      # its findings-ledger kind and id
-# Agent-built engines (#363, docs/design/agent-built-engines.md §2.2 & §6.2)
-MAX_ENGINE_BUILD_TRIES = 2
-MAX_ENGINE_REFERENCE_TRIES = 2
-MAX_ENGINE_REPAIRS = 1
-ENGINE_BUILD_CAP_USD = 40.0
-ENGINE_BUILD_CAP_MAX_USD = 200.0
-ENGINE_BUILD_TRY_CAP_USD = 15.0
-ENGINE_REFERENCE_CAP_USD = 6.0
-ENGINE_REVIEW_CAP_USD = 3.0
-ENGINE_ADMIT_COMPUTE_CAP_USD = 15.0
-AWAITING_ENGINE_SIGNOFF = "awaiting_engine_signoff"
-ENGINE_NOT_ADMITTED = "completed_engine_not_admitted"
-ENGINE_DECLINED = "completed_engine_declined"
 # v2 ACQUIRE (docs/design/acquire.md §§2.1, 6.2)
 MAX_ACQUIRE_ROUNDS = 2
 MAX_ACQUIRE_RETRIES = 1
@@ -170,10 +209,6 @@ class RunState:
     # started, completed, ok, output, note}. Written before and after each call, so a resumed run
     # never repeats a completed task or loses its charge, and charges an interrupted one its allowance.
     journal: dict = field(default_factory=dict)
-    # §14: the world-model stages run when true (init_run sets it for every new run; False for older states), and
-    # what they recorded: {status, decision_id, anchor, preregistered, scored, counts}.
-    world_model_stages: bool = False
-    world_model: dict = field(default_factory=dict)
     # #363 agent-built engine lane state: {id, kind, status, tries, repairs, spent_usd, compute_reserved_usd,
     # snapshot_sha256, admission_sha256, hidden_commitment}. Empty for runs using registered engines.
     engine_build: dict = field(default_factory=dict)
@@ -204,46 +239,8 @@ def load_state(run_dir: str) -> RunState | None:
     return st
 
 
-def _withhold_report(run_dir: str) -> None:
-    """A report an earlier gate rendered is not delivered under a failed status: a regular report.md is moved to
-    report_withheld.md; a link at that name is removed (never followed)."""
-    p = os.path.join(run_dir, "report.md")
-    if os.path.islink(p):
-        from lib.safe_io import remove_nofollow
-        remove_nofollow(run_dir, "report.md")
-    elif os.path.isfile(p):
-        _quarantine_report(run_dir)
-
-
-def _retire_stale_withheld(run_dir: str) -> None:
-    """Baseline hb2 (§5 fix 8): a language repair quarantines the rejected draft in report_withheld.md; once the run
-    ends with a regular report.md (every withhold path moves report.md away, so it is the delivered one), the
-    leftover is removed (no link followed), so no reader takes the run's report as withheld. The repair stays in the
-    history and in the gate records (report_acceptance_language). The caller calls it only on a post-write gate's
-    decision (Codex r1 of #355: a run that ends before that gate keeps the quarantined copy). Anything at that name
-    other than a regular file or a link (a directory) is left alone."""
-    p = os.path.join(run_dir, "report.md")
-    w = os.path.join(run_dir, "report_withheld.md")
-    if os.path.isfile(p) and not os.path.islink(p) and (os.path.islink(w) or os.path.isfile(w)):
-        from lib.safe_io import remove_nofollow
-        remove_nofollow(run_dir, "report_withheld.md")
-
-
-def _quarantine_report(run_dir: str) -> None:
-    """F6 S1-7: move report.md to report_withheld.md through lib.safe_io (no link followed at either name;
-    a linked report.md is refused, a link at the destination is replaced)."""
-    from lib.safe_io import rename_nofollow
-    rename_nofollow(run_dir, "report.md", "report_withheld.md")
-
-
-def _put(run_dir: str, rel: str, text: str) -> None:
-    """A harness file in the run dir, published atomically with no link followed (lib.safe_io; review round 4)."""
-    from lib.safe_io import write_nofollow
-    write_nofollow(run_dir, rel.replace(os.sep, "/"), text.encode("utf-8"), atomic=True)
-
-
 def _state_bytes(st: RunState) -> bytes:
-    """run_state.json's bytes for `st` (a lead hand-off binds its child to them before they are saved: Codex r3)."""
+    """run_state.json's bytes for `st`."""
     return json.dumps(st.to_dict(), indent=1, default=str).encode()
 
 
@@ -252,53 +249,6 @@ def save_state(run_dir: str, st: RunState) -> None:
     from lib.safe_io import write_nofollow
     write_nofollow(run_dir, STATE_FILE, _state_bytes(st), atomic=True)
 
-
-# ------------------------------------------------------------------ gate routing (pure)
-def rethink_target(decision: dict, *, built_engine: bool = False, engine_repairs_left: bool = False) -> str:
-    """RETHINK_STRUCTURAL back-edge: SPEC when a structural blocker targets PLAN (the decision
-    spec is wrong), ENGINE_BUILD when a blocker targets ENGINE on a built-engine run with a repair left,
-    else ENGINE_CHOICE (the engine or its configuration cannot represent it)."""
-    for b in decision.get("unresolved_high") or []:
-        if isinstance(b, dict) and b.get("category") == "STRUCTURAL" and b.get("target_stage") == "PLAN":
-            return "SPEC"
-    if built_engine and engine_repairs_left:
-        for b in decision.get("unresolved_high") or []:
-            if isinstance(b, dict) and b.get("target_stage") == "ENGINE":
-                return "ENGINE_BUILD"
-    return "ENGINE_CHOICE"
-
-
-def route_gate(decision: dict | None, post_write: bool, *, built_engine: bool = False,
-               engine_repairs_left: bool = False) -> tuple[str, str | None, str | None]:
-    """(next state, terminal status or None, write mode or None) for a gate decision.
-
-    The rules of lead prompt STAGE 7 Step 3 and STAGE 8.9, as code."""
-    if not isinstance(decision, dict):
-        return "FINAL", "completed_gate_error", None
-    if decision.get("schema_errors"):
-        return "CRITIQUE", None, None
-    a = decision.get("action")
-    if a == "ACCEPT":
-        return ("FINAL", "completed", None) if post_write else ("WRITE", None, "accepted")
-    if a == "DECLARE_SCOPE":
-        return ("FINAL", "completed_scope_declared", None) if post_write else ("WRITE", None, "declared")
-    if a == "RUN_FAILED":
-        owner_declined = any(isinstance(u, dict) and u.get("kind") == "scope_declaration_declined"
-                             for u in decision.get("unresolved_high") or [])
-        status = "completed_scope_declined" if owner_declined else "run_failed"
-        return ("FINAL", status, None) if post_write else ("WRITE", None, "not_accepted")
-    if a == "PATCH_OR_RETHINK":
-        if built_engine and engine_repairs_left and any(
-            isinstance(u, dict) and u.get("target_stage") == "ENGINE"
-            for u in decision.get("unresolved_high") or []
-        ):
-            return "ENGINE_BUILD", None, None
-        return "FIX_LOOP", None, None
-    if a == "RETHINK_STRUCTURAL":
-        return rethink_target(decision, built_engine=built_engine, engine_repairs_left=engine_repairs_left), None, None
-    if a == "AWAIT_OWNER":
-        return "OWNER_DECISION", None, None
-    return "FINAL", "completed_gate_error", None
 
 
 # ------------------------------------------------------------------ gates
@@ -317,12 +267,6 @@ def spec_signoff_findings(run_dir: str, signoff: str, backend=None) -> list[dict
                  "key": "spec", "scope_declarable": False,
                  "claim": "decision_spec.yaml changed after sign-off. It is the owner's; restore it or ask for a "
                           "new sign-off. Computational settings belong in analysis_settings.yaml."}]
-    from toolkit.spec import review_conditions as RC     # W0-G (Codex r2 P1-5): the conditions the signature bound
-    bad = RC.problems(run_dir, None, None)
-    if bad:
-        return [{"kind": "review_conditions_changed_after_signoff", "severity": "HIGH", "stage": "PLAN",
-                 "target_stage": "PLAN", "key": "review_conditions", "scope_declarable": False,
-                 "claim": "; ".join(bad)[:600]}]
     from agents import acquire as ACQ
     if rec.get("acquired_inventory_sha256") or ACQ.has_acquired(run_dir):
         try:
@@ -337,603 +281,6 @@ def spec_signoff_findings(run_dir: str, signoff: str, backend=None) -> list[dict
                      "target_stage": "PLAN", "key": "acquired_inventory", "scope_declarable": False,
                      "claim": "acquired inventory changed after sign-off: restore the signed inputs or re-sign"}]
     return []
-
-
-def deliverable_problems(run_dir: str) -> list[str]:
-    """The spec's `deliverable_file.path` must be a plain file inside the run directory: relative,
-    no `..`, no symlink on the way, and not a file the harness, the gate or a critic owns."""
-    import yaml
-    try:
-        spec = yaml.safe_load(open(os.path.join(run_dir, AB.SPEC_FILE))) or {}
-    except OSError:
-        return []
-    df = spec.get("deliverable_file")
-    if df is None:
-        return []
-    rel = df.get("path") if isinstance(df, dict) else None
-    if not isinstance(rel, str) or not rel.strip() or not isinstance(df.get("columns"), dict):
-        return ["deliverable_file needs a path and columns"]
-    if os.path.isabs(rel) or ".." in rel.replace("\\", "/").split("/"):
-        return [f"deliverable path {rel!r} must be relative and inside the run directory"]
-    root = os.path.realpath(run_dir)
-    target = os.path.join(root, rel)
-    if not os.path.realpath(target).startswith(root + os.sep):
-        return [f"deliverable path {rel!r} resolves outside the run directory"]
-    cur = root
-    for part in rel.replace("\\", "/").split("/"):
-        cur = os.path.join(cur, part)
-        if os.path.islink(cur):
-            return [f"deliverable path {rel!r} goes through a symlink ({os.path.relpath(cur, root)})"]
-    norm = os.path.relpath(target, root).replace(os.sep, "/")
-    # v2 autonomy 1B-ii: the signed evidence dossier the spec names, compared as a literal path (Codex r2 P1-1: a
-    # name such as x[1].yaml is not its own glob) and by identity
-    drel = spec["evidence"].get("dossier") if isinstance(spec.get("evidence"), dict) else None
-    if isinstance(drel, str) and drel.strip():
-        dn = os.path.normpath(drel).replace(os.sep, "/").lower()
-        dp = os.path.join(root, drel)
-        try:
-            same = os.path.exists(dp) and os.path.exists(target) and os.path.samefile(dp, target)
-        except OSError:
-            same = True
-        if dn == norm.lower() or same:
-            return [f"deliverable path {rel!r} is the evidence dossier the spec names"]
-    if owned_path(root, norm, harness_owned()):
-        return [f"deliverable path {rel!r} is a file the harness, the gate or a critic owns"]
-    return []
-
-
-def harness_owned() -> tuple:
-    """The run files the harness, the gate or a critic owns (glob patterns): no deliverable and no supplied evidence
-    dossier may be one of them."""
-    import pipeline as P
-    return tuple(P._reserved_patterns()) + PROTECTED_BY_FIX + (
-        STATE_FILE, SIGNOFF_FILE, SCOPE_SIGNOFF, "spec_rethink_request.json", FL.LEDGER, FX.IMPACT, "report.md", "manuscript.md", "metadata.json",
-        "report_render.json", "report_withheld.md", "final_gate.json", AB.ENGINE_CHOICE, "validator_history.jsonl", "gate_r*", "fix_plan_r*", "fix_progress_r*",
-        "analysis/*", "models/pipeline*", "evidence/*", "data/*", "world_model", "world_model/*",
-        "acquire", "acquire/*",
-        "engine_build", "engine_build/*", "models/ext/engine_*", "models/ext/engine_*/*",
-        "evidence_dossier.yaml", SIGNOFF_SHEET,    # v2 autonomy 1B-ii: the default dossier and the sign-off sheet
-        AMENDMENT_RECORD)                          # lead-gaps β (Codex r1): toolkit/spec/amend.py's record
-
-
-def owned_path(root: str, rel: str, owned) -> bool:
-    """Is `rel` (inside `root`) one of the owned paths? Compared case-insensitively (APFS and NTFS
-    are case-insensitive by default: Report.MD is report.md), and, when the file exists, by
-    identity: the same inode as an existing owned file, or any hard link (st_nlink > 1)."""
-    import glob
-    import pipeline as P
-    low = rel.lower()
-    if any(P.path_match(low, str(pat).lower()) for pat in owned):
-        return True
-    target = os.path.join(root, rel)
-    if not os.path.exists(target):
-        return False
-    try:
-        if os.path.isfile(target) and os.stat(target).st_nlink > 1:
-            return True
-        for pat in owned:
-            for hit in glob.glob(os.path.join(root, str(pat)), recursive=True):
-                if os.path.exists(hit) and os.path.samefile(hit, target):
-                    return True
-    except OSError:
-        return True                  # fail closed
-    return False
-
-
-# Phase 49 β's sign-off lifecycle in v2 (autonomy 1F): a fingerprinted request (scope_signoff.record) written on the
-# AWAIT_OWNER route, kept in run_state.json, and the answers taken through the harness (harness_record), honouring the
-# run's signoff mode: the owner's under --signoff owner; under --signoff lead the lead's, provisionally (D2), so the run
-# never waits; under --signoff none decision-bearing findings stay non-declarable.
-OWNER_LIFECYCLE_WIRED = True
-
-
-def _owner_rule():
-    """Phase 49 β's owner rule (scripts/scope_signoff.py with the validator's AWAIT_OWNER path),
-    or None when this checkout does not have both, or v2's sign-off lifecycle is not wired."""
-    if not OWNER_LIFECYCLE_WIRED:
-        return None
-    import inspect
-    import validate_critique_yaml as V
-    try:
-        import scope_signoff
-    except ImportError:
-        return None
-    try:
-        if "AWAIT_OWNER" not in inspect.getsource(V._recompute_action):
-            return None
-    except (OSError, TypeError):
-        return None
-    return scope_signoff
-
-
-def _bearing_record(run_dir: str, v: dict):
-    """The producer's record of a decision-bearing finding's test: the toolkit's verified row (with its result file's
-    hash) for a toolkit finding; None when absent."""
-    if v.get("source") != "toolkit/analysis/contract.py":
-        return None
-    try:
-        from toolkit.analysis import contract as _CT
-        return _CT.decision_test_record(run_dir, v.get("key"))
-    except Exception:  # noqa: BLE001 -- no evidence: the item binds the claim alone, as before
-        return None
-
-
-# What an owner's accept of a plan-changing decision test authorizes (owner decision (b), 2026-11-23): the run may
-# ACCEPT with the dependence stated. Bound into the item's fingerprint, so an accept given under the earlier contract
-# (the finding declared, the run not accepted) does not authorize it (Codex r3 of #357, P1-1).
-DT_DISPOSITION = "accept_with_dependence_stated"
-
-
-def _bearing_fp(v: dict, ev) -> str:
-    key = {"finding": FL.gate_id(v), "claim": v.get("claim", ""), "evidence": ev}
-    if v.get("kind") in DECISION_BEARING_KINDS:
-        key["disposition"] = DT_DISPOSITION
-    return hashlib.sha256(json.dumps(key, sort_keys=True, default=str).encode()).hexdigest()[:16]
-
-
-def _bearing_item(run_dir: str, v: dict) -> dict:
-    """What the owner is asked about a decision-bearing finding: its claim and the analysis's record of the decision
-    test (_bearing_record), fingerprinted with the disposition an accept authorizes (an answer binds all three: a
-    changed result is asked again)."""
-    ev = _bearing_record(run_dir, v)
-    gid = FL.gate_id(v)
-    fp = _bearing_fp(v, ev)
-    why = ("a measured decision test changes the plan" if v.get("kind") in DECISION_BEARING_KINDS
-           else "the headline's uncertainty interval has next to no width" if v.get("kind") == INTERVAL_KIND
-           else "the finding bears on the decision")
-    return {"finding": gid, "kind": v.get("kind"), "reason": why,
-            "claim": v.get("claim", ""), "declarations": [], "declared": False, "fingerprint": fp,
-            # the producer's record the answer binds, for the report's statement of it (Codex r1 of #357, P1-7/8)
-            "record": "toolkit",
-            "result_sha256": (ev or {}).get("result_sha256") if isinstance(ev, dict) else None}
-
-
-def _answer_counts(a: dict, mode: str) -> bool:
-    """Whose answer releases an owner item: the owner's; the lead's only in a --signoff lead run (D2), and only a
-    provisional one (the harness's, listed in the report: Codex r1 of #316)."""
-    return a.get("by") == "owner" or (a.get("by") == "lead" and mode == "lead" and a.get("provisional") is True)
-
-
-def apply_owner_rule(run_dir: str, round_n: int, viols: list[dict], rule="auto", mode: str = "owner") -> list[dict]:
-    """Decision-bearing findings (a measured decision test that changes the plan) go through
-    Phase 49 β's owner rule before they can be declared: marked for the owner (an item the
-    AWAIT_OWNER route requests) until a recorded answer counts (`mode`: the run's sign-off).
-    Without the rule, or under --signoff none, they are not scope-declarable, so the run can
-    neither declare them away nor finish around them."""
-    import validate_critique_yaml as V
-    rule = _owner_rule() if rule == "auto" else rule
-    bearing = [v for v in viols if v.get("decision_bearing") or v.get("kind") in DECISION_BEARING_KINDS]
-    if not bearing:
-        if rule is None or mode == "none":
-            return []
-        # Codex r2 of #316 (P1): an owner's recorded decline holds the gate whatever else is present; nothing new is
-        # put to the owner here (the policy kinds go to the owner only beside a decision-bearing finding, as before)
-        marked = {id(v) for v in viols if v.get("owner_signoff")}
-        try:
-            out = [f for f in rule.gate_findings(run_dir, round_n, viols, non_declarable=V.is_non_declarable,
-                                                 mode=mode, provisional_only=True) or []
-                   if f.get("kind") == "scope_declaration_declined"]
-        except Exception:  # noqa: BLE001 -- as before this rule: nothing marked, nothing declined
-            out = []
-        for v in viols:
-            if v.get("owner_signoff") and id(v) not in marked:
-                v.pop("owner_signoff", None)
-                v.pop("owner_item", None)
-        return out
-    if rule is not None and mode != "none":
-        out = []
-        try:
-            answers = (getattr(rule, "verified_answers", None) or (lambda rd: ({}, [])))(run_dir)[0]
-            for v in bearing:
-                if v.get("kind") in DECISION_BEARING_KINDS:
-                    # hb2 fix 1: no fix task can change a measured decision test: the gate asks its owner at the
-                    # first gate (rule 2o), and an accept lets the run ACCEPT with the dependence stated (owner
-                    # decision (b), 2026-11-23); scripts/validate_critique_yaml.py _recompute_action
-                    v["owner_resolution"] = True
-                item = _bearing_item(run_dir, v)
-                a = answers.get(item["fingerprint"]) or {}
-                if str(a.get("finding")) == item["finding"] and _answer_counts(a, mode):
-                    if a.get("decision") == "accept":
-                        v["owner_signed"] = {"by": a.get("by"), "at": a.get("at"), "fingerprint": item["fingerprint"],
-                                             "record": item["record"], "result_sha256": item["result_sha256"],
-                                             **({"provisional": True} if a.get("provisional") else {})}
-                        continue
-                    v["scope_declarable"], v["owner_declined"] = False, True
-                    out.append({"kind": "scope_declaration_declined", "severity": "HIGH", "stage": "GATE",
-                                "target_stage": "MODEL", "scope_declarable": False, "key": item["finding"],
-                                "claim": f"The {a.get('by')} declined the declaration of `{item['finding']}` "
-                                         f"({a.get('at')}): {str(a.get('note') or 'no note')[:300]}."})
-                    continue
-                v["owner_signoff"], v["owner_item"] = True, item
-            return out + list(rule.gate_findings(run_dir, round_n, viols, non_declarable=V.is_non_declarable,
-                                                 mode=mode, provisional_only=True) or [])
-        except Exception as e:  # noqa: BLE001 -- fail closed below
-            reason = f"the owner rule failed ({type(e).__name__}: {e})"
-    elif rule is not None:
-        reason = "under --signoff none nobody can accept a finding that bears on the decision"
-    else:
-        reason = "the owner rule (Phase 49 β, scripts/scope_signoff.py) is not available"
-    for v in bearing:
-        v["scope_declarable"] = False
-        v.pop("owner_signoff", None)
-        v.pop("owner_signed", None)
-        v["claim"] = f"{v.get('claim', '')} Not declarable: {reason}."
-    return []
-
-
-def _earlier_round(path: str, round_n: int) -> int:
-    """The round a critique file states when it is an earlier one than `round_n`; else `round_n` (a file that
-    cannot be read, or states no earlier round, is validated against the gate's round as usual)."""
-    import yaml
-    try:
-        with open(path) as fh:
-            r = (yaml.safe_load(fh) or {}).get("round")
-    except Exception:  # noqa: BLE001 -- validate_critique reports it
-        return round_n
-    return r if isinstance(r, int) and not isinstance(r, bool) and 1 <= r < round_n else round_n
-
-
-def v2_gate(run_dir: str, round_n: int, max_rounds: int, post_write: bool, extra: list[dict],
-            history: bool = True, critics=CRITICS, spec_violations=None, registry_violations=None,
-            strict_done_when: bool = False, append_history: bool | None = None, signoff: str = "owner",
-            checklist_rules: bool = True) -> dict:
-    """Today's rule functions, in today's order, on the v2 findings: the critic YAMLs, the
-    harness's checks (`extra`), and optionally spec-compliance and registry findings. `signoff`:
-    the run's mode, for whose answers to owner items count (apply_owner_rule)."""
-    import done_when
-    import validate_critique_yaml as V
-    critiques, schema_errors, schema_errors_by_reviewer, refused = {}, [], {}, {}
-    # Owner 2026-11-23: the domain and red-team critics answer every item of the structural checklist
-    # (toolkit/spec/critique_checklist.py); a missing item is a schema error. Required in a run (its run_state.json or
-    # its decision spec exists); only a gate over critique files alone (the unit fixtures, no run) or a replay of
-    # stored gates (v2_rules off) needs none.
-    from toolkit.spec import critique_checklist as CL
-    in_run = any(os.path.lexists(os.path.join(run_dir, f)) for f in ("decision_spec.yaml", STATE_FILE))
-    checklist = bool(in_run and checklist_rules)
-    draft = any(os.path.exists(os.path.join(run_dir, f)) for f in ("report.md", "manuscript.md"))
-    extra = list(extra)
-    names = list(critics) + [r for r in V.REVIEWERS if r not in critics and r != "critique-presentation"
-                             and os.path.exists(os.path.join(run_dir, V.FILENAMES[r]))]
-    names += ["critique-presentation"] if draft else []
-    for reviewer in names:
-        path = os.path.join(run_dir, V.FILENAMES[reviewer])
-        if not os.path.exists(path):
-            if reviewer == "critique-presentation":
-                extra.append({"kind": "critique_presentation_missing", "severity": "MEDIUM", "stage": "WRITE",
-                              "target_stage": "WRITE", "scope_declarable": True,
-                              "claim": "A draft exists but critique_presentation.yaml does not."})
-                continue
-            err = f"{V.FILENAMES[reviewer]} is missing"
-            schema_errors.append(err)
-            schema_errors_by_reviewer.setdefault(reviewer, []).append(err)
-            continue
-        rn = round_n
-        if reviewer == "critique-presentation" and not post_write:
-            # A pre-write gate with a draft follows a post-write modelling fix, one round on: PRESENTATION has not
-            # run since, and it reviews the rewritten draft before the next post-write gate. The last review is
-            # read as of the round it was written in (its findings stay open and listed), not refused for that
-            # round, which cost a schema repair and a paid review of a draft about to be replaced.
-            rn = _earlier_round(path, round_n)
-        try:
-            critiques[reviewer] = V.validate_critique(path, reviewer, rn, checklist=checklist)
-        except V.SchemaError as e:
-            # Every error in the file, so one repair fixes all of them (T74-T75). The refused file's
-            # blockers still have their done_when tests checked below, for the same reason.
-            errs = list(getattr(e, "errors", None) or [str(e)])
-            schema_errors.extend(errs)
-            schema_errors_by_reviewer.setdefault(reviewer, []).extend(errs)
-            import yaml
-            try:
-                with open(path) as fh:
-                    raw = yaml.safe_load(fh)
-                if isinstance(raw, dict) and isinstance(raw.get("blockers"), list):
-                    refused[reviewer] = raw
-            except Exception:                                # unreadable: its schema errors stand
-                pass
-    if strict_done_when:
-        # v2blind1: critics wrote done_when as prose, done_when.py counted every test as missing,
-        # and the open MEDIUMs were accepted. A HIGH or MEDIUM blocker's test is part of the schema
-        # here: one that does not parse is repaired like any schema error (the T37 path).
-        import done_when as DW
-        for reviewer, doc in list(critiques.items()) + list(refused.items()):
-            for b in doc.get("blockers") or []:
-                if not isinstance(b, dict) or b.get("resolved") is True \
-                        or str(b.get("severity")) not in ("HIGH", "MEDIUM"):
-                    continue
-                try:
-                    probs = DW.problems(b["done_when"]) if b.get("done_when") is not None else ["missing"]
-                except Exception as e:                       # a test that cannot be checked is a problem
-                    probs = [f"done_when could not be checked ({type(e).__name__})"]
-                if probs:
-                    err = f"{V.FILENAMES[reviewer]}: blocker {b.get('id')} done_when: {'; '.join(probs)[:300]}"
-                    schema_errors.append(err)
-                    schema_errors_by_reviewer.setdefault(reviewer, []).append(err)
-    for reviewer in V.OPTIONAL_REVIEWERS:
-        doc, vs = V._load_optional_critique(run_dir, reviewer, round_n)
-        if doc is not None:
-            critiques[reviewer] = doc
-        extra += vs
-    if schema_errors:
-        return {"schema_errors": schema_errors, "schema_errors_by_reviewer": schema_errors_by_reviewer, "action": None}
-    d = V.decide(critiques, max_rounds, round_n)
-    if checklist:        # a replay (checklist_rules off) never reads, so never records, a legacy field (Codex r3 P1-5)
-        d["critique_checklist"] = CL.record(critiques)
-    d["declared"] = V._declared_ids(run_dir)
-    d["declared_prev"] = V._previous_declared(run_dir, round_n)
-    d = V._apply_brief_scope(d, critiques, run_dir, max_rounds, round_n)
-    d, dw = V._apply_done_when(d, critiques, run_dir, max_rounds, round_n, record=history)
-    d = V._defer_write_findings(d, run_dir, max_rounds, round_n)
-    if spec_violations is not None:
-        d = V.incorporate_spec_violations(d, list(spec_violations), max_rounds, round_n)
-    viols = extra + done_when.gate_findings(dw or {})
-    viols += apply_owner_rule(run_dir, round_n, viols, mode=signoff)
-    for v in viols:
-        k = FL.gate_key(v)
-        if k:
-            v["stall_key"] = k
-    d = V._incorporate_rigor_violations(d, viols, max_rounds, round_n)
-    if registry_violations is not None:
-        d = V.incorporate_registry_violations(d, list(registry_violations), max_rounds, round_n)
-    d["post_write"] = bool(post_write)
-    if history if append_history is None else append_history:
-        V._append_validator_history(run_dir, round_n, d, post_write)
-    return d
-
-
-
-
-def open_findings(run_dir: str, decision: dict) -> list[dict]:
-    """Every HIGH or MEDIUM finding still open after a gate: the critics' unresolved blockers (not
-    closed by their done_when test), and the harness checks' findings (their test is the check
-    itself). `tested`: the finding has a test the fix loop can work to. A write-up finding waits
-    for the draft."""
-    import done_when as DW
-    import validate_critique_yaml as V
-    draft = os.path.exists(os.path.join(run_dir, "manuscript.md"))
-    drafted = draft or os.path.exists(os.path.join(run_dir, "report.md"))     # the gate's own test for a draft
-    closed = set(map(str, decision.get("resolved_by_test") or [])) | set(map(str, decision.get("outside_brief") or []))
-    out = []
-    for reviewer, name in V.FILENAMES.items():
-        p = os.path.join(run_dir, name)
-        if not os.path.exists(p) or (reviewer == "critique-presentation" and not drafted):
-            continue
-        try:
-            import yaml
-            with open(p) as fh:
-                doc = yaml.safe_load(fh)
-            # No defaults before the check (Codex on #264, P1): an empty or truncated file, or one without a
-            # `blockers` list (a required key), is unreadable, never "no blockers".
-            why = None if isinstance(doc, dict) and isinstance(doc.get("blockers"), list) else \
-                f"top level is {type(doc).__name__}, or it has no `blockers` list"
-        except Exception as e:  # noqa: BLE001
-            why = f"{type(e).__name__}: {str(e)[:160]}"
-        if why is not None:
-            # The gate refuses to act on such a file (a schema error), so this is not reached from GATE; kept fail
-            # closed for any other caller: an open HIGH, never skipped (external review 2026-11-17).
-            out.append({"id": f"critique_unreadable:{reviewer}", "source": "harness", "severity": "HIGH",
-                        "tested": False, "claim": f"{name} could not be read as a critique ({why})",
-                        "fix_requires": "the critic rewrites its YAML"})
-            continue
-        for b in doc.get("blockers") or []:
-            if (not isinstance(b, dict) or b.get("resolved") or str(b.get("severity")) not in ("HIGH", "MEDIUM")
-                    or str(b.get("id")) in closed):
-                continue
-            if not drafted and V.after_write_item(b):     # the gate's own rule (V._defer_write_findings)
-                continue
-            dw = b.get("done_when")
-            out.append({"id": str(b.get("id")), "source": reviewer, "severity": b.get("severity"),
-                        "kind": FL.CRITIC_KIND,
-                        "tested": dw is not None and not DW.problems(dw), "claim": str(b.get("claim") or ""),
-                        "fix_requires": _remedy(b)})
-    critic_open = {o["id"] for o in out}
-    seen = set()
-    for v in decision.get("rigor_violations") or []:
-        if not (isinstance(v, dict) and str(v.get("severity")) in ("HIGH", "MEDIUM")):
-            continue
-        if v.get("owner_resolution") and v.get("owner_signed") and not v.get("owner_signoff"):
-            continue          # the owner accepted it: the report states the dependence (owner decision (b), hb2 fix 1)
-        fid = FL.gate_id(v)
-        # Every gate finding counts (a resolved blocker whose test fails is done_when_unmet; a missing
-        # presentation review is critique_presentation_missing); only one that restates an open
-        # critic blocker (same id as its key) is a duplicate.
-        # (a regression is its own HIGH finding beside the open one it is keyed by)
-        if (str(v.get("key") or "") in critic_open and v.get("kind") != "done_when_regressed") or fid in seen:
-            continue
-        seen.add(fid)
-        out.append({"id": fid, "source": "harness", "severity": v.get("severity"), "kind": str(v.get("kind") or ""),
-                    "tested": not str(v.get("kind") or "").startswith("critique_done_when_missing"),
-                    "claim": str(v.get("claim") or ""), "fix_requires": _remedy(v)})
-    return out
-
-
-_remedy, short_label = FL.remedy, FL.short_label
-MAX_LANGUAGE_REPAIRS = 2
-# hb2: writer sessions inside WRITE that repair claim references (no round is spent on them)
-MAX_CLAIM_REPAIRS = 2
-CLAIM_REF_KINDS = ("report_claim_unresolved", "report_claim_id_raw", "report_claim_unrendered")
-
-
-def require_judged(d: dict, opened: list | None = None) -> dict:
-    """F6 S1-7: passed, failed and not-judged tests are counted apart (`check_summary`), and a required
-    test (an open HIGH or MEDIUM finding's) that is not judged cannot yield ACCEPT: the finding is
-    declared (rule 3j), like an open finding with no test the fix loop can work to (rule 3m)."""
-    import done_when as DW
-    summ = DW.summary(d.get("done_when_status") or {}, required=("HIGH", "MEDIUM"))
-    d = dict(d, check_summary=summ)
-    nj = summ["required_not_judged"]
-    if d.get("action") != "ACCEPT" or not nj:
-        return d
-    if opened is not None:
-        have = {o["id"] for o in opened}
-        opened += [{"id": i, "source": "done-when", "severity": (d["done_when_status"].get(i) or {}).get("severity"),
-                    "tested": False, "claim": str((d["done_when_status"].get(i) or {}).get("detail") or ""),
-                    "fix_requires": None} for i in nj if i not in have]
-    d.update(action="DECLARE_SCOPE", rule_matched="3j", declared_open=list(nj),
-             rationale=(f"{len(nj)} required test(s) are not judged ({', '.join(nj)}): not judged is not a pass, "
-                        "so they are declared in the write-up (declared_findings.yaml), not accepted."))
-    return d
-
-
-def owner_held(ledger: dict) -> set[str]:
-    """Findings the owner has answered (hb1 cause H): accepted by the owner (or provisionally by the lead). No fix task
-    can work to their test. One still awaiting the owner's answer is not among them (Codex r1 of #344, P1-1): the gate
-    sends it to OWNER_DECISION before anything declares it."""
-    return {f.id for f in ledger.values() if f.status == "owner_accepted"}
-
-
-def owner_accepted_now(run_dir: str, opened: list[dict], lead_ok: bool) -> set[str]:
-    """The open findings whose current kind and remedy class, as this gate reads them, carry the owner's (or, in a lead
-    run, the lead's provisional) accept: the answer binds to that fingerprint (FL.answer_fingerprint; hb2 fix 3: not
-    the critic's wording), so a finding revised into another kind or remedy class since is not among them (Codex r2 of
-    #344, P1-2: the ledger may keep an older remedy). A lead accept never counts for an open critic HIGH finding."""
-    answers = FL.owner_answers(run_dir, lead_ok)
-    led = FL.load(run_dir) if lead_ok else {}
-    out = set()
-    for o in opened:
-        fid = str(o.get("id"))
-        a = FL.answer_for(answers, fid, kind=o.get("kind") or FL.CRITIC_KIND, fix_requires=o.get("fix_requires"),
-                          claim=str(o.get("claim") or ""))
-        if a and a.get("decision") == "accept":
-            if a.get("by") == "lead":
-                lf = led.get(fid)
-                chk_o = dict(o, kind=o.get("kind") or getattr(lf, "kind", None) or FL.CRITIC_KIND,
-                             source=o.get("source") or getattr(lf, "source", None),
-                             severity=o.get("severity") if o.get("severity") is not None else getattr(lf, "severity", None))
-                if not FL.lead_answer_allowed(chk_o, a) or (lf is not None and not FL.lead_answer_allowed(lf, a)):
-                    continue
-            out.add(fid)
-    return out
-
-
-def apply_medium_rule(decision: dict, opened: list[dict], rounds_remaining: int, budget_ok: bool,
-                      owner_held=(), harness_gaps=()) -> dict:
-    """v2: the gate never accepts an open HIGH or MEDIUM finding. Today's rules ACCEPT when no HIGH
-    is open (rule 4); in v2 an open finding with a test goes to the fix loop while rounds and
-    budget remain (rule 4m) and is declared, with the write-up saying so, when they do not (3m).
-    A finding the owner holds (`owner_held`) never goes to the fix loop, which has no task for it: it is
-    declared (harness baseline hb1, malaria R2: two critique rounds ran for an accepted finding). Nor does a declared
-    harness gap (`harness_gaps`, FL.harness_gaps: no file a fix task may edit can fix it; hb2 fix 4, dengue R2 R-001:
-    two critique rounds ran for one): it is declared with what it needs.
-    The decision's action and rationale say what the machine then does."""
-    if decision.get("action") != "ACCEPT" or not opened:
-        return decision
-    d = dict(decision)
-    held = set(map(str, owner_held or ()))
-    gaps = set(map(str, harness_gaps or ()))
-    tested = [f["id"] for f in opened if f["tested"] and str(f["id"]) not in held | gaps]
-    if tested and rounds_remaining > 0 and budget_ok:
-        d.update(action="PATCH_OR_RETHINK", rule_matched="4m", open_tested=tested,
-                 rationale=(f"No HIGH finding is open, but {len(tested)} finding(s) with a test are "
-                            f"({', '.join(tested)[:300]}) and {rounds_remaining} round(s) remain: they go to the "
-                            "fix loop before ACCEPT."))
-    else:
-        why = "no rounds remain" if rounds_remaining <= 0 else ("the budget is used" if not budget_ok
-                                                                 else "none has a test the fix loop can work to")
-        mine = sorted(str(f["id"]) for f in opened if str(f["id"]) in held)
-        gap = sorted(str(f["id"]) for f in opened if str(f["id"]) in gaps and str(f["id"]) not in held)
-        if (mine or gap) and rounds_remaining > 0 and budget_ok:
-            why = "; ".join(x for x in (
-                f"the owner's answer, not a fix task, decides {', '.join(mine)[:200]}" if mine else "",
-                f"only a harness change can fix {', '.join(gap)[:200]} (declared harness gaps)" if gap else "") if x)
-        d.update(action="DECLARE_SCOPE", rule_matched="3m", declared_open=[f["id"] for f in opened],
-                 rationale=(f"{len(opened)} HIGH/MEDIUM finding(s) are still open and {why}: they are declared "
-                            "in the write-up (declared_findings.yaml), not accepted."))
-    return d
-
-
-def held_entry_id(b: dict, decision: dict) -> str | None:
-    """The ledger id of a gate's unresolved HIGH that the owner may hold: a critic's blocker (its id), or a harness
-    finding whose kind only the owner's answer resolves and no fix task can work on: a declared decision test that did
-    not run (hb3 fix 4; Codex r1 of #375 P2-5), whose RIG entry is matched to its rigor violation by kind and claim.
-    None for any other gate finding: it keeps the round."""
-    if str(b.get("reviewer") or "").startswith("critique"):
-        return str(b.get("id"))
-    if b.get("kind") not in FL.NOT_RUN_KINDS:
-        return None
-    for v in decision.get("rigor_violations") or []:
-        if isinstance(v, dict) and v.get("kind") == b.get("kind") \
-                and f"{v.get('stage', '?')}/{v.get('kind')}: {v.get('claim', '')}" == b.get("claim"):
-            return FL.gate_id(v)
-    return None
-
-
-def apply_held_rule(decision: dict, ledger: dict, owner_held=(), harness_gaps=(), opened=None) -> dict:
-    """hb2 fix 1: a gate that patches (rule 2) only for critic findings the owner holds (accepted) or the fix planner
-    declared harness gaps has nothing a fix task can do: they are declared now (rule 3h), as rule 3m declares them when
-    no HIGH is open, instead of a fix loop with no task and another critique round (malaria R2, dengue R2). An accepted
-    declared decision test that did not run is held the same way (held_entry_id; #375). Never with another
-    gate finding, a required artifact missing or a structural mismatch open, nor while any open finding with a test
-    (`opened`, a MEDIUM too) is neither the owner's nor a gap: the fix loop works to it (Codex r1 of #357, P1-3)."""
-    if decision.get("action") != "PATCH_OR_RETHINK" or str(decision.get("rule_matched")) != "2" \
-            or decision.get("accept_blockers") or decision.get("structural_mismatch"):
-        return decision
-    keep = set(map(str, owner_held or ())) | set(map(str, harness_gaps or ()))
-    hi = [b for b in decision.get("unresolved_high") or [] if isinstance(b, dict)]
-    hid = [held_entry_id(b, decision) for b in hi]
-    if not hi or len(hi) != len(decision.get("unresolved_high") or []) or not all(
-            i is not None and i in keep and i in ledger for i in hid):
-        return decision
-    if opened is None:
-        return decision
-    work = [str(o.get("id")) for o in opened if o.get("tested") and str(o.get("id")) not in keep]
-    if work:      # these keep the round: they are what the fix loop works to (Codex r3 of #357, P2-12)
-        return dict(decision, open_tested=work)
-    ids = sorted(hid)
-    return dict(decision, action="DECLARE_SCOPE", rule_matched="3h", declared_open=[o["id"] for o in opened],
-                rationale=(f"{len(ids)} HIGH finding(s) are open ({', '.join(ids)[:200]}), each one the owner answered "
-                           "or a declared harness gap: no fix task can work on them, so they are declared in the "
-                           "write-up (declared_findings.yaml) now, not accepted."))
-
-
-def scope_request_view(d: dict) -> dict:
-    """What the AWAIT_OWNER route asks: under rule 2o (rounds left) only the findings whose resolution is the owner's;
-    a policy-mapped owner item is asked at the round cap, as before (Codex r1 of #357, P1-4: the request held both,
-    and an answer to the decision test alone could not release the run)."""
-    if not isinstance(d, dict) or str(d.get("rule_matched")) != "2o":
-        return d
-    keep = lambda b: not (isinstance(b, dict) and b.get("owner_signoff")) or b.get("owner_resolution")  # noqa: E731
-    return dict(d, unresolved_high=[b for b in d.get("unresolved_high") or [] if keep(b)],
-                accept_blockers=[b for b in d.get("accept_blockers") or [] if keep(b)])
-
-
-DECLARED_FILE = "declared_findings.yaml"
-
-
-def _ledger_claims(run_dir: str) -> dict | None:
-    """The claims ledger's valid claims, or None when there is no ledger or it cannot be read."""
-    lp = os.path.join(run_dir, "models", "claims_ledger.yaml")
-    if not os.path.exists(lp):
-        return None
-    try:
-        import render_claims as RCL
-        return RCL.load_claims_tolerant(lp)[0]
-    except Exception:  # noqa: BLE001 -- report_claim_findings reports the unreadable ledger
-        return None
-
-
-def _quoted(text, claims: dict | None):
-    """A finding's text for the writer, who repeats it in full: no reference outside the ledger (hb2, dengue R2)."""
-    import render_claims as RCL
-    return RCL.quote_refs(text, claims or {}, render=False) if isinstance(text, str) else text
-
-
-def write_declared(run_dir: str, opened: list[dict], decision: dict) -> None:
-    import yaml
-    known = _ledger_claims(run_dir)
-    try:            # a declared harness gap keeps the planner's reason and what it needs (Codex r3 of #357, P2-13)
-        led = FL.load(run_dir)
-        gaps = FL.harness_gaps(led)
-        gap_note = {i: next((e.get("note") for e in reversed(led[i].events or []) if isinstance(e, dict)
-                             and e.get("status") == FL.HARNESS_GAP), None) for i in gaps}
-    except Exception:  # noqa: BLE001 -- the declaration is written without it
-        gap_note = {}
-    _put(run_dir, DECLARED_FILE, yaml.safe_dump({
-        "rule": decision.get("rule_matched"), "rationale": decision.get("rationale"),
-        "declared": [{"id": o["id"], "severity": o["severity"], "source": o["source"],
-                      "label": _quoted(short_label(o["claim"]), known), "claim": _quoted(o["claim"], known),
-                      "required_remedy": _quoted(o.get("fix_requires"), known), "tested": bool(o.get("tested")),
-                      **({"harness_gap": _quoted(gap_note[o["id"]], known)} if gap_note.get(o["id"]) else {})}
-                     for o in opened]}, sort_keys=False, width=10**6))
 
 
 # ---- provenance of inputs
@@ -1099,225 +446,7 @@ def record_cited_inputs(run_dir: str, derived_inputs: bool = True) -> list[str]:
     return probs
 
 
-# ---- claims in the write-up
-def report_claim_findings(run_dir: str) -> list[dict]:
-    """The report must show values, never claim ids: an unresolved [CLAIM:id], or a claims-ledger id
-    left bare in the text the writer wrote, is a HIGH write-up finding (not declarable)."""
-    import re
-    rp, lp = os.path.join(run_dir, "manuscript.md"), os.path.join(run_dir, "models", "claims_ledger.yaml")
-    if not (os.path.exists(rp) and os.path.exists(lp)):
-        return []
-    try:
-        import render_claims as RCL
-        claims, invalid = RCL.load_claims_tolerant(lp)
-    except Exception as e:  # noqa: BLE001 -- fail closed
-        return [{"kind": "report_claims_unreadable", "severity": "HIGH", "stage": "WRITE", "target_stage": "WRITE",
-                 "key": "claims", "scope_declarable": False, "claim": f"claims ledger unreadable: {e}"}]
-    # The writer's own text, all of it: what the harness appends is not in manuscript.md, so no
-    # marker the writer could copy can hide anything. Read as render_report renders it: a known id alone in
-    # inline code is its reference (render_claims.normalise_refs).
-    text = RCL.normalise_refs(open(rp).read(), claims)
-    # One invalid claim is its own finding (the valid ones still render: render_report); still HIGH and not
-    # declarable, as the whole-ledger refusal it replaces was.
-    out = [{"kind": "report_claim_invalid", "severity": "HIGH", "stage": "WRITE", "target_stage": "WRITE", "key": cid,
-            "scope_declarable": False, "claim": f"The claims ledger's entry {cid} is invalid and cannot be rendered: {why}"}
-           for cid, why in sorted(invalid.items())]
-    # A reference is read as the renderer reads it (render_claims.render_text strips the id).
-    refs = {c if "\n" in c else c.strip() for c in re.findall(r"\[CLAIM:([^\]]*)\]", text)}   # no id spans lines
-    for cid in sorted(refs - set(claims) - set(invalid)):
-        out.append({"kind": "report_claim_unresolved", "severity": "HIGH", "stage": "WRITE", "target_stage": "WRITE",
-                    "key": cid, "scope_declarable": False,
-                    "claim": f"The report has [CLAIM:{cid}], which is not in the claims ledger."})
-    bare = re.sub(r"\[CLAIM:[^\]\n]*\]", " ", text)       # an id inside a reference is not a bare id
-    for cid in sorted(c for c in claims if "." in c or "_" in c):     # a plain word is not an id
-        if re.search(r"(?<![A-Za-z0-9_.:\-])" + re.escape(cid) + r"(?![A-Za-z0-9_\-]|\.[A-Za-z0-9_])", bare):
-            out.append({"kind": "report_claim_id_raw", "severity": "HIGH", "stage": "WRITE", "target_stage": "WRITE",
-                        "key": cid, "scope_declarable": False,
-                        "claim": f"The report shows the claim id {cid} instead of its value: write [CLAIM:{cid}]."})
-    typed = typed_numbers(text, given_values(run_dir, claims))
-    rp2 = os.path.join(run_dir, "report.md")
-    if os.path.exists(rp2):
-        # a reference to an invalid claim is reported once, as invalid (the ledger's, not the writer's to repair)
-        left = [x for x in re.findall(r"\[CLAIM:([^\]]*)\]", open(rp2).read()) if x.strip() not in invalid]
-        if left:
-            out.append({"kind": "report_claim_unrendered", "severity": "HIGH", "stage": "WRITE", "target_stage": "WRITE",
-                        "key": "unrendered", "scope_declarable": False,
-                        "claim": f"The report still shows {len(left)} claim reference(s) ({', '.join(sorted(set(left))[:5])}), "
-                                 "e.g. inside code; write [CLAIM:id] in plain text."})
-    if typed:
-        # A text heuristic with a measured false-positive rate of 45% or more (design note §13): LOW,
-        # advisory. It is reported (findings.jsonl, the presentation critic's input) but never blocks,
-        # goes to the fix loop or is declared. It goes back up only after structural exemptions for its
-        # false-positive classes and a new measurement. The structural cases above stay HIGH.
-        out.append({"kind": "report_number_typed", "severity": "LOW", "stage": "WRITE", "target_stage": "WRITE",
-                    "key": "numbers", "scope_declarable": True,
-                    "claim": f"The writer typed {len(typed)} number(s) ({', '.join(typed[:8])}) that are not in the spec, "
-                             "the claims ledger or the question; write each as a [CLAIM:id] the harness renders."})
-    return out
-
-
-ACCEPTANCE_MANIFEST = os.path.join(REPO, ".claude", "orchestration", "acceptance_language.yaml")
-
-
-def load_acceptance_language(path: str = ACCEPTANCE_MANIFEST) -> dict:
-    """The acceptance-language manifest. Raises on a missing or malformed file (callers fail closed)."""
-    import yaml
-    with open(path, encoding="utf-8") as f:
-        doc = yaml.safe_load(f) or {}
-    if not isinstance(doc.get("terms"), list) or not doc["terms"] or not isinstance(doc.get("status_lines"), dict):
-        raise ValueError(f"{os.path.basename(path)}: needs a non-empty `terms` list and `status_lines`")
-    for t in doc["terms"]:
-        if not (isinstance(t, dict) and isinstance(t.get("id"), str) and isinstance(t.get("pattern"), str)):
-            raise ValueError(f"{os.path.basename(path)}: each term needs a string id and pattern")
-        re.compile(t["pattern"])
-    for k in ("negations", "allowed", "attributions"):
-        v = doc.get(k) or []
-        if not isinstance(v, list) or not all(isinstance(x, str) and x for x in v):
-            raise ValueError(f"{os.path.basename(path)}: `{k}` must be a list of quoted strings "
-                             "(YAML reads an unquoted no as false)")
-    return doc
-
-
-def acceptance_language_hits(text: str, status: str | None, manifest: dict | None = None) -> list[str]:
-    """Each use of an acceptance term ("<term id>: <context>") in a report whose status is not an accepted one."""
-    m = manifest or load_acceptance_language()
-    if status in (m.get("accepted_statuses") or []):
-        return []
-    for a, b in (("\u2018", "'"), ("\u2019", "'"), ("\u201c", '"'), ("\u201d", '"')):
-        text = text.replace(a, b)
-    for a in m.get("allowed") or []:
-        text = re.sub(a, " ", text, flags=re.I)
-    att = "|".join(re.escape(a) for a in m.get("attributions") or [])
-    if att:
-        text = re.sub(r'(\b(?:%s)\w*\b[^"\n.]{0,60})"[^"\n]{0,400}"' % att, r"\1 ", text, flags=re.I)
-    text = re.sub(r"\n(?![ \t]*(?:[\n#>|*+-]|\d+[.)]\s))", " ", text)
-    negs = {n.lower() for n in m.get("negations") or []}
-    win = int(m.get("negation_window", 3))
-    out = []
-    for t in m["terms"]:
-        for hit in re.finditer(t["pattern"], text, re.I):
-            clause = re.split(r"[.;:!?,()\n]|\bbut\b", text[max(0, hit.start() - 120):hit.start()], flags=re.I)[-1]
-            before = re.findall(r"[a-z']+", clause.lower())[-win:]
-            if any(w in negs or w.endswith("n't") for w in before):
-                continue
-            ctx = " ".join(text[max(0, hit.start() - 60):hit.end() + 60].split())
-            out.append(f"{t['id']}: ...{ctx}...")
-    return out
-
-
-def report_acceptance_findings(run_dir: str, write_mode: str | None) -> list[dict]:
-    """F6 S1-7: a declared-scope or not-accepted write-up uses no acceptance language (the terms are in
-    .claude/orchestration/acceptance_language.yaml). MEDIUM: a
-    write-up fix the loop can make, declared when it cannot."""
-    if write_mode not in ("declared", "not_accepted"):
-        return []
-    try:
-        text = open(os.path.join(run_dir, "manuscript.md")).read()
-    except OSError:
-        return []
-    try:
-        hits = acceptance_language_hits(text, "completed_scope_declared" if write_mode == "declared" else "not_accepted")
-    except Exception as e:  # noqa: BLE001 -- fail closed
-        hits = [f"the check could not run ({type(e).__name__}: {e})"]
-    if not hits:
-        return []
-    return [{"kind": "report_acceptance_language", "severity": "MEDIUM", "stage": "WRITE", "target_stage": "WRITE",
-             "key": "acceptance", "scope_declarable": True,
-             "claim": (f"The write-up is {'declared scope' if write_mode == 'declared' else 'not accepted'} but uses "
-                       f"acceptance language ({len(hits)}): " + "; ".join(hits)
-                       + ". Say what was tested and what is declared.")}]
-
-
-_SUFFIX = {"k": 1e3, "m": 1e6, "b": 1e9, "bn": 1e9}
-
-
-def given_values(run_dir: str, claims: dict | None = None) -> list[float]:
-    """Numbers a report may show as typed: those in the signed spec and the question (the owner's
-    facts), and every number in the claims ledger, the interval level included (0.95 is also 95)."""
-    import re
-    texts = []
-    try:
-        texts.append(open(os.path.join(run_dir, AB.SPEC_FILE)).read())
-    except OSError:
-        pass
-    try:   # the question only: not timestamps or other run metadata
-        texts.append(str(json.load(open(os.path.join(run_dir, "metadata.json"))).get("question") or ""))
-    except (OSError, ValueError):
-        pass
-    vals = []
-    for t in texts:
-        vals += [float(g.replace(",", "")) for g in re.findall(r"\d[\d,]*(?:\.\d+)?", t)]
-
-    def walk(x):
-        if isinstance(x, bool):
-            return
-        if isinstance(x, (int, float)):
-            vals.append(float(x))
-        elif isinstance(x, dict):
-            for v in x.values():
-                walk(v)
-        elif isinstance(x, (list, tuple)):
-            for v in x:
-                walk(v)
-    walk(list((claims or {}).values()))
-    vals += [v * 100 for v in list(vals) if 0 < abs(v) <= 1]          # proportions written as percentages
-    return vals
-
-
-def typed_numbers(text: str, given: list[float]) -> list[str]:
-    """Numbers typed in `text` outside [CLAIM:] references that match none of `given` at the precision
-    they are written with. Not years or year ranges, list or heading numbering, or digits inside an
-    identifier (D09, DT1, R-004)."""
-    import math
-    import re
-    bare = re.sub(r"\[CLAIM:[^\]]*\]", " ", text)
-    bare = re.sub(r"(?m)^\s*(#+\s*)?\d+[.)]\s", " ", bare)
-    num = re.compile(r"(?<![A-Za-z0-9_.])[-+\u2212]?\d[\d,]*(?:\.\d+)?(?:[eE][-+]?\d+)?(?:\s?(?:[kKmMbB]n?|%))?(?![A-Za-z0-9_])")
-    out = []
-    for m_ in num.finditer(bare):
-        t = m_.group(0).rstrip(",")
-        before = bare[max(0, m_.start() - 1):m_.start()]
-        if t[0] in "-+\u2212" and before and (before.isalnum() or before == "_"):
-            continue                                  # an identifier such as R-004
-        mant = re.match(r"[-+\u2212]?([\d,]*(?:\.\d+)?)", t).group(1).replace(",", "")
-        rest = t[len(re.match(r"[-+\u2212]?[\d,]*(?:\.\d+)?", t).group(0)):].strip()
-        if re.fullmatch(r"(19|20)\d\d", mant) and not rest:
-            continue                                  # a year, or one end of a year range
-        try:
-            v = float(mant)
-        except ValueError:
-            continue
-        exp = re.match(r"[eE]([-+]?\d+)", rest)
-        if exp:
-            v *= 10 ** int(exp.group(1))
-            rest = rest[exp.end():].strip()
-        mult = _SUFFIX.get(rest.lower(), 1.0)
-        v *= mult
-        digits = mant.replace(".", "").lstrip("0") or "0"
-        sig = max(1, len(digits))
-        def same(g):
-            if g == 0 or v == 0:
-                return g == v
-            return float(f"{abs(g):.{sig}g}") == round(abs(v), 12) or math.isclose(abs(g), abs(v), rel_tol=1e-9)
-        if any(same(g) for g in given):
-            continue
-        out.append(t)
-    return out
-
-
 # ------------------------------------------------------------------ sign-off
-def signed_hash(run_dir: str) -> str | None:
-    """sha256 of decision_spec.yaml as a file (the owner signs all of it, as workstream B does)."""
-    p = os.path.join(run_dir, AB.SPEC_FILE)
-    if os.path.islink(p):
-        return None
-    try:
-        with open(p, "rb") as f:
-            return hashlib.sha256(f.read()).hexdigest()
-    except OSError:
-        return None
-
-
 def _signoff(run_dir: str) -> dict | None:
     try:
         return json.load(open(os.path.join(run_dir, SIGNOFF_FILE)))
@@ -1334,28 +463,6 @@ def sign(run_dir: str, by: str, note: str = "", expect_sha256: str | None = None
         expect_sheet_sha256=expect_sheet_sha256)
 
 
-POST_CHOICE_STATES = ("ENGINE_BUILD", "ENGINE_ADMIT", "ENGINE_REVIEW", "ENGINE_SIGN",
-                      "PREREGISTER", "CONFIGURE", "ANALYZE", "SCORE", "CRITIQUE", "GATE", "FIX_LOOP", "OWNER_DECISION",
-                      "WRITE", "PRESENTATION")
-POST_ENGINE_SIGN_STATES = ("PREREGISTER", "CONFIGURE", "ANALYZE", "SCORE", "CRITIQUE", "GATE", "FIX_LOOP",
-                           "OWNER_DECISION", "WRITE", "PRESENTATION")
-
-
-def spec_has_engine_build(run_dir: str) -> bool:
-    """True when `decision_spec.yaml` in `run_dir` declares an `engine.build` request (single-link no-follow read)."""
-    import yaml
-    from lib.safe_io import read_nofollow
-    from toolkit.spec import schema as _SCH
-    try:
-        raw, st_f = read_nofollow(run_dir, AB.SPEC_FILE)
-        if st_f.st_nlink > 1:
-            return False
-        doc = yaml.safe_load(raw.decode("utf-8"))
-        return isinstance(doc, dict) and _SCH.engine_has_build(doc.get("engine"))
-    except Exception:  # noqa: BLE001
-        return False
-
-
 def evidence_gate(run_dir: str, engine: tuple | None = None, signoff: str | None = None) -> list[str]:
     """F6 (#218): the registered preconditions of a signed run, recomputed from its files (the sign-off record
     compared; the engine chosen in engine_choice.json, or `engine`): checked at ENGINE_CHOICE on the engine picked and
@@ -1370,103 +477,6 @@ def evidence_gate(run_dir: str, engine: tuple | None = None, signoff: str | None
 
 
 AWAITING_SPEC_AMENDMENT = "awaiting_spec_amendment"
-SPEC_RETHINK_REQUEST = "spec_rethink_request.json"
-# lead-gaps β: under --signoff lead a rethink of the signed spec with a valid patch becomes a child run (toolkit/spec/
-# amend.py), signed provisionally by the lead; the parent ends with this status and the run continues in the child.
-AMENDED_PROVISIONAL = "amended_provisional"
-AMENDMENT_RECORD = "amendment_record.json"           # toolkit/spec/amend.py RECORD
-# held by a --signoff lead run across its amendment and hand-off; under analysis/ (reserved for every run, so no
-# owner-mode deliverable path changes: Codex r3) and never copied into a child (.lock)
-AMEND_LOCK = "analysis/spec_amendment.lock"
-LEGACY_BRIEF_SIGNOFF = ("decision_brief.signoff.json",)      # scripts/decision_brief.py SIGNOFF (the v1 brief)
-
-
-class AmendmentLocked(RuntimeError):
-    """Another process holds the parent's amendment lock, or has already handed the run to its child: this resume
-    stops with nothing written (owner decision on #330). `run_dir`: the run whose lock is held (main.py stores a
-    parent it finished up to a child another process holds: Codex r1 of #349)."""
-
-    def __init__(self, msg: str, run_dir: str | None = None):
-        super().__init__(msg)
-        self.run_dir = run_dir
-
-
-_LOCK_HELD = __import__("threading").local()
-
-
-class _amend_lock:
-    """An exclusive, non-blocking lock on <run>/analysis/spec_amendment.lock (lib.safe_io, no link followed; flock is
-    per open file, so two processes, or two machines in two threads, exclude each other). Nests within one thread (a
-    lead run holds it from run_v2 through its amendment and hand-off). A second holder raises AmendmentLocked."""
-
-    def __init__(self, run_dir: str):
-        self.run_dir, self.f = run_dir, None
-        self.key = os.path.realpath(os.path.join(run_dir, AMEND_LOCK))
-
-    def __enter__(self):
-        held = _LOCK_HELD.__dict__.setdefault("depth", {})
-        if held.get(self.key):
-            held[self.key] += 1
-            return self
-        import fcntl
-        from lib.safe_io import open_append_nofollow
-        f = open_append_nofollow(self.run_dir, AMEND_LOCK)
-        try:
-            fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            f.close()
-            raise AmendmentLocked(f"another process is amending {self.run_dir} ({AMEND_LOCK} is held): this resume "
-                                  "stops with nothing written; resume again once that process has ended",
-                                  run_dir=self.run_dir) from None
-        except BaseException:
-            f.close()
-            raise
-        self.f = f
-        held[self.key] = 1
-        return self
-
-    def __exit__(self, *exc):
-        held = _LOCK_HELD.__dict__.setdefault("depth", {})
-        held[self.key] -= 1
-        if held[self.key]:
-            return False
-        del held[self.key]
-        import fcntl
-        try:
-            fcntl.flock(self.f, fcntl.LOCK_UN)
-        finally:
-            self.f.close()
-        return False
-
-
-def _spec_signed_sha(run_dir: str) -> str | None:
-    """The spec sha256 a sign-off record binds (the spec's own record, or a brief's that hashed the spec), or None."""
-    import re as _re
-    hexd = _re.compile(r"[0-9a-f]{64}")
-
-    def nested(r):
-        m = r.get("sha256")
-        return m.get(AB.SPEC_FILE) if isinstance(m, dict) else (False if m is not None else None)
-    def own(r):        # the spec's own record: spec_sha256 (spike) or the nested map (toolkit); a present but empty
-        v = r.get("spec_sha256") or nested(r)          # spec_sha256 with no nested digest is not a binding: unreadable
-        return False if v is None and "spec_sha256" in r else v
-    for f, get in ((SIGNOFF_FILE, own),
-                   ("decision_brief.signoff.json", nested)):
-        p = os.path.join(run_dir, f)
-        if not os.path.lexists(p):
-            continue
-        try:
-            rec = json.load(open(p))
-        except (OSError, ValueError):
-            return "unreadable"          # fail closed: an unreadable record still protects the spec (#261 re-review)
-        if not isinstance(rec, dict):
-            return "unreadable"
-        v = get(rec)
-        if v is False or (v is not None and not (isinstance(v, str) and hexd.fullmatch(v))):
-            return "unreadable"          # a malformed binding is not a signature (narrow Codex review of #272)
-        if v:
-            return v
-    return None
 
 
 def spec_signed_once(run_dir: str) -> bool:
@@ -1539,21 +549,6 @@ def drop_declined(run_dir: str, ids) -> None:
         _put(run_dir, DECLARED_FILE, yaml.safe_dump(dict(doc, declared=keep), sort_keys=False, width=10**6))
 
 
-def apply_owner_declines(decision: dict, ledger: dict) -> dict:
-    """Codex review of #258 P1-11: a finding the owner declined (the run may not go on without it) holds the gate: a
-    decision that would accept or declare is not accepted instead, with the decline as a non-declarable finding, so the
-    run ends completed_scope_declined (route_gate) once the write-up is gated."""
-    fixed = set(map(str, decision.get("resolved_by_test") or []))     # its test passes: the decline is moot
-    declined = sorted(f.id for f in ledger.values() if f.status == "owner_declined" and f.id not in fixed)
-    if not declined or decision.get("action") not in ("ACCEPT", "DECLARE_SCOPE"):
-        return decision
-    held = [{"kind": "scope_declaration_declined", "finding": fid, "severity": "HIGH", "scope_declarable": False,
-             "claim": f"the owner declined to let the run go on without {fid}"} for fid in declined]
-    return dict(decision, action="RUN_FAILED", rule_matched="owner_declined",
-                unresolved_high=list(decision.get("unresolved_high") or []) + held,
-                rationale=f"the owner declined {', '.join(declined)[:200]}: the run is not accepted or declared")
-
-
 def request_owner_amendments(run_dir: str, round_n: int, ledger: dict, ids: list[str]) -> dict:
     """F6 run 3: the findings whose remedy is an owner amendment of the signed spec, written as a request in
     scripts/scope_signoff.py's format, so the owner reads it with `scope_signoff.py show` and answers with `sign`
@@ -1587,7 +582,7 @@ def request_owner_amendments(run_dir: str, round_n: int, ledger: dict, ids: list
 
 
 # ------------------------------------------------------------------ the machine
-class Machine:
+class Machine(EngineBuildMixin):
     def __init__(self, run_dir: str, tasks, state: RunState | None = None, backend=None, log=print,
                  cross_engine_check: bool = True):
         self.run_dir = os.path.abspath(run_dir)
@@ -1598,20 +593,16 @@ class Machine:
         st = load_state(self.run_dir)
         eff = st or state
         need_lock = eff is not None and (
-            eff.signoff == "lead"
-            or eff.state in ("ENGINE_BUILD", "ENGINE_ADMIT", "ENGINE_REVIEW", "ENGINE_SIGN")
+            eff.state in ("ENGINE_BUILD", "ENGINE_ADMIT", "ENGINE_REVIEW", "ENGINE_SIGN")
             or bool(getattr(eff, "engine_build", None))
             or spec_has_engine_build(self.run_dir)
         )
         if need_lock:
-            # a lead or built-engine run's state is read again and written back under the run lock, so two
-            # processes cannot race on hand-off, build tries, or hidden-seed commitment (Codex r3 #342, BE31)
-            with _amend_lock(self.run_dir):
+            # a built-engine run's state is read again and written back under _run_lock (BE31)
+            with _run_lock(self.run_dir):
                 self._load(load_state(self.run_dir), state)
         else:
             self._load(st, state)
-        self.seed_fn = getattr(tasks, "world_model_seed", None)    # §14: the world model's seed task, when the tasks have one
-        self.wm_repo = REPO                                         # where the beliefs are anchored (wm-trials)
 
     def _load(self, st: RunState | None, state: RunState | None) -> None:
         self.st = st or state
@@ -1620,11 +611,7 @@ class Machine:
         self._settle_interrupted()
         save_state(self.run_dir, self.st)
 
-    def persist(self) -> None:
-        # Named persist, not save, only because scripts/write_audit.py WA3 reads any `<obj>.save()` call as PIL's
-        # image save (a false positive): this writes run_state.json through save_state -> lib.safe_io.write_nofollow,
-        # atomic. The heuristic's own-module exemption cannot see a method defined in another module (the caller is
-        # agents/world_model_stage.py), so it was not changed.
+    def _save(self) -> None:
         save_state(self.run_dir, self.st)
 
     def _charge_interrupted_entry(self, j: dict) -> None:
@@ -1668,7 +655,6 @@ class Machine:
         self.st.state = to
         if to == "FINAL":
             self.st.status = self.st.forced_status or status or "completed_gate_error"
-            self._withhold_if_acceptance_language()
             if frm == "GATE" and (self.st.last_gate or {}).get("post_write") and self.st.last_gate.get("action") \
                     and self.st.status in DELIVERED_STATUSES:     # a gate decision that delivers the report (Codex r2)
                 _retire_stale_withheld(self.run_dir)
@@ -1809,13 +795,13 @@ class Machine:
         if s in ("CRITIQUE", "FIX_LOOP") and not self._has_draft():
             self.st.write_mode = "not_accepted"
             return self._go("WRITE", "budget used: the harness writes the report")
-        if s in ("CRITIQUE", "FIX_LOOP", "PRESENTATION", "WRITE"):
+        if s in ("CRITIQUE", "FIX_LOOP", "WRITE"):
             return self._go("FINAL", "budget used")
         return self._go("FINAL", "budget used before the model was built", "budget_exhausted")
 
     def _budget(self, writeup: bool = False) -> dict | None:
-        """What is left under the cap: less the write-up reserve, except for the write-up's own tasks (WRITE and
-        the PRESENTATION review of its draft), which the reserve is held for."""
+        """What is left under the cap: less the write-up reserve, except for the write-up's own tasks (WRITE and its
+        inline presentation review), which the reserve is held for."""
         cap = self.st.budget_usd
         if not cap:
             return None
@@ -1918,20 +904,6 @@ class Machine:
                     found.append(tok)
         return found
 
-    def _has_built_engine(self) -> bool:
-        return bool(isinstance(self.st.engine_build, dict) and self.st.engine_build.get("id"))
-
-    def _engine_repairs_left(self) -> bool:
-        return int((self.st.engine_build or {}).get("repairs") or 0) < MAX_ENGINE_REPAIRS
-
-    def _engine_tamper_problems(self) -> list[str]:
-        """Verify signed built-engine snapshot bytes after ENGINE_SIGN (§5.1). Empty when clean or not signed."""
-        eb = self.st.engine_build if isinstance(self.st.engine_build, dict) else {}
-        if eb.get("status") != "signed":
-            return []
-        from toolkit.engines.built import snapshot as BSNAP
-        return BSNAP.verify_engine_snapshot(self.run_dir)
-
     def _geometry_findings(self) -> list[dict]:
         """The standing input geometry check (toolkit/spec/geometry.py, docs/design/v2-input-geometry.md): the units'
         coordinates and areas against the declared boundaries, re-run on the current files at every gate."""
@@ -2027,7 +999,8 @@ class Machine:
                         out.append(f"{reviewer}: {sm.get('description')}")
                     for b in doc.get("blockers") or []:       # its own text: not every reviewer's is in the ledger
                         if isinstance(b, dict) and b.get("category") == "STRUCTURAL" and not b.get("resolved"):
-                            out.append(f"{b.get('id')}: {b.get('claim')}" + (f" Required: {_remedy(b)}" if _remedy(b) else ""))
+                            rem = FL.remedy(b)
+                            out.append(f"{b.get('id')}: {b.get('claim')}" + (f" Required: {rem}" if rem else ""))
                             seen.add(str(b.get("id")))
                 except Exception:  # noqa: BLE001 -- the gate already judged the file; here it only adds reasons
                     continue
@@ -2080,15 +1053,13 @@ class Machine:
             if acq_tamper:
                 _withhold_report(self.run_dir)
                 return self._go("FINAL", f"acquired inventory tampered: {acq_tamper}", "artifact_tampered")
-        # PRESENTATION is not checked here: its one task is a write-up task, and _task replays a completed review
-        # before it looks at the budget (h_PRESENTATION takes the budget path when there is no allowance).
-        if s in LLM_STATES and s != "PRESENTATION" and self._out_of_budget():
+        if s in LLM_STATES and s != "WRITE" and self._out_of_budget():
             return self._budget_out(s)
         try:
             if s in ("ENGINE_BUILD", "ENGINE_ADMIT", "ENGINE_REVIEW", "ENGINE_SIGN") or (
                 s == "ENGINE_CHOICE" and spec_has_engine_build(self.run_dir)
             ):
-                with _amend_lock(self.run_dir):
+                with _run_lock(self.run_dir):
                     return getattr(self, "h_" + s)()
             return getattr(self, "h_" + s)()
         except AwaitingBudget:            # _task recorded the pause; the journal makes the handler safe to re-run
@@ -2177,13 +1148,6 @@ class Machine:
         if self.st.paused == AWAITING_ENGINE_SIGNOFF:
             why = ("admitted agent-built engine awaits sign-off: inspect engine_build/admission_sheet.md and run "
                    f"`python3 toolkit/engines/built/signoff.py sign {self.run_dir} --by owner` (or `decline --note ...`)")
-        if self.st.paused == AWAITING_SPEC_AMENDMENT:
-            try:
-                la = json.load(open(os.path.join(self.run_dir, SPEC_RETHINK_REQUEST))).get("lead_amendment")
-            except (OSError, ValueError, AttributeError):
-                la = None
-            if isinstance(la, dict) and la.get("status") == "refused":
-                why = f"{why}; the lead amendment was refused: {la.get('why')}".lstrip("; ")
         if self.st.paused == "awaiting_scope_signoff":
             ent_idx = max((idx for idx, x in enumerate(h) if x.get("to") == "OWNER_DECISION"), default=-1)
             ref_idx = max((idx for idx, x in enumerate(h)
@@ -2358,16 +1322,6 @@ class Machine:
         self._write_meta()
         return self._go("SPEC", f"acquired {len(newly_promoted)} file(s) (round {round_n})")
     def h_SPEC(self):
-        if self.st.signoff == "lead" and (self.st.tries.get("spec_amendment") or spec_signed_once(self.run_dir)) \
-                and not getattr(self, "_in_amend_lock", False):
-            # owner decision on #330 (Codex r3): the request is written only under the amendment lock, so a resumer that
-            # loses the lock writes nothing
-            with _amend_lock(self.run_dir):
-                self._in_amend_lock = True
-                try:
-                    return self.h_SPEC()
-                finally:
-                    self._in_amend_lock = False
         if self.st.tries.get("spec_amendment") or spec_signed_once(self.run_dir):
             # F6 run 3 (gap 2): a rethink of a signed spec is the owner's amendment, never a redraft in this run (an
             # amended spec cannot be re-signed in a signed run dir): the request, then a pause; the owner amends and
@@ -2381,10 +1335,6 @@ class Machine:
             if ev != "present":
                 self.log(f"[machine] WARNING: the spec's sign-off record is {ev}; the amendment pause holds, but the "
                          "relaunch must start from a signed spec")
-            if self.st.signoff == "lead" and ev == "present":
-                done = self._lead_amend(req)
-                if done:
-                    return done
             self.st.tries["spec_amendment"] = True     # honoured on resume, whatever a restored copy lost (#261 P1-2)
             self.st.paused, self.st.status = AWAITING_SPEC_AMENDMENT, None
             save_state(self.run_dir, self.st)
@@ -2443,11 +1393,6 @@ class Machine:
                             extra={"feedback": list(self.st.tries["spec_feedback"])})
         self.st.tries.pop("spec_feedback", None)
         self.st.tries.pop("spec_feedback_checked", None)
-        if not self._review_conditions(self.st.signoff, defer=False):
-            # Codex narrow round P1: the conditions exist before the run ever asks for a signature (owner 2026-11-21)
-            self.st.tries["spec_feedback"] = ["review conditions could not be prepared for signing"]
-            return self._go("SPEC", "review conditions could not be prepared for signing",
-                            extra={"feedback": list(self.st.tries["spec_feedback"])})
         return self._go("EVIDENCE", "spec drafted and valid")
 
     def _spec_checks(self, rd: str) -> list[str]:
@@ -2545,155 +1490,6 @@ class Machine:
                 f"{EDR.ED.DOSSIER_FILE}"]
         return raw, a
 
-    def _lead_amend(self, req: dict) -> str | None:
-        """The lead amendment under the parent's amendment lock (owner decision on #330): the request and the parent's
-        state are read again once the lock is held, so a run another process already handed to its child, or is
-        amending now, stops with AmendmentLocked and nothing written."""
-        with _amend_lock(self.run_dir):
-            disk = load_state(self.run_dir)
-            if disk is not None and disk.status == AMENDED_PROVISIONAL:
-                raise AmendmentLocked(f"{self.run_dir} was already handed to its child by another process: this "
-                                      "resume stops with nothing written", run_dir=self.run_dir)
-            try:
-                cur = json.load(open(os.path.join(self.run_dir, SPEC_RETHINK_REQUEST)))
-            except (OSError, ValueError):
-                cur = None
-            return self._lead_amend_locked(cur if isinstance(cur, dict) else req)
-
-    def _lead_amend_locked(self, req: dict) -> str | None:
-        """lead-gaps β (S7 under --signoff lead only): the rethink's machine-readable patch is applied by toolkit/spec/
-        amend.py (--from-request) to a child run, the child's spec is signed by the lead, provisionally, and this run
-        ends `amended_provisional`; run_v2 continues in the child, whose report heads with the amendment. None (the
-        run pauses for the owner, as before) when there is no patch, it does not apply or validate, the amended spec
-        would not sign, the parent's signature no longer holds, no budget is left, this run already continues a
-        provisional amendment, or an earlier attempt was refused. The child's path is recorded before it is made, so
-        an interrupted handoff is finished on resume, never repeated (Codex r1)."""
-        from toolkit.spec import amend as AM, signoff as SO
-        la, why, rec = req.get("lead_amendment") or {}, None, None
-        child = la.get("child")
-        if la.get("status") in ("started", "signed_provisionally"):
-            # resolved beside this run only (a moved copy: r2); never the recorded path, which may be the original tree
-            # of a restored copy (Codex r3 on #342, P1-5); and only the child this request made (Codex r1 of #349)
-            child = _child_of(self.run_dir, child)
-            child = child if child and _made_by(child, req, self.run_dir) else None
-        if la.get("status") == "refused":
-            return None                   # the first refusal stands, with its reason and any kept child
-        if req.get("source") == "ENGINE_ADMIT":
-            why = "post-admission built-engine spec amendments require owner review (lead never auto-amends trial bands or departures)"
-        elif any(os.path.lexists(os.path.join(self.run_dir, f)) for f in LEGACY_BRIEF_SIGNOFF):
-            # owner decision on #330: in v2 a legacy decision-brief signature (which may bind other files than the spec)
-            # never satisfies the lead's check, also when recovering an interrupted hand-off (Codex r3); the owner decides
-            why = "the parent carries a legacy decision brief signature, which a lead amendment never relies on in v2"
-        elif la.get("status") in ("started", "signed_provisionally"):
-            # an interrupted handoff: finished when the parent's signature still holds (Codex r3 on #342, P1-6) and the
-            # child is signed by the lead, else refused (the owner decides)
-            if self._signed_by() is None:
-                why = "the parent's sign-off no longer holds (a signed input changed since): the owner decides"
-            elif not (child and os.path.isfile(os.path.join(child, STATE_FILE)) and SO.status(child) == "signed"
-                    and (SO._spec_record(child) or {}).get("signed_by") == "lead"):
-                why = "an interrupted amendment left no lead-signed child"
-            else:
-                try:
-                    rec = json.load(open(os.path.join(child, AMENDMENT_RECORD)))
-                except (OSError, ValueError) as e:
-                    why = f"the interrupted amendment's record cannot be read ({type(e).__name__})"
-        elif not isinstance(req.get("patch"), dict):
-            why = "the rethink wrote no machine-readable patch"
-        elif self._provisional_amendment():
-            why = "this run continues a provisional amendment; a second one waits for the owner"
-        elif not callable(getattr(self.tasks, "for_run_dir", None)):
-            why = "the run's tasks cannot continue in a child run"
-        elif self._signed_by() is None:
-            why = "the parent's sign-off no longer holds (a signed input changed since): the owner decides"
-        elif isinstance(self.st.budget_usd, (int, float)) and round(self.st.budget_usd - self.st.spent_usd, 4) <= 0:
-            why = "no budget is left for a child run"
-        else:
-            child = AM._next_child(self.run_dir)
-            _write_json(self.run_dir, SPEC_RETHINK_REQUEST, dict(req, lead_amendment={"at": _now(), "status": "started",
-                                                                                      "child": child}))
-            self.st.tries["spec_amendment"] = True
-            self.st.paused, self.st.status = AWAITING_SPEC_AMENDMENT, None     # amend amends a paused or finished run
-            save_state(self.run_dir, self.st)
-            try:
-                rec = AM.amend(self.run_dir, from_request=True, out=child, signoff="lead", log=lambda *a: None)
-                if not (rec.get("dry_sign") or {}).get("ok"):
-                    why = f"the amended spec would not sign: {(rec.get('dry_sign') or {}).get('error')}"
-                else:
-                    self._mark_child(child, rec.get("id"))     # before the signature: a signed child always says so (r2)
-                    SO.sign(child, "lead", f"Provisional (--signoff lead): amendment {rec['id']} of "
-                            f"{self.run_dir}, made from its rethink request (round {req.get('round')}); the owner has "
-                            f"not reviewed it. Reason: {' '.join(str(rec.get('reason')).split())[:500]}",
-                            expect_sha256=rec["spec_sha256"], expect_sheet_sha256=rec["sheet_sha256"],
-                            expect_derivations_sha256=rec["derivations_sha256"])
-            except Exception as e:  # noqa: BLE001 -- AmendError (refused, no child) or a signing refusal: owner pause
-                why = f"{type(e).__name__}: {e}"
-        if why is None:
-            try:
-                self._mark_child(child, rec.get("id"))
-            except Exception as e:  # noqa: BLE001 -- an unreadable child state: refused, the owner decides (r2)
-                why = f"the child's run state cannot be read ({type(e).__name__})"
-        kept = child if child and os.path.isdir(child) else None
-        req = dict(req, lead_amendment={"at": _now(), "status": "refused" if why else "signed_provisionally",
-                                        **({"why": why[:2000]} if why else {"id": rec.get("id")}),
-                                        **({"child": kept} if kept else {})})
-        _write_json(self.run_dir, SPEC_RETHINK_REQUEST, req)
-        if why:
-            self.log(f"[machine] the lead does not amend the signed spec ({why[:300]}): the run waits for the owner")
-            return None
-        self.st.paused = None
-        # the child is bound to the parent's final state before that state is saved, so no interruption leaves a FINAL
-        # parent whose child binds its paused state (Codex r3 on #342, P1-4); until that save the parent is at SPEC and
-        # a resume finishes the hand-off again
-        # a failure before the parent's FINAL state is saved (its metadata, the lineage) puts this machine and the
-        # parent's metadata back as they were (Codex r2 and r3 of #349): a retry, on this machine or a new one, finishes
-        # the hand-off
-        import copy
-        saved = copy.deepcopy(self.st)
-        meta_p = os.path.join(self.run_dir, "metadata.json")
-        meta0 = open(meta_p, "rb").read() if os.path.isfile(meta_p) else None
-        try:
-            return self._go("FINAL", f"provisional amendment {rec.get('id')} by the lead: the run continues in {child}",
-                            AMENDED_PROVISIONAL, extra={"amended_to": child}, before_save=lambda: self._relink(child))
-        except BaseException:
-            disk = _state_or_none(self.run_dir)
-            if disk is None or disk.status != AMENDED_PROVISIONAL:
-                self.st = saved
-                from lib.safe_io import remove_nofollow, write_nofollow
-                if meta0 is not None:
-                    write_nofollow(self.run_dir, "metadata.json", meta0, atomic=True)
-                else:
-                    remove_nofollow(self.run_dir, "metadata.json")
-            raise
-
-    def _mark_child(self, child: str, rid) -> None:
-        """The child's state, once: not paused, what is left of the cap (always > 0 here), the handoff event."""
-        cst = load_state(child)
-        if cst is None:
-            raise ValueError("no run state")
-        if not any(isinstance(h, dict) and h.get("provisional_amendment") for h in cst.history):
-            cst.paused = None
-            if isinstance(self.st.budget_usd, (int, float)):    # one cap: the child gets what is left
-                cst.budget_usd = round(self.st.budget_usd - self.st.spent_usd, 4)
-            cst.history.append({"at": _now(), "provisional_amendment": rid, "by": "lead", "parent_run": self.run_dir})
-            save_state(child, cst)
-
-    def _provisional_amendment(self) -> bool:
-        """This run was made by a lead's provisional amendment: its amendment record not signed by the owner, or the
-        handoff event in its history (kept when the record is lost: Codex r1)."""
-        return (os.path.lexists(os.path.join(self.run_dir, AMENDMENT_RECORD)) and self._signed_by() != "owner") or \
-            any(isinstance(h, dict) and h.get("provisional_amendment") for h in self.st.history)
-
-    def _relink(self, child: str) -> None:
-        """The child's parent_run binds the parent's final run_state.json (amend recorded it while paused), so the
-        chain still links (scripts/harness_metrics.py chains): the bytes about to be saved, from the state in memory. A
-        failure is raised before the parent is saved FINAL, so a resume finishes the hand-off (Codex r1 of #349)."""
-        sha = hashlib.sha256(_state_bytes(self.st)).hexdigest()
-        for rel in ("metadata.json", AMENDMENT_RECORD):
-            doc = json.load(open(os.path.join(child, rel)))
-            if isinstance(doc.get("parent_run"), dict):
-                doc["parent_run"]["run_state_sha256"] = sha
-                _write_json(child, rel, doc)
-
     def _derive(self, rd: str | None = None) -> list[str]:
         """The draft's declared derivations, run by the harness (scripts/pipeline.py derive). Their problems go back
         to the planner with the script's stderr tail: the planner never needs a shell to learn whether its code
@@ -2725,10 +1521,6 @@ class Machine:
             self._close_acquire()
             return self._go("ENGINE_CHOICE", "sign-off not required (--signoff none)")
         by = self._signed_by()
-        if not by and not self._review_conditions(mode):
-            self.st.paused, self.st.status = "awaiting_signoff", None
-            save_state(self.run_dir, self.st)
-            return "SIGN"
         # A HIGH geometry finding the spec proposes as an exception is the owner's to approve (review of #131, P1):
         # a lead sign-off approves nothing, so the run waits for the owner here, as for a spec sign-off.
         pend = self._geometry_owner_pending()
@@ -2762,9 +1554,6 @@ class Machine:
                     return self._go("ENGINE_CHOICE", "spec signed by the lead")
                 except ValueError as e:
                     self.log(f"[machine] the spec could not be signed: {e}")
-                    back = self._sign_repair(str(e))
-                    if back:
-                        return back
         self.st.paused = "awaiting_signoff"
         self.st.status = None
         save_state(self.run_dir, self.st)
@@ -2777,21 +1566,6 @@ class Machine:
         return spec_signed_once(self.run_dir) or any(
             h.get("from") == "SIGN" and str(h.get("why", "")).startswith("spec signed by") for h in self.st.history
         ) or os.path.lexists(os.path.join(self.run_dir, "decision_brief.signed", AB.SPEC_FILE))   # a frozen copy (r2)
-
-    def _sign_repair(self, why: str) -> str | None:
-        """v2 autonomy 1B-ii: a refused lead sign-off goes back with the refusal as feedback, to EVIDENCE when the
-        evidence dossier is what was refused, else to SPEC (one more draft allowed), at most MAX_SIGN_REPAIRS times;
-        then the run waits for the owner. The check is not loosened: the next SIGN runs it again on the files."""
-        n = self.st.tries.get("sign_repair", 0)
-        if n >= MAX_SIGN_REPAIRS:
-            return None
-        self.st.tries["sign_repair"] = n + 1
-        if "evidence dossier" in why:
-            self.st.tries["evidence_feedback"] = [why[:2000]]
-            return self._go("EVIDENCE", f"sign-off refused (evidence dossier): repair {n + 1} of {MAX_SIGN_REPAIRS}")
-        self.st.tries["spec_feedback"] = [why[:2000]]
-        self.st.tries["spec"] = min(self.st.tries.get("spec", 0), MAX_SPEC_TRIES - 1)
-        return self._go("SPEC", f"sign-off refused: repair {n + 1} of {MAX_SIGN_REPAIRS}")
 
     def _evidence_note(self) -> str:
         """The evidence stage's declared gaps, for the lead's sign-off note (counts; the record holds the inputs)."""
@@ -2807,29 +1581,6 @@ class Machine:
         return (f"Evidence dossier {'drafted by a run task' if rec.get('drafted_by_task') else 'supplied'}: "
                 f"{len(rec.get('required') or [])} input(s); provisional, not reviewed by the owner; gaps declared in "
                 f"{EDR.RECORD}" + (f" ({parts})." if parts else "."))
-
-    def _review_conditions(self, mode: str, defer: bool = True) -> bool:
-        """Owner decision 2026-11-21 (W0-G): before signing, the spec critique's undeclared HIGH findings become rows of
-        review_conditions.yaml; under --signoff lead each open row is deferred to the owner, provisionally (D2), and
-        the run proceeds. The sheet is regenerated so it shows them. False (the run waits for the owner) when the
-        import cannot run: a signature never goes ahead without it."""
-        from toolkit.spec import review_conditions as RC
-        try:
-            n = RC.import_critique(self.run_dir)
-            d = RC.lead_defer(self.run_dir) if mode == "lead" and defer else 0
-            sp_ = os.path.join(self.run_dir, SIGNOFF_SHEET)
-            if os.path.exists(sp_):     # whenever the sheet does not show the file as it now is (Codex narrow round)
-                from toolkit.spec import signoff as SO
-                src = SO.sheet_sources(open(sp_, encoding="utf-8", errors="replace").read()) or {}
-                if src.get(RC.SHEET_KEY, "none") != RC.sha(self.run_dir):
-                    self._write_sheet()
-        except Exception as e:  # noqa: BLE001 -- fail closed: the owner is asked
-            self.log(f"[machine] review conditions could not be prepared for signing: {type(e).__name__}: {e}")
-            return False
-        if n or d:
-            self.log(f"[machine] review conditions: {n} spec-critique finding(s) added"
-                     + (f", {d} deferred to the owner by the lead (D2)" if d else ""))
-        return True
 
     def h_EVIDENCE(self):
         """v2 autonomy 1B-ii (D1): the evidence dossier, before SIGN. No decision inputs needed: a pass with no task.
@@ -3026,833 +1777,7 @@ class Machine:
                 rec["cross_check"] = {"error": f"{type(e).__name__}: {e}"}
         _write_json(self.run_dir, AB.ENGINE_CHOICE, rec)     # the spec stays as signed
         self.st.engine = pick
-        return self._go("PREREGISTER" if self.st.world_model_stages else "CONFIGURE", f"engine {pick}")
-
-    # -------------------------------------------------- agent-built engine lane (#363)
-    def _max_engine_build_tries(self) -> int:
-        repairs = int((self.st.engine_build or {}).get("repairs") or 0)
-        return MAX_ENGINE_BUILD_TRIES + repairs
-
-    def _update_pending_choice_status(self, build_id: str, bstatus: str) -> None:
-        try:
-            from lib.safe_io import read_nofollow
-            cur = json.loads(read_nofollow(self.run_dir, AB.ENGINE_CHOICE)[0].decode("utf-8"))
-            if not isinstance(cur, dict):
-                cur = {}
-        except (OSError, ValueError):
-            cur = {}
-        cur.pop("engine", None)
-        cur["at"] = _now()
-        cur["build"] = {"id": build_id, "status": bstatus}
-        _write_json(self.run_dir, AB.ENGINE_CHOICE, cur)
-
-    def _build_engine_packet(self, build_decl: dict, feedback: list[str] | None) -> dict:
-        """Build the `_task_input.json` packet for `build_engine` (§3.5)."""
-        import inspect
-        from toolkit.engines import contract as _C
-        from toolkit.engines.built import oracles as BORC
-        from toolkit.engines.built import snapshot as BSNAP
-        oracle_sigs = {name: str(inspect.signature(fn)) for name, fn in sorted(BORC.ORACLE_REGISTRY.items())}
-        return {
-            "build": build_decl,
-            "contract_docstring": inspect.getdoc(_C) or "",
-            "allowed_imports": {
-                "top_level": sorted(BSNAP.ALLOWED_TOP_IMPORTS),
-                "qualified": sorted(BSNAP.ALLOWED_QUALIFIED_IMPORTS),
-            },
-            "oracle_signatures": oracle_sigs,
-            "layout": {
-                "work_dir": f"models/ext/engine_{build_decl['id']}/",
-                "required_files": ["engine.py", "card.yaml", "ENGINE_NOTES.md"],
-            },
-            "checks": {
-                "S1-S3": "file/link/size audit, AST import allowlist, banned calls/dunders/top-level execution",
-                "A1": "conformance with EngineCard, card.yaml, exact request parameters, non-negative finite outputs",
-                "A2": "determinism across processes, PYTHONHASHSEED, case orders, opaque IDs, and seed_test_setting",
-                "A3": "optional run_batch_state equals run pair by pair",
-                "A4": "declared oracle reductions + absent-component identity + per_capita_invariant_to_N",
-                "A5": "compartment mass balance, non-negativity, conservation, transition-count witnesses (starsim_module)",
-                "A6": "dead-parameter read tracking, read_outcomes phase check, non-trivial output movement, and output liveness",
-                "A8": "structured trial benchmarks under built coverage policy",
-            },
-            "feedback": list(feedback or []),
-        }
-
-    def _build_reference_packet(self, build_decl: dict, feedback: list[str] | None,
-                                dossier_path: str = "evidence_dossier.yaml") -> dict:
-        """Build `_task_input.json` for `build_reference` (§4.4): request, contract, oracle signatures,
-        and allowed imports (including `scipy.integrate`), NEVER candidate code or paths."""
-        import inspect
-        from toolkit.engines import contract as _C
-        from toolkit.engines.built import oracles as BORC
-        from toolkit.engines.built import snapshot as BSNAP
-        oracle_sigs = {name: str(inspect.signature(fn)) for name, fn in sorted(BORC.ORACLE_REGISTRY.items())}
-        return {
-            "build": build_decl,
-            "contract_docstring": inspect.getdoc(_C) or "",
-            "allowed_imports": {
-                "top_level": sorted(BSNAP.ALLOWED_TOP_IMPORTS),
-                "qualified": sorted(BSNAP.REFERENCE_ALLOWED_QUALIFIED),
-            },
-            "oracle_signatures": oracle_sigs,
-            "dossier_path": dossier_path,
-            "output_file": "engine_build/reference/reference.py",
-            "feedback": list(feedback or []),
-        }
-
-    def _write_request_for_owner(self, reason: str, problems: list[str]) -> None:
-        eb = self.st.engine_build or {}
-        lines = [
-            "# Agent-built engine not admitted — owner follow-up",
-            "",
-            f"- Engine id: `{eb.get('id')}` (`{eb.get('kind')}`)",
-            f"- Tries used: `{eb.get('tries', 0)}` (repairs: `{eb.get('repairs', 0)}`)",
-            f"- Snapshot: `{eb.get('snapshot_sha256') or 'none'}`",
-            f"- Reason: {reason}",
-            "",
-            "## Problems",
-            "",
-        ]
-        lines += [f"- {p}" for p in (problems or ["see engine_build/admission.json"])]
-        _put(self.run_dir, "engine_build/request_for_owner.md", "\n".join(lines) + "\n")
-
-    def _ensure_hidden_seed(self, snap_sha: str) -> tuple[bytes, str]:
-        """Draw and commit the hidden seed once per snapshot before any hidden case runs, reusing the exact
-        committed seed if admission resumes mid-way after a crash (BE31). Fails closed if a commitment was
-        already recorded for `snap_sha` in run_state.json but `engine_build/.hidden/seed.json` is missing
-        or mismatched (never silently swaps a committed hidden seed)."""
-        import secrets
-        from lib.safe_io import read_nofollow
-        seed_rel = "engine_build/.hidden/seed.json"
-        eb = self.st.engine_build
-        prior_snap = eb.get("hidden_seed_snapshot")
-        prior_commit = eb.get("hidden_commitment")
-        if prior_commit and prior_snap in (snap_sha, None):
-            try:
-                raw, st_f = read_nofollow(self.run_dir, seed_rel)
-                if st_f.st_nlink != 1:
-                    raise RuntimeError(f"{seed_rel} has multiple hard links")
-                doc = json.loads(raw.decode("utf-8"))
-                shex = doc.get("seed_hex") if isinstance(doc, dict) else None
-                if not isinstance(shex, str) or len(shex) != 64:
-                    raise RuntimeError(f"{seed_rel} missing valid 64-hex seed_hex")
-                sb = bytes.fromhex(shex)
-                commit = hashlib.sha256(shex.encode("ascii")).hexdigest()
-                if commit != prior_commit:
-                    raise RuntimeError(f"{seed_rel} commitment mismatch ({commit[:12]} != {prior_commit[:12]})")
-                eb["hidden_seed_snapshot"] = snap_sha
-                return sb, commit
-            except (FileNotFoundError, OSError, ValueError) as e:
-                raise RuntimeError(f"committed hidden seed for {snap_sha[:12]} missing or unreadable: {e}") from None
-        try:
-            raw, st_f = read_nofollow(self.run_dir, seed_rel)
-            if st_f.st_nlink == 1:
-                doc = json.loads(raw.decode("utf-8"))
-                shex = doc.get("seed_hex") if isinstance(doc, dict) else None
-                if (isinstance(doc, dict) and doc.get("snapshot_sha256") == snap_sha
-                        and isinstance(shex, str) and len(shex) == 64):
-                    sb = bytes.fromhex(shex)
-                    commit = hashlib.sha256(shex.encode("ascii")).hexdigest()
-                    eb["hidden_commitment"] = commit
-                    eb["hidden_seed_snapshot"] = snap_sha
-                    save_state(self.run_dir, self.st)
-                    return sb, commit
-        except (FileNotFoundError, OSError, ValueError):
-            pass
-        sb = secrets.token_bytes(32)
-        shex = sb.hex()
-        commit = hashlib.sha256(shex.encode("ascii")).hexdigest()
-        _write_json(self.run_dir, seed_rel, {
-            "snapshot_sha256": snap_sha,
-            "seed_hex": shex,
-            "commitment": commit,
-            "committed_at": _now(),
-        })
-        eb["hidden_commitment"] = commit
-        eb["hidden_seed_snapshot"] = snap_sha
-        save_state(self.run_dir, self.st)
-        return sb, commit
-
-    def _reveal_hidden_seed(self) -> None:
-        """Reveal hidden seed into `engine_build/hidden_reveal.json` at FINAL for post-run audits (§5.4, §7 Q5)."""
-        from lib.safe_io import read_nofollow
-        seed_rel = "engine_build/.hidden/seed.json"
-        if not os.path.lexists(os.path.join(self.run_dir, seed_rel)):
-            return
-        try:
-            raw, st_f = read_nofollow(self.run_dir, seed_rel)
-            if st_f.st_nlink > 1:
-                return
-            doc = json.loads(raw.decode("utf-8"))
-            if isinstance(doc, dict):
-                _write_json(self.run_dir, "engine_build/hidden_reveal.json", dict(doc, revealed_at=_now()))
-        except (OSError, ValueError):
-            return
-
-    def _invalidate_engine_admission(self) -> None:
-        """Clear stale admission/review/signoff artifacts before rebuilding a built engine."""
-        from lib.safe_io import remove_nofollow
-        eb = self.st.engine_build
-        if isinstance(eb, dict):
-            eb["status"] = "building"
-            eb["snapshot_sha256"] = None
-            eb["admission_sha256"] = None
-            eb["hidden_commitment"] = None
-            eb["hidden_seed_snapshot"] = None
-            eb["compute_reservation_id"] = None
-        for stale_rel in ("engine_build/admission.json", "engine_build/admission_sheet.md",
-                          "engine_build/signoff.json", "engine_build/decline.json",
-                          "engine_build/review_status.json", "engine_build/.hidden/seed.json",
-                          "critique_engine.yaml"):
-            remove_nofollow(self.run_dir, stale_rel, missing_ok=True)
-
-    def _smoke_check_reference(self, ref_raw: bytes, build_decl: dict, raw_spec: dict) -> list[str]:
-        """Fast sandboxed runtime smoke check on `reference.py` before locking its snapshot: verifies
-        `describe()`, `parameters()`, and one evaluation produce finite non-negative declared outputs."""
-        import math
-        import numpy as np
-        from toolkit.engines.built import admission as BADM
-        from toolkit.engines.built import candidate as BCAND
-        from toolkit.engines.contract import Package
-        ref_build = dict(build_decl)
-        ref_build["kind"] = "closed_form"
-        req = ref_build.get("request") or {}
-        ref_files = {
-            "engine.py": bytes(ref_raw),
-            "card.yaml": b"name: built_reference\nkind: reference\nbenchmarks: []\n",
-            "ENGINE_NOTES.md": b"# Independent reference implementation\n",
-        }
-        try:
-            rc = BCAND.CandidateEngine(
-                ref_files, ref_build, run_dir=self.run_dir, unsandboxed_ok=self.st.engine_unsandboxed,
-            )
-            card = rc.describe()
-            _ = rc.parameters()
-            hor = BADM._default_horizon(raw_spec, req)
-            comp_specs = req.get("components") or {}
-            absent_pkg = {c: cs["absent"] for c, cs in comp_specs.items()}
-            u0 = BADM.generate_domain_units(req, 1, np.random.default_rng(17))[0]
-            out = rc.run({}, u0, Package("ref_smoke", absent_pkg), hor, seed=1)
-        except Exception as e:  # noqa: BLE001
-            return [f"reference runtime smoke check failed: {type(e).__name__}: {e}"]
-        probs: list[str] = []
-        req_outs = req.get("outputs") or {}
-        for pc in (req_outs.get("per_capita") or []):
-            pm = (out.per_capita or {}).get(pc)
-            if not isinstance(pm, dict):
-                probs.append(f"reference output missing per_capita.{pc}")
-                continue
-            for g in (req.get("age_groups") or card.age_groups or []):
-                v = pm.get(g)
-                if not isinstance(v, (int, float)) or isinstance(v, bool) or not math.isfinite(float(v)) or float(v) < 0.0:
-                    probs.append(f"reference per_capita.{pc}[{g}]={v!r} (must be finite >= 0)")
-        for drv in (req_outs.get("cost_drivers") or []):
-            dv = (out.cost_drivers or {}).get(drv)
-            if not isinstance(dv, (int, float)) or isinstance(dv, bool) or not math.isfinite(float(dv)) or float(dv) < 0.0:
-                probs.append(f"reference cost_driver {drv}={dv!r} (must be finite >= 0)")
-        for wn, ms in (req_outs.get("windows") or {}).items():
-            if wn in hor.windows:
-                wm = (out.windows or {}).get(wn)
-                if not isinstance(wm, dict):
-                    probs.append(f"reference window {wn!r} missing")
-                    continue
-                for m in (ms or []):
-                    mv = wm.get(m)
-                    if not isinstance(mv, (int, float)) or isinstance(mv, bool) or not math.isfinite(float(mv)):
-                        probs.append(f"reference window {wn}.{m}={mv!r} not finite")
-        return probs
-
-    def _begin_engine_repair(self, why: str, findings: list[str] | None = None):
-        """Route a GATE/FIX_LOOP finding with `target_stage: ENGINE` into the single allowed engine repair
-        (§6.1, BE30): clears post_write, increments round_pending, withholds report, removes old sign-off,
-        resets engine_choice.json to pending-build, and transitions to ENGINE_BUILD."""
-        eb = self.st.engine_build
-        eb["repairs"] = int(eb.get("repairs") or 0) + 1
-        self._invalidate_engine_admission()
-        self.st.round_pending = True
-        self.st.post_write = False
-        self.st.engine = None
-        _withhold_report(self.run_dir)
-        self._update_pending_choice_status(str(eb["id"]), "building")
-        fb = list(findings or []) or [f"post-analysis engine repair: {why}"]
-        self.st.tries["engine_build_feedback"] = fb
-        return self._go("ENGINE_BUILD", f"engine repair {eb['repairs']}/{MAX_ENGINE_REPAIRS}: {why}")
-
-    def h_ENGINE_BUILD(self):
-        from toolkit.engines.built import snapshot as BSNAP
-        eb = self.st.engine_build
-        if not isinstance(eb, dict) or not eb.get("id"):
-            return self._go("FINAL", "ENGINE_BUILD entered with no build request", "run_failed")
-        bid = str(eb["id"])
-        try:
-            raw_spec = self._spec()
-            build_decl = dict(raw_spec["engine"]["build"])
-        except Exception as e:  # noqa: BLE001
-            return self._go("FINAL", f"cannot read engine.build from decision_spec.yaml: {e}", "run_failed")
-        n_used = int(eb.get("tries") or 0)
-        max_tries = self._max_engine_build_tries()
-        snaps_dir = os.path.join(self.run_dir, "engine_build", "snapshots")
-        doss_rel = ((raw_spec.get("evidence") or {}).get("dossier")
-                    if isinstance(raw_spec.get("evidence"), dict) else None) or "evidence_dossier.yaml"
-
-        # If a prior visit already built and snapshotted a valid candidate and paused for budget during
-        # `build_reference`, resume directly at the reference phase without spending another candidate try.
-        snap_sha = None
-        try_num = n_used
-        if (eb.get("status") == "awaiting_reference"
-                and isinstance(eb.get("snapshot_sha256"), str) and len(eb["snapshot_sha256"]) == 64):
-            try:
-                BSNAP.read_verified_snapshot(snaps_dir, eb["snapshot_sha256"])
-                snap_sha = eb["snapshot_sha256"]
-            except BSNAP.SnapshotError:
-                snap_sha = None
-
-        if snap_sha is None:
-            if n_used >= max_tries:
-                self._write_request_for_owner("maximum engine build tries exhausted",
-                                              list(self.st.tries.get("engine_build_feedback") or []))
-                eb["status"] = "refused"
-                return self._go("FINAL", f"engine build exhausted {max_tries} try/tries", ENGINE_NOT_ADMITTED)
-
-            wdir_rel = f"models/ext/engine_{bid}"
-            wdir = os.path.join(self.run_dir, wdir_rel)
-            if os.path.isdir(wdir) and not os.path.islink(wdir):
-                from lib.safe_io import remove_nofollow
-                for entry in list(os.listdir(wdir)):
-                    if not BSNAP._allowed_filename(entry):
-                        ep = os.path.join(wdir, entry)
-                        if not os.path.isdir(ep) or os.path.islink(ep):
-                            remove_nofollow(self.run_dir, f"{wdir_rel}/{entry}", missing_ok=True)
-            fb = list(self.st.tries.get("engine_build_feedback") or [])
-            packet = self._build_engine_packet(build_decl, fb)
-            try_num = n_used + 1
-            res = self._task(
-                f"ENGINE_BUILD#{self._visit()}:try{try_num}",
-                "build_engine",
-                self.run_dir,
-                packet,
-                bid,
-                cap_override=ENGINE_BUILD_TRY_CAP_USD,
-                build_budget=True,
-            )
-            if res is None:
-                return self._budget_out("ENGINE_BUILD")
-            eb["tries"] = try_num
-            static_probs: list[str] = []
-            try:
-                files = BSNAP.read_working_copy(wdir)
-                static_probs.extend(BSNAP.check_static(files, request=build_decl))
-            except BSNAP.SnapshotError as e:
-                static_probs.append(f"working copy invalid: {e}")
-            if static_probs and not res.ok:
-                static_probs.insert(0, f"build_engine task failed: {res.note}")
-            if static_probs:
-                self.st.tries["engine_build_feedback"] = static_probs[:40]
-                if try_num < max_tries:
-                    return self._go("ENGINE_BUILD", f"static check failed on try {try_num}: {static_probs[0][:160]}")
-                self._write_request_for_owner("static checks failed on final try", static_probs)
-                eb["status"] = "refused"
-                return self._go("FINAL", f"engine build failed static checks after {try_num} tries", ENGINE_NOT_ADMITTED)
-
-            man = BSNAP.create_snapshot(wdir, snaps_dir, run_static=True, request=build_decl)
-            snap_sha = man["snapshot_sha256"]
-            eb["snapshot_sha256"] = snap_sha
-            eb["status"] = "awaiting_reference"
-            self.st.tries.pop("engine_build_feedback", None)
-            self._update_pending_choice_status(bid, "building")
-            save_state(self.run_dir, self.st)
-
-        # §4.4 & §6.1: when A11 is on and no verified reference snapshot exists yet, run `build_reference`
-        # (up to MAX_ENGINE_REFERENCE_TRIES = 2) or snapshot a pre-seeded reference.py. If `build_reference`
-        # fails twice, proceed to ENGINE_ADMIT where A11 returns `unavailable` -> not admitted.
-        req_ref = bool(eb.get("require_reference")) if "require_reference" in eb else True
-        if req_ref and not eb.get("reference_snapshot_sha256"):
-            from lib.safe_io import read_nofollow, remove_nofollow
-            ref_snaps = os.path.join(self.run_dir, "engine_build", "reference", "snapshots")
-            ref_rel = "engine_build/reference/reference.py"
-            ref_built = False
-            # If a valid reference.py is already on disk (e.g. reused or fixture-seeded), snapshot it directly
-            if os.path.lexists(os.path.join(self.run_dir, ref_rel)) and eb.get("reference_status") != "failed":
-                try:
-                    ref_raw, ref_st = read_nofollow(self.run_dir, ref_rel)
-                    if ref_st.st_nlink == 1:
-                        smoke_probs = self._smoke_check_reference(ref_raw, build_decl, raw_spec)
-                        if not smoke_probs:
-                            rman = BSNAP.create_reference_snapshot(ref_raw, ref_snaps, request=build_decl)
-                            eb["reference_snapshot_sha256"] = rman["snapshot_sha256"]
-                            eb["reference_status"] = "ready"
-                            ref_built = True
-                        else:
-                            remove_nofollow(self.run_dir, ref_rel, missing_ok=True)
-                    else:
-                        remove_nofollow(self.run_dir, ref_rel, missing_ok=True)
-                except (OSError, ValueError, BSNAP.SnapshotError):
-                    remove_nofollow(self.run_dir, ref_rel, missing_ok=True)
-            if not ref_built and eb.get("reference_status") != "failed":
-                start_ref_try = int(eb.get("reference_tries") or 0) + 1
-                ref_fb: list[str] = list(eb.get("reference_feedback") or [])
-                for ref_try in range(start_ref_try, MAX_ENGINE_REFERENCE_TRIES + 1):
-                    remove_nofollow(self.run_dir, ref_rel, missing_ok=True)
-                    r_pkt = self._build_reference_packet(build_decl, ref_fb, dossier_path=str(doss_rel))
-                    r_res = self._task(
-                        f"ENGINE_BUILD:{snap_sha[:12]}:ref{ref_try}",
-                        "build_reference",
-                        self.run_dir,
-                        r_pkt,
-                        bid,
-                        cap_override=ENGINE_REFERENCE_CAP_USD,
-                        build_budget=True,
-                    )
-                    if r_res is None:
-                        save_state(self.run_dir, self.st)
-                        return self._budget_out("ENGINE_BUILD")
-                    eb["reference_tries"] = ref_try
-                    ref_probs: list[str] = []
-                    if os.path.lexists(os.path.join(self.run_dir, ref_rel)):
-                        try:
-                            ref_raw, ref_st = read_nofollow(self.run_dir, ref_rel)
-                            if ref_st.st_nlink != 1:
-                                ref_probs.append("reference.py must be a single-link regular file")
-                            else:
-                                rman = BSNAP.create_reference_snapshot(ref_raw, ref_snaps, request=build_decl)
-                                smoke_probs = self._smoke_check_reference(ref_raw, build_decl, raw_spec)
-                                if smoke_probs:
-                                    ref_probs.extend(smoke_probs)
-                                else:
-                                    eb["reference_snapshot_sha256"] = rman["snapshot_sha256"]
-                                    eb["reference_status"] = "ready"
-                                    eb.pop("reference_feedback", None)
-                                    ref_built = True
-                                    break
-                        except (FileNotFoundError, OSError, ValueError, BSNAP.SnapshotError) as e:
-                            ref_probs.append(f"reference static check failed: {e}")
-                    if not ref_built:
-                        if not r_res.ok:
-                            ref_probs.insert(0, f"build_reference failed: {r_res.note}")
-                        elif not ref_probs:
-                            ref_probs.append("reference.py was not written")
-                    ref_fb = ref_probs[:20]
-                    eb["reference_feedback"] = ref_fb
-                    save_state(self.run_dir, self.st)
-                if not ref_built:
-                    remove_nofollow(self.run_dir, ref_rel, missing_ok=True)
-                    eb["reference_status"] = "failed"
-                    eb["reference_snapshot_sha256"] = None
-
-        eb["status"] = "building"
-        return self._go("ENGINE_ADMIT", f"snapshot {snap_sha[:12]} built (try {try_num}/{max_tries})")
-
-    def h_ENGINE_ADMIT(self):
-        from agents import run_budget as RB
-        from toolkit.engines.built import admission as BADM
-        eb = self.st.engine_build
-        snap_sha = eb.get("snapshot_sha256")
-        if not isinstance(snap_sha, str) or len(snap_sha) != 64:
-            return self._go("FINAL", "ENGINE_ADMIT entered without a snapshot", "run_failed")
-        try:
-            spec_raw = self._spec()
-            build_decl = dict(spec_raw["engine"]["build"])
-        except Exception as e:  # noqa: BLE001
-            return self._go("FINAL", f"cannot read decision_spec.yaml for admission: {e}", "run_failed")
-
-        # BE33: reserve admission compute against the run balance BEFORE any dispatch, reusing an
-        # existing active reservation (including an orphaned one after crash-before-save_state).
-        cap_usd = self.st.budget_usd
-        res_id = None
-        prev_res_id = eb.get("compute_reservation_id")
-        ledger0 = RB.load_budget_ledger(self.run_dir)
-        for sess in reversed(ledger0.get("sessions") or []):
-            if not isinstance(sess, dict) or sess.get("status") != "reserved":
-                continue
-            if prev_res_id and sess.get("session_id") == prev_res_id:
-                if float(sess.get("reserved_usd") or 0.0) + 1e-9 >= ENGINE_ADMIT_COMPUTE_CAP_USD:
-                    res_id = prev_res_id
-                    break
-            elif (not prev_res_id and sess.get("stage") == "ENGINE_ADMIT"
-                  and sess.get("label") == "admission_compute"
-                  and float(sess.get("reserved_usd") or 0.0) + 1e-9 >= ENGINE_ADMIT_COMPUTE_CAP_USD):
-                res_id = str(sess.get("session_id"))
-                eb["compute_reservation_id"] = res_id
-                eb["compute_reserved_usd"] = float(sess.get("reserved_usd") or ENGINE_ADMIT_COMPUTE_CAP_USD)
-                save_state(self.run_dir, self.st)
-                break
-        if res_id is None:
-            if cap_usd is not None:
-                rem_state = round(cap_usd - self.st.spent_usd, 4)
-                if rem_state + 1e-9 < ENGINE_ADMIT_COMPUTE_CAP_USD:
-                    self.st.paused, self.st.status = AWAITING_BUDGET, None
-                    self.st.history.append({
-                        "at": _now(), "paused": AWAITING_BUDGET, "reason": "engine_admit_compute",
-                        "state": "ENGINE_ADMIT", "need_usd": ENGINE_ADMIT_COMPUTE_CAP_USD,
-                        "left_usd": rem_state, "cap_usd": cap_usd, "spent_usd": round(self.st.spent_usd, 4),
-                    })
-                    save_state(self.run_dir, self.st)
-                    self.log(f"[machine] ENGINE_ADMIT paused before dispatch: remaining ${rem_state:.2f} < "
-                             f"${ENGINE_ADMIT_COMPUTE_CAP_USD:.2f} admission compute cap")
-                    return "ENGINE_ADMIT"
-            ok_res, res_or_why = RB.reserve_compute(
-                self.run_dir, ENGINE_ADMIT_COMPUTE_CAP_USD, cap_usd=cap_usd,
-                stage="ENGINE_ADMIT", label="admission_compute",
-            )
-            if not ok_res:
-                self.st.paused, self.st.status = AWAITING_BUDGET, None
-                self.st.history.append({
-                    "at": _now(), "paused": AWAITING_BUDGET, "reason": "engine_admit_compute",
-                    "state": "ENGINE_ADMIT", "need_usd": ENGINE_ADMIT_COMPUTE_CAP_USD,
-                    "left_usd": None, "why": str(res_or_why), "cap_usd": cap_usd,
-                    "spent_usd": round(self.st.spent_usd, 4),
-                })
-                save_state(self.run_dir, self.st)
-                return "ENGINE_ADMIT"
-            res_id = str(res_or_why)
-            eb["compute_reservation_id"] = res_id
-            eb["compute_reserved_usd"] = ENGINE_ADMIT_COMPUTE_CAP_USD
-            save_state(self.run_dir, self.st)
-
-        # BE31: draw or reuse committed hidden seed for this snapshot (fails closed if missing/tampered)
-        try:
-            _seed_bytes, commit = self._ensure_hidden_seed(snap_sha)
-        except RuntimeError as e:
-            RB.reconcile_compute(self.run_dir, res_id, 0.0, cap_usd=cap_usd)
-            eb["compute_reservation_id"] = None
-            eb["compute_reserved_usd"] = 0.0
-            _withhold_report(self.run_dir)
-            return self._go("FINAL", f"hidden seed tampered: {e}", "artifact_tampered")
-
-        # Load verified independent A11 reference snapshot (fail closed if a recorded snapshot was tampered;
-        # only allow working reference.py when NO reference_snapshot_sha256 was ever recorded).
-        ref_files = None
-        ref_sha = eb.get("reference_snapshot_sha256")
-        ref_snaps = os.path.join(self.run_dir, "engine_build", "reference", "snapshots")
-        if isinstance(ref_sha, str) and len(ref_sha) == 64:
-            from toolkit.engines.built import snapshot as BSNAP
-            try:
-                ref_files = BSNAP.read_verified_snapshot(ref_snaps, ref_sha)
-            except (BSNAP.SnapshotError, OSError) as e:
-                RB.reconcile_compute(self.run_dir, res_id, 0.0, cap_usd=cap_usd)
-                eb["compute_reservation_id"] = None
-                eb["compute_reserved_usd"] = 0.0
-                _withhold_report(self.run_dir)
-                return self._go("FINAL", f"reference snapshot tampered: {e}", "artifact_tampered")
-        elif eb.get("reference_status") != "failed":
-            ref_dir = os.path.join(self.run_dir, "engine_build", "reference")
-            if os.path.isdir(ref_dir) and os.path.isfile(os.path.join(ref_dir, "reference.py")):
-                try:
-                    from lib.safe_io import read_nofollow
-                    ref_raw, ref_st = read_nofollow(self.run_dir, "engine_build/reference/reference.py")
-                    if ref_st.st_nlink == 1:
-                        ref_files = {"engine.py": ref_raw, "card.yaml": b"name: ref\n", "ENGINE_NOTES.md": b"# ref\n"}
-                except (OSError, ValueError):
-                    ref_files = None
-        dossier_bytes = None
-        doss_rel = ((spec_raw.get("evidence") or {}).get("dossier")
-                    if isinstance(spec_raw.get("evidence"), dict) else None) or "evidence_dossier.yaml"
-        if isinstance(doss_rel, str) and os.path.lexists(os.path.join(self.run_dir, doss_rel)):
-            try:
-                from lib.safe_io import read_nofollow
-                d_raw, d_st = read_nofollow(self.run_dir, doss_rel)
-                if d_st.st_nlink == 1:
-                    dossier_bytes = d_raw
-            except OSError:
-                dossier_bytes = None
-        from toolkit.engines import benchmark_coverage as BC
-        from toolkit.engines.built import try_tool as BTRY
-        # §7 Q2: A11 reference comparison is ON by default (matches pre-sign sheet `A11_reference: 1`); never
-        # silently waived when reference.py is missing unless explicitly disabled in state.
-        req_ref = bool(eb.get("require_reference")) if "require_reference" in eb else True
-        cfg_map = (build_decl.get("request") or {}).get("configs") or {}
-        default_cfg = dict(cfg_map.get("default") or {}) if isinstance(cfg_map, dict) else {}
-        actual_compute_usd = 0.0
-        try:
-            adm = BADM.admit(
-                self.run_dir,
-                snap_sha,
-                build_decl,
-                spec_raw,
-                config=default_cfg,
-                reference_files=ref_files,
-                require_reference=req_ref,
-                dossier_bytes=dossier_bytes,
-                departures_status=BC.signature(self.run_dir),
-                unsandboxed_ok=self.st.engine_unsandboxed,
-            )
-        finally:
-            RB.reconcile_compute(self.run_dir, res_id, actual_compute_usd, cap_usd=cap_usd)
-            eb["compute_reservation_id"] = None
-            eb["compute_reserved_usd"] = 0.0
-            self.st.spent_usd = round(self.st.spent_usd + actual_compute_usd, 4)
-
-        from lib.safe_io import read_nofollow
-        adm_sha = hashlib.sha256(read_nofollow(self.run_dir, "engine_build/admission.json")[0]).hexdigest()
-        eb["admission_sha256"] = adm_sha
-        eb["hidden_commitment"] = adm.get("hidden_commitment") or commit
-
-        # Check SPEC amendment routing BEFORE accepting admission (A10 is non-gating in admit(), so an
-        # otherwise-admitted engine with an unidentified parameter still routes to SPEC).
-        checks = adm.get("checks") or {}
-        a8 = checks.get("A8") or {}
-        a10 = checks.get("A10") or {}
-        other_gating_failed = [
-            cid for cid in ("A1", "A2", "A3", "A4", "A5", "A6", "A11")
-            if (checks.get(cid) or {}).get("status") not in ("pass", "skipped", "not_applicable")
-        ]
-        a8_missing_bm = any("no benchmark" in str(p) for p in (a8.get("problems") or []))
-        n_used = int(eb.get("tries") or 0)
-        max_tries = self._max_engine_build_tries()
-        a8_amend = (
-            a8.get("status") == "fail"
-            and a8.get("routing") == "spec_amendment"
-            and (a8_missing_bm or not other_gating_failed or n_used >= max_tries)
-        )
-        a10_unid = list(a10.get("unidentified") or [])
-        dt_names: set[str] = set()
-        for dt in ((spec_raw.get("analysis") or {}).get("decision_tests") or []):
-            if isinstance(dt, dict):
-                for key in ("parameter", "id"):
-                    if dt.get(key):
-                        dt_names.add(str(dt[key]))
-                for item in (dt.get("set") or []):
-                    if isinstance(item, dict) and item.get("parameter"):
-                        dt_names.add(str(item["parameter"]))
-                pert = dt.get("perturb")
-                if isinstance(pert, dict) and pert.get("name"):
-                    dt_names.add(str(pert["name"]))
-        cal_cfg = spec_raw.get("calibration") if isinstance(spec_raw.get("calibration"), dict) else {}
-        cal_method = "joint" if cal_cfg.get("joint") else str(cal_cfg.get("method") or "none")
-        cal_priors = cal_cfg.get("priors") if isinstance(cal_cfg.get("priors"), dict) else {}
-        a10_classes = a10.get("classes") if isinstance(a10.get("classes"), dict) else {}
-        auto_prior_range = {
-            p for p in a10_unid
-            if cal_method == "posterior"
-            and a10_classes.get(p) == "prior_dominated"
-            and p in cal_priors
-        }
-        req_d = build_decl.get("request") or {}
-        inert_set = set((req_d.get("inert") or {}).keys())
-        engine_inputs = (
-            {str(p["name"]) for p in (req_d.get("parameters") or []) if isinstance(p, dict) and p.get("name")}
-            | set((req_d.get("unit_attributes") or {}).keys())
-        ) - inert_set
-        a10_uncovered = [
-            p for p in a10_unid
-            if p in engine_inputs and p not in dt_names and p not in auto_prior_range
-        ]
-        if a8_amend or (adm.get("status") == "admitted" and a10_uncovered):
-            probs = list(a8.get("problems") or []) if a8_amend else []
-            if a10_uncovered:
-                probs.append(f"A10 unidentified parameter(s) without covering decision_test: {a10_uncovered}")
-            claim_txt = "; ".join(probs[:6])
-            fix_req = "Owner amendment: add signed engine_departures or decision_test"
-            led = FL.load(self.run_dir)
-            led["engine_admit_amendment"] = FL.Finding(
-                id="engine_admit_amendment", kind="engine_admit_amendment", severity="HIGH",
-                source="engine-admit", owner_state="SPEC", target_stage="SPEC",
-                resolution_type="owner_decision", status="open", blocking=True,
-                scope_declarable=False, first_seen_round=self.st.round, last_seen_round=self.st.round,
-                claim=claim_txt, fix_requires=fix_req,
-            )
-            FL.save(self.run_dir, led)
-            req_doc = {
-                "round": self.st.round,
-                "requested_at": _now(),
-                "source": "ENGINE_ADMIT",
-                "signed_spec_sha256": _spec_signed_sha(self.run_dir),
-                "working_spec_sha256": signed_hash(self.run_dir),
-                "briefs": [{"task": "ENGINE_ADMIT", "findings": ["A8" if a8_amend else "A10"],
-                            "brief": "; ".join(probs[:4])}],
-                "findings": [{"id": "engine_admit_amendment", "severity": "HIGH",
-                              "claim": claim_txt, "fix_requires": fix_req}],
-                "next": "amend decision_spec.yaml (add engine_departures or decision_test) and relaunch with reuse",
-            }
-            _write_json(self.run_dir, SPEC_RETHINK_REQUEST, req_doc)
-            self.st.tries["spec_amendment"] = True
-            return self._go("SPEC", "admission requires signed spec amendment (" + ("A8" if a8_amend else "A10") + ")")
-
-        if adm.get("status") == "admitted":
-            eb["status"] = "admitted"
-            self._update_pending_choice_status(str(eb["id"]), "admitted")
-            return self._go("ENGINE_REVIEW", f"admitted snapshot {snap_sha[:12]}")
-
-        # Failed admission: fail fast if A11 is permanently unavailable because reference build failed;
-        # otherwise retry ENGINE_BUILD if tries remain, else FINAL completed_engine_not_admitted.
-        # NEVER copy hidden check problem strings (`adm["checks"][cid]["problems"]`) into builder feedback (§4.6).
-        fb_lines: list[str] = []
-        if adm.get("static_problems"):
-            fb_lines += [f"static: {p}" for p in adm["static_problems"][:12]]
-        failed_ids = list((adm.get("feedback") or {}).get("failed_checks") or [])
-        if (checks.get("A11") or {}).get("status") == "unavailable" and eb.get("reference_status") == "failed":
-            fb_lines.append("A11 independent reference implementation failed to build; cannot admit without reference")
-            eb["status"] = "refused"
-            self._write_request_for_owner(f"admission failed on checks {failed_ids}", fb_lines)
-            return self._go("FINAL", "independent reference unavailable after retries (A11)", ENGINE_NOT_ADMITTED)
-        pub_checks = [cid for cid in failed_ids if cid in BTRY.VALID_PUBLIC_CHECKS]
-        if pub_checks:
-            fb_lines.append(
-                f"admission failed on check(s): {failed_ids} — run mcp__engine__try(checks={pub_checks!r}) on your "
-                "working copy to inspect public diagnostics"
-            )
-        elif failed_ids:
-            fb_lines.append(f"admission failed on check(s): {failed_ids}")
-        if n_used < max_tries:
-            self.st.tries["engine_build_feedback"] = fb_lines
-            return self._go("ENGINE_BUILD", f"admission failed ({', '.join(failed_ids[:4])}); try {n_used}/{max_tries}")
-        eb["status"] = "refused"
-        self._write_request_for_owner(f"admission failed on checks {failed_ids}", fb_lines)
-        return self._go("FINAL", f"engine not admitted after {n_used} tries ({', '.join(failed_ids[:4])})",
-                        ENGINE_NOT_ADMITTED)
-
-    def h_ENGINE_REVIEW(self):
-        from lib.safe_io import remove_nofollow
-        from toolkit.engines.built import signoff as BSIG
-        eb = self.st.engine_build
-        snap_sha = eb.get("snapshot_sha256")
-        v = self._visit()
-        repairs = int(self.st.tries.get("engine_review_repairs") or 0)
-        fb = self.st.tries.get("engine_review_feedback")
-        jkey = f"ENGINE_REVIEW#{v}:r{self.st.round}:a{repairs + 1}"
-        if repairs == 0 and (self.st.journal.get(jkey) or {}).get("status") != "completed":
-            # Remove any stale critique_engine.yaml from a prior snapshot before a fresh review task runs
-            remove_nofollow(self.run_dir, BSIG.REVIEW_FILE, missing_ok=True)
-        res = self._task(
-            jkey,
-            "critique_engine",
-            self.run_dir,
-            self.st.round,
-            fb,
-            cap_override=ENGINE_REVIEW_CAP_USD,
-            build_budget=True,
-        )
-        if res is None:
-            return self._budget_out("ENGINE_REVIEW")
-        cpath = os.path.join(self.run_dir, BSIG.REVIEW_FILE)
-        doc, errs = (BSIG.validate_engine_critique(cpath, self.st.round)
-                     if os.path.isfile(cpath)
-                     else (None, [f"critique_engine task failed: {res.note or 'no output'}"]))
-        if doc is None and not res.ok:
-            errs = [f"critique_engine task failed: {res.note or 'no output'}"] + errs
-        if doc is None:
-            if repairs < 1:
-                self.st.tries["engine_review_repairs"] = repairs + 1
-                self.st.tries["engine_review_feedback"] = errs
-                return self._go("ENGINE_REVIEW", f"critique_engine.yaml malformed ({errs[0][:120]}); 1 repair")
-            self.st.tries.pop("engine_review_repairs", None)
-            self.st.tries.pop("engine_review_feedback", None)
-            _write_json(self.run_dir, BSIG.REVIEW_STATUS_REL, {
-                "snapshot_sha256": snap_sha, "review_unavailable": True, "errors": errs, "recorded_at": _now(),
-            })
-            eb["status"] = "reviewed"
-            return self._go("ENGINE_SIGN", "engine review unavailable after repair (blocks lead sign-off)")
-
-        self.st.tries.pop("engine_review_repairs", None)
-        self.st.tries.pop("engine_review_feedback", None)
-        open_high = [b for b in (doc.get("blockers") or []) if not b.get("resolved") and b.get("severity") == "HIGH"]
-        open_med = [b for b in (doc.get("blockers") or []) if not b.get("resolved") and b.get("severity") == "MEDIUM"]
-        _write_json(self.run_dir, BSIG.REVIEW_STATUS_REL, {
-            "snapshot_sha256": snap_sha,
-            "review_unavailable": False,
-            "verdict": doc.get("verdict"),
-            "high_count": len(open_high),
-            "medium_count": len(open_med),
-            "recorded_at": _now(),
-        })
-        n_used = int(eb.get("tries") or 0)
-        if open_high and n_used < self._max_engine_build_tries():
-            self._invalidate_engine_admission()
-            self.st.tries["engine_build_feedback"] = [
-                f"engine reviewer {b['id']} ({b['severity']}): {b['claim']} Required: {b['fix_requires']}"
-                for b in open_high
-            ]
-            return self._go("ENGINE_BUILD", f"critique-engine raised {len(open_high)} HIGH finding(s); rebuilding")
-        eb["status"] = "reviewed"
-        return self._go("ENGINE_SIGN", f"engine review {doc.get('verdict')} (HIGH={len(open_high)})")
-
-    def h_ENGINE_SIGN(self):
-        from toolkit.engines.built import BUILT_ADAPTER_REF
-        from toolkit.engines.built import signoff as BSIG
-        eb = self.st.engine_build
-        st_sig = BSIG.status(self.run_dir)
-        if st_sig == "declined":
-            dec, _ = BSIG._read_json_optional(self.run_dir, BSIG.DECLINE_REL)
-            dec_by = (dec or {}).get("by")
-            if self.st.signoff == "owner" and dec_by != "owner":
-                self.st.paused = AWAITING_ENGINE_SIGNOFF
-                save_state(self.run_dir, self.st)
-                return "ENGINE_SIGN"
-            note = (dec or {}).get("note") or "declined"
-            n_used = int(eb.get("tries") or 0)
-            if n_used < self._max_engine_build_tries():
-                self._invalidate_engine_admission()
-                self.st.tries["engine_build_feedback"] = [f"owner/lead declined admitted engine: {note}"]
-                return self._go("ENGINE_BUILD", f"engine declined with try left: {note[:120]}")
-            eb["status"] = "declined"
-            return self._go("FINAL", f"admitted engine declined: {note[:200]}", ENGINE_DECLINED)
-
-        if st_sig == "awaiting" and self.st.signoff == "lead":
-            try:
-                BSIG.sign(self.run_dir, "lead", note="lead provisional engine sign-off (--signoff lead)")
-                st_sig = BSIG.status(self.run_dir)
-            except ValueError as e:
-                # e.g. review_unavailable or unresolved review HIGH -> pause for owner
-                self.st.paused = AWAITING_ENGINE_SIGNOFF
-                save_state(self.run_dir, self.st)
-                self.log(f"[machine] lead cannot sign built engine ({e}); paused for owner at ENGINE_SIGN")
-                return "ENGINE_SIGN"
-
-        if st_sig == "signed":
-            so, _ = BSIG._read_json_optional(self.run_dir, BSIG.SIGNOFF_REL)
-            by = (so or {}).get("by")
-            if self.st.signoff == "owner" and by != "owner":
-                self.st.paused = AWAITING_ENGINE_SIGNOFF
-                save_state(self.run_dir, self.st)
-                return "ENGINE_SIGN"
-            if by == "lead" and BSIG.review_blocks_lead(self.run_dir):
-                self.st.paused = AWAITING_ENGINE_SIGNOFF
-                save_state(self.run_dir, self.st)
-                return "ENGINE_SIGN"
-            # Write final engine_choice.json resolving to BuiltEngine adapter (§5.1)
-            try:
-                raw_spec = self._spec()
-                cfg_map = ((raw_spec.get("engine") or {}).get("build") or {}).get("request", {}).get("configs") or {}
-                default_cfg = dict(cfg_map.get("default") or {}) if isinstance(cfg_map, dict) else {}
-            except Exception:  # noqa: BLE001
-                default_cfg = {}
-            prev_ch = {}
-            try:
-                from lib.safe_io import read_nofollow
-                prev_ch = json.loads(read_nofollow(self.run_dir, AB.ENGINE_CHOICE)[0].decode("utf-8"))
-                if not isinstance(prev_ch, dict):
-                    prev_ch = {}
-            except (OSError, ValueError):
-                prev_ch = {}
-            cands = prev_ch.get("candidates") or []
-            choice_doc = {
-                "at": _now(),
-                "candidates": cands,
-                "build": {"id": eb.get("id"), "status": "signed", "snapshot_sha256": eb.get("snapshot_sha256")},
-                "engine": {"ref": BUILT_ADAPTER_REF, "config": default_cfg},
-                "why": f"admitted and {by}-signed agent-built engine {eb.get('id')}",
-            }
-            if "engine_departures" in prev_ch:
-                choice_doc["engine_departures"] = prev_ch["engine_departures"]
-            _write_json(self.run_dir, AB.ENGINE_CHOICE, choice_doc)
-            eb["status"] = "signed"
-            self.st.engine = BUILT_ADAPTER_REF
-            return self._go("PREREGISTER" if self.st.world_model_stages else "CONFIGURE",
-                            f"built engine {eb.get('id')} signed by {by}")
-
-        if st_sig == "changed":
-            _withhold_report(self.run_dir)
-            return self._go("FINAL", "admitted built-engine evidence changed before/after sign-off", "artifact_tampered")
-
-        self.st.paused = AWAITING_ENGINE_SIGNOFF
-        save_state(self.run_dir, self.st)
-        self.log(f"[machine] built engine {eb.get('id')} awaiting owner sign-off: inspect "
-                 f"engine_build/admission_sheet.md and run "
-                 f"python3 toolkit/engines/built/signoff.py sign {self.run_dir} --by owner")
-        return "ENGINE_SIGN"
-
-    def h_PREREGISTER(self):
-        return self._go("CONFIGURE", self._world_model("preregister"))
+        return self._go("ANALYZE", f"engine {pick}")
 
     def _write_pipeline(self) -> str | None:
         """models/pipeline.yaml from the backend's steps (their limits from the compute budget as it is now), or why
@@ -3886,23 +1811,19 @@ class Machine:
         self.log(f"[machine] FINAL -> ANALYZE (resumed after an analysis {cause})")
         return cause
 
-    def h_CONFIGURE(self):
+    def h_ANALYZE(self):
         import pipeline as P
         errs = self.backend.validate(os.path.join(self.run_dir, AB.SPEC_FILE))
         if errs:
             return self._go("FINAL", f"spec invalid for the engine: {'; '.join(errs)[:200]}", "run_failed")
         err = self._write_pipeline()
         if err:
-            return self._go("FINAL", f"configure failed: {err}"[:300], "run_failed")
+            return self._go("FINAL", f"analyze pipeline failed: {err}"[:300], "run_failed")
         steps, _errs = P.load(self.run_dir)
-        if not any(s_.get("id") == "configure" for s_ in steps):    # workstream B: one analyze step
-            return self._go("ANALYZE", "pipeline written (no separate configure step)")
-        rep = P.run(self.run_dir, only="configure")
-        if not rep.get("ok"):
-            return self._go("FINAL", f"configure failed: {_rep_error(rep)}", "run_failed")
-        return self._go("ANALYZE", "engine batch built")
-
-    def h_ANALYZE(self):
+        if any(s_.get("id") == "configure" for s_ in steps):
+            rep_c = P.run(self.run_dir, only="configure")
+            if not rep_c.get("ok"):
+                return self._go("FINAL", f"analyze pipeline failed: {_rep_error(rep_c)}", "run_failed")
         rep = self.rebuild(self.run_dir)
         if not rep.get("ok"):
             cause = analysis_failure_cause(rep, self.run_dir)
@@ -3921,27 +1842,9 @@ class Machine:
                                                  f"{MAX_CALIBRATION_REFUSALS}): {ref['reason']}"[:300])
                 why += f"; the calibration was refused {n} time(s) before (cap {MAX_CALIBRATION_REFUSALS})"
             return self._go("FINAL", why, "run_failed", extra={"resumable": cause} if cause else None)
-        return self._go("SCORE" if self.st.world_model_stages else "CRITIQUE", "analysis built")
-
-    def h_SCORE(self):
-        return self._go("CRITIQUE", self._world_model("score_run"))
-
-    def _world_model(self, fn: str) -> str:
-        """§14, fail soft: a world-model step never raises into the machine. `refresh` (before CRITIQUE and WRITE)
-        scores again when the fix loop has rebuilt the analysis since; it is recorded in the history."""
-        if not self.st.world_model_stages:
-            return ""
-        try:
-            import world_model_stage as WMS
-            why = getattr(WMS, fn)(self) or ""
-        except Exception as e:  # noqa: BLE001
-            why = f"world model: {fn} failed: {type(e).__name__}: {e}"[:300]
-        if why and fn == "refresh":
-            self.st.history.append({"at": _now(), "world_model": why})
-        return why
+        return self._go("CRITIQUE", "analysis built")
 
     def h_CRITIQUE(self):
-        self._world_model("refresh")
         if self.st.round_pending:
             self.st.round += 1
             self.st.round_pending = False
@@ -3955,7 +1858,6 @@ class Machine:
             critics = list(CRITICS) + (["critique-presentation"] if self.st.post_write else [])
         else:
             critics = [r for r in fb if r in CRITICS or r == "critique-presentation"]
-        rereview = self._rereview_due()          # hb1 cause G: the domain and red-team critics, on the revised draft
         for reviewer in critics:
             args = (self.run_dir, reviewer, self.st.round) + ((fb.get(reviewer) or fb.get("*"),) if fb else ())
             res = self._task(f"CRITIQUE#{v}:r{self.st.round}:{reviewer}", "critique", *args,
@@ -3963,9 +1865,6 @@ class Machine:
             if res is None:
                 return self._budget_out("CRITIQUE")
         self.st.tries.pop("schema_feedback", None)
-        if rereview:
-            self.st.tries.pop("rereview", None)
-            return self._go("GATE", f"critique round {self.st.round} (re-review of the revised draft)")
         return self._go("GATE", f"critique round {self.st.round}")
 
     def h_GATE(self):
@@ -3977,23 +1876,18 @@ class Machine:
                     spec_violations=sv(self.run_dir) if sv else None,
                     registry_violations=rv(self.run_dir) if rv else None,
                     strict_done_when=self.st.v2_rules and self.st.tries.get("schema", 0) < MAX_SCHEMA_REPAIRS,
-                    append_history=False, signoff=self.st.signoff, checklist_rules=self.st.v2_rules)
+                    append_history=False, signoff=self.st.signoff)
         opened = []
         if d.get("action") and self.st.v2_rules:
             opened = open_findings(self.run_dir, d)
-            # synced with this decision, so a gate finding is read as this gate states it (Codex round 3 of #258),
-            # and before the medium rule, which declares what the owner holds (hb1 cause H)
             led0 = FL.sync(self.run_dir, d, self.st.round, post_write=pw, lead_ok=self.st.signoff == "lead")[0]
             held_now = sorted(owner_accepted_now(self.run_dir, opened, self.st.signoff == "lead"))
-            gaps_now = sorted(FL.harness_gaps(led0))            # hb2 fix 4: not fix-loop work
             d = apply_medium_rule(d, opened, int(d.get("rounds_remaining") or 0), not self._out_of_budget(),
-                                  owner_held=held_now, harness_gaps=gaps_now)
-            d = apply_held_rule(d, led0, held_now, gaps_now, opened)
+                                  owner_held=held_now)
+            d = apply_held_rule(d, led0, held_now, opened)
             d["owner_held"] = held_now      # what this gate read as the owner's (FIX_LOOP's shortcut reads it here)
-            d["harness_gaps"] = gaps_now
             d["open_tested_ids"] = sorted(str(o["id"]) for o in opened if o.get("tested"))   # the shortcut reads it
             d = require_judged(d, opened)
-            # Codex re-review of #258 P1-11: the owner's declines hold this gate before anything is written from it
             d = apply_owner_declines(d, led0)
             waiting = sorted(set(pending_amendments(led0, d.get("resolved_by_test")) + pending_conflicts(led0)))
             if d.get("rule_matched") == "owner_declined":
@@ -4017,8 +1911,6 @@ class Machine:
                 _withhold_report(self.run_dir)
                 return self._go("FINAL", "an accepted decision test's record changed after the gate read it: "
                                          "the report could not state the accepted dependence", "completed_gate_error")
-            if fst is not None and fst not in ACCEPTED_STATUSES:
-                d["report_acceptance_language"] = self._language_check(fst)
         tag = f"gate_r{self.st.round}{'_post' if pw else ''}.json"
         _write_json(self.run_dir, tag, d or {})
         if pw and not waiting:
@@ -4031,7 +1923,7 @@ class Machine:
         if (d or {}).get("action"):
             FL.sync(self.run_dir, d, self.st.round, post_write=pw, lead_ok=self.st.signoff == "lead")
             if d.get("rule_matched") == "4m" or (str(d.get("rule_matched")) == "2" and d.get("open_tested")):
-                # these are why the loop runs: plan them (rule 2 too, when apply_held_rule kept it for them)
+                # these are why the loop runs: plan them
                 led = FL.load(self.run_dir)
                 for fid in d.get("open_tested") or []:
                     if fid in led:
@@ -4062,29 +1954,8 @@ class Machine:
                 nxt, status, mode = ("FINAL", "run_failed", None) if pw else ("WRITE", None, "not_accepted")
         if nxt == "OWNER_DECISION":
             self._request_scope(d)
-        lang = (d or {}).get("report_acceptance_language") or {}
-        if nxt == "FINAL" and lang.get("remaining"):
-            # Not delivered with acceptance language in place (F6 S1-7): the writer repairs the draft, which then
-            # goes through the whole post-write path again (presentation, every post-write check, this gate);
-            # once the repairs are used, the report is withheld.
-            if lang["repairs"] < MAX_LANGUAGE_REPAIRS:
-                self.st.tries["language"] = lang["repairs"] + 1
-                self.st.tries["language_feedback"] = lang["remaining"]
-                self.st.write_mode = lang["mode"]
-                # Quarantined until a repaired draft passes the whole post-write gate.
-                _quarantine_report(self.run_dir)
-                return self._go("WRITE", f"acceptance language in a {lang['mode']} report: the writer repairs it")
-            _quarantine_report(self.run_dir)
-            return self._go("FINAL", "the report kept acceptance language after its repairs: withheld",
-                            "completed_no_report")
         if nxt == "CRITIQUE":                               # schema errors: re-run the critics
-            # Codex r3 of #366 (P1-3): a run started before the structural checklist (critique files without it) gets
-            # one repair to add it outside the schema-repair count, once per run, so the upgrade cannot end it.
-            upgrade = (not self.st.tries.get("checklist_upgrade")
-                       and any(CHECKLIST_MISSING in str(e) for e in d["schema_errors"]))
-            n = self.st.tries.get("schema", 0) + (0 if upgrade else 1)
-            if upgrade:
-                self.st.tries["checklist_upgrade"] = 1
+            n = self.st.tries.get("schema", 0) + 1
             self.st.tries["schema"] = n
             if n > MAX_SCHEMA_REPAIRS:
                 return self._go("FINAL", "critique schema errors persist", "completed_gate_error")
@@ -4104,8 +1975,7 @@ class Machine:
                     cand = os.path.basename(head[len("invalid YAML in "):].strip()) if head.startswith("invalid YAML in ") else head.split()[0]
                     fb.setdefault(by_file.get(cand, "*"), []).append(s_err)
             self.st.tries["schema_feedback"] = fb
-            target = "PRESENTATION" if set(fb) == {"critique-presentation"} else "CRITIQUE"
-            return self._go(target, f"schema errors: {'; '.join(d['schema_errors'])[:200]}")
+            return self._go("CRITIQUE", f"schema errors: {'; '.join(d['schema_errors'])[:200]}")
         self.st.tries.pop("schema", None)
         why = f"{(d or {}).get('action')} (rule {(d or {}).get('rule_matched')}){' post-write' if pw else ''}"
         if nxt == "ENGINE_BUILD":
@@ -4123,13 +1993,6 @@ class Machine:
         if nxt in ("SPEC", "ENGINE_CHOICE"):
             return self._rethink(nxt, why)
         return self._go(nxt, why, status)
-
-    def _language_check(self, status: str) -> dict:
-        """F6 S1-7: acceptance language in the whole manuscript of a report the final gate did not accept, with
-        the repairs used so far (MAX_LANGUAGE_REPAIRS at most; each goes back through the post-write path)."""
-        mode = "declared" if status == "completed_scope_declared" else "not_accepted"
-        found = [f["claim"] for f in report_acceptance_findings(self.run_dir, mode)]
-        return {"mode": mode, "repairs": int(self.st.tries.get("language", 0)), "remaining": found}
 
     def h_FIX_LOOP(self):
         v = self._visit()
@@ -4180,18 +2043,11 @@ class Machine:
                 return self._go("FINAL", f"second engine repair refused (cap {MAX_ENGINE_REPAIRS})", "run_failed")
             return self._rethink(summ["rethink"], f"the planner chose a rethink ({summ['rethink']})", planned=True)
         if not summ["tasks"] and summ.get("write_up") and not self._fixable_open() and self._has_draft():
-            # (a blocking harness gap no longer keeps it here: it is declared, not fixed; hb2 fix 4)
-            # Every open finding is the write-up's: the writer revises the draft (with them) as the next round, and
-            # the domain and red-team critics then re-review the revised draft at that round (hb1 cause G: they were
-            # left on the round before, and the gate re-ran them through the schema repair).
             if self.st.round_pending:
                 self.st.round += 1
                 self.st.round_pending = False
             self.st.write_mode = self.st.write_mode or "not_accepted"
-            self.st.tries["rereview"] = self.st.round
-            gaps = summ.get("harness_gaps_blocking") or []
-            return self._go("WRITE", f"every open finding is the write-up's ({', '.join(summ['write_up'])[:120]})"
-                            + (f" or a declared harness gap ({', '.join(gaps)[:120]})" if gaps else ""))
+            return self._go("WRITE", f"every open finding is the write-up's ({', '.join(summ['write_up'])[:120]})")
         held_now = None if summ["tasks"] or self._drafted() or self._fixable_open() else self._shortcut_held()
         if held_now is not None:
             # hb1 cause H: pre-write, a loop with no task changed nothing, so another critique round can find nothing
@@ -4214,56 +2070,42 @@ class Machine:
         return self._has_draft() or os.path.exists(os.path.join(self.run_dir, "report.md"))
 
     def _shortcut_held(self) -> list[str] | None:
-        """Codex r1 of #344 (P1-3, P2-4): the shortcut to WRITE follows a gate that patched (rule 4m, or rule 2 for
-        HIGHs) only for findings that are the write-up's, the owner's answered ones or declared harness gaps (hb2 fixes
-        1 and 4: rule 2 too, and the gaps); a gate that patches for any other reason (a gate HIGH, a missing artifact, a
-        finding a task could fix) keeps its critique round. None: no shortcut; else the findings of that gate that are
-        declared, not written up (the owner's and the gaps)."""
-        try:        # this round's pre-write gate (the one that routed here; the round is raised at the next CRITIQUE)
+        """Pre-write shortcut to WRITE when FIX_LOOP has no tasks and every open finding is write-up or owner-held."""
+        try:
             d = json.load(open(os.path.join(self.run_dir, f"gate_r{self.st.round}.json")))
         except (OSError, ValueError):
             return None
         if not isinstance(d, dict) or d.get("action") != "PATCH_OR_RETHINK" or str(d.get("rule_matched")) not in ("4m", "2") \
                 or d.get("accept_blockers") or d.get("structural_mismatch"):
             return None
-        # the owner-held findings as this gate read them (their current fingerprint carries the accept), not the
-        # ledger's status, which may keep an older remedy (Codex r3 of #344, P1-1); the medium rule kept them out of
-        # open_tested, so the mode comes from that record (P2-5)
         held = d.get("owner_held")
         if not isinstance(held, list):
             return None
         led = FL.load(self.run_dir)
-        gaps = FL.harness_gaps(led)           # as the fix loop just declared them (hb2 fix 4)
-        keep = set(map(str, held)) | gaps
+        keep = set(map(str, held))
         hi = d.get("unresolved_high") or []
         if str(d.get("rule_matched")) == "2" and not hi:
             return None
-        hid = []
-        for b in hi:            # rule 2: every HIGH is a critic's (or an owner-held unrun test), and the write-up's,
-            i = held_entry_id(b, d) if isinstance(b, dict) else None      # the owner's or a gap (#375 P2-5)
+        for b in hi:
+            i = held_entry_id(b, d) if isinstance(b, dict) else None
             if i is None:
                 return None
             crit = str(b.get("reviewer") or "").startswith("critique")
             if not (i in led and ((crit and FX.is_write_up(led[i])) or i in keep)):
                 return None
-            hid.append(i)
         ids = [str(i) for i in d.get("open_tested") or []]
-        if not all(i in led and (FX.is_write_up(led[i]) or i in gaps) for i in ids):
+        if not all(i in led and FX.is_write_up(led[i]) for i in ids):
             return None
-        # rule 2 leaves a MEDIUM non-blocking: one with a test a task can work to keeps the round (Codex r2 of #357)
-        tested = d.get("open_tested_ids")      # the gate's open findings with a test, harness checks included (r3 P2-11)
+        tested = d.get("open_tested_ids")
         if not isinstance(tested, list) or any(str(i) not in keep and not (str(i) in led and FX.is_write_up(led[str(i)]))
                                                for i in tested):
             return None
-        named = set(ids) | set(hid)
-        return sorted(set(map(str, held)) | (gaps & named))
+        return sorted(keep)
 
     def _fixable_open(self) -> list[str]:
-        """Open findings a fix task could still work to: the gate holds them (blocking), and they are neither the
-        write-up's, the owner's (answered), nor a
-        declared harness gap (hb2 fixes 1 and 4)."""
+        """Open findings a fix task could still work to: blocking, neither write-up nor owner-held."""
         led = FL.load(self.run_dir)
-        held = owner_held(led) | FL.harness_gaps(led)
+        held = owner_held(led)
         return [f.id for f in FL.open_findings(led) if f.blocking and not FX.is_write_up(f) and f.id not in held]
 
     def _request_owner(self, led: dict, ids: list[str]) -> None:
@@ -4375,6 +2217,18 @@ class Machine:
         save_state(self.run_dir, self.st)
         return "OWNER_DECISION"
 
+    def _critics_behind_round(self) -> bool:
+        import yaml
+        for reviewer in CRITICS:
+            p = os.path.join(self.run_dir, FL.CRITIQUE_FILES.get(reviewer, ""))
+            try:
+                doc = yaml.safe_load(open(p)) if os.path.isfile(p) else None
+            except Exception:
+                return False
+            if isinstance(doc, dict) and doc.get("round") != self.st.round:
+                return True
+        return False
+
     def h_WRITE(self):
         tamper = self._engine_tamper_problems()
         if tamper:
@@ -4382,119 +2236,29 @@ class Machine:
             return self._go("FINAL", "agent-built engine snapshot tampered before WRITE: " + "; ".join(tamper[:4]),
                             "artifact_tampered")
         mode = self.st.write_mode or "not_accepted"
-        self._recover_claim_repair()        # before the draft is read: a repair interrupted before its check
-        self._world_model("refresh")
-        fb = self.st.tries.get("language_feedback")             # a language repair (F6 S1-7)
-        # F6 run 3: the write-up findings the fix loop left to this stage, with their remedies
         known = _ledger_claims(self.run_dir)
         wf = [{"id": f.id, "claim": _quoted(f.claim, known), "fix_requires": _quoted(f.fix_requires, known)}
               for f in FL.open_findings(FL.load(self.run_dir)) if FX.is_write_up(f)]
-        res = self._task(f"WRITE#{self._visit()}:{mode}", "write", self.run_dir, mode, *([fb] if fb else []),
+        res = self._task(f"WRITE#{self._visit()}:{mode}", "write", self.run_dir, mode,
                          writeup=True, **({"findings": wf} if wf else {}))
-        self.st.tries.pop("language_feedback", None)
         if res is None:
             return self._go("FINAL", "no budget left for the write-up", "completed_no_report")
         if not res.ok or not self._has_draft():
             return self._go("FINAL", "the writer produced no draft", "completed_no_report")
         render_report(self.run_dir, self.backend)
-        if self.st.v2_rules:
-            self._repair_claim_refs(mode)
         self.st.post_write = True
-        if mode == "not_accepted" and not self._rereview_due():
-            # (a revised not-accepted draft gets its presentation review at the new round too: Codex r1 of #344, P2-5)
-            return self._go("GATE", "not-accepted report written; final gate")
-        return self._go("PRESENTATION", f"draft written ({mode})")
-
-    def _repair_claim_refs(self, mode: str) -> None:
-        """hb2 (3 of 8 runs RUN_FAILED): a claim-reference finding in the draft (an id outside the ledger, a bare id,
-        a reference left unrendered) is the writer's alone, and it was found only at the post-write gate, with no
-        round left. It is repaired here, inside WRITE, before any gate, so it never costs a round: at most
-        MAX_CLAIM_REPAIRS writer sessions per draft, each told the findings, paid outside the write-up reserve (the
-        presentation review and the gate keep theirs). What is left goes to the gate, which still refuses it
-        (non-declarable HIGH): a number with no ledger entry is never accepted.
-        A repair only turns references into references (_claim_repair_undo): otherwise it is undone and the finding
-        stays for the gate. The draft before each session is kept in run_state.json until its check has run; a
-        session interrupted before its check is undone on resume (_recover_claim_repair). report.md is re-rendered
-        after every session."""
-        base = f"WRITE#{self._visit()}:{mode}:claims"
-        used = sum(1 for h in self.st.history if str(h.get("claim_repair_key", "")).startswith(base))
-        for n in range(used + 1, MAX_CLAIM_REPAIRS + 1):
-            bad = [f for f in report_claim_findings(self.run_dir)
-                   if f["severity"] == "HIGH" and f["kind"] in CLAIM_REF_KINDS]
-            if not bad:
-                return
-            key, before = f"{base}{n}", open(os.path.join(self.run_dir, "manuscript.md"), encoding="utf-8").read()
-            rec = {"claim_repair": n, "claim_repair_key": key, "state": "WRITE", "round": self.st.round,
-                   "kinds": sorted({f["kind"] for f in bad}), "findings": len(bad)}
-            self.st.tries["claim_repair"] = dict(rec, before=before)
-            save_state(self.run_dir, self.st)
-            fs = [{"id": f"{f['kind']}:{f['key']}", "claim": f["claim"], "fix_requires": None, "repair": "claims"}
-                  for f in bad]
-            res = self._task(key, "write", self.run_dir, mode, findings=fs)
-            self.st.tries.pop("claim_repair", None)
-            if res is None:                 # no session ran: the draft is as it was
-                save_state(self.run_dir, self.st)
-                return
-            undone = self._claim_repair_undo(before)
-            if undone:
-                _put(self.run_dir, "manuscript.md", before)
-            self.st.history.append(dict(rec, at=_now(), ok=bool(res.ok), **({"undone": undone} if undone else {})))
-            save_state(self.run_dir, self.st)
-            render_report(self.run_dir, self.backend)
-            if not res.ok or undone:
-                return
-
-    def _recover_claim_repair(self) -> None:
-        """A claim-repair session interrupted before its check (Codex r2-r3 of #353): its draft is undone from the
-        copy in run_state.json, and the session counts as used."""
-        rec = self.st.tries.pop("claim_repair", None)
-        if not isinstance(rec, dict) or not isinstance(rec.get("before"), str):
-            return
-        _put(self.run_dir, "manuscript.md", rec.pop("before"))
-        self.st.history.append(dict(rec, at=_now(), ok=False, undone=["interrupted before its check"]))
-        save_state(self.run_dir, self.st)
-
-    def _claim_repair_undo(self, before: str) -> list[str]:
-        """Why a repair is undone ([] when kept): the draft is missing, unreadable or empty; it lost more than a
-        fifth of its text outside references; or it holds a digit string outside a reference that the draft
-        before did not (counted per occurrence, years included; references read as the renderer reads them)."""
-        import re
-        from collections import Counter
-        try:
-            after = open(os.path.join(self.run_dir, "manuscript.md"), encoding="utf-8").read()
-        except (OSError, UnicodeDecodeError) as e:
-            return [f"the draft could not be read ({type(e).__name__})"]
-        if not after.strip():
-            return ["the repair left the draft empty"]
-        import render_claims as RCL
-        known = _ledger_claims(self.run_dir) or {}
-
-        def prose(t):
-            return re.sub(r"\[CLAIM:[^\]]*\]", " ", RCL.normalise_refs(t, known))
-        if len(prose(after).split()) < 0.8 * len(prose(before).split()):
-            return ["the repair removed text other than references"]
-        added = Counter(re.findall(r"\d+(?:[.,]\d+)*", prose(after))) - Counter(re.findall(r"\d+(?:[.,]\d+)*",
-                                                                                            prose(before)))
-        return [f"added number {x}" for x in sorted(added)][:8]
-
-    def h_PRESENTATION(self):
-        # The review of the draft is part of the write-up: like WRITE, it may use the write-up reserve (an accepted
-        # run whose WRITE spent into the reserve ended budget_exhausted here, with most of the reserve unspent).
-        fb = self.st.tries.get("schema_feedback") or {}
-        pres_fb = fb.get("critique-presentation") or fb.get("*")
-        args = (self.run_dir, "critique-presentation", self.st.round) + ((pres_fb,) if pres_fb else ())
-        res = self._task(f"PRESENTATION#{self._visit()}:r{self.st.round}", "critique", *args, writeup=True)
-        if res is None:
-            return self._budget_out("PRESENTATION")
-        self.st.tries.pop("schema_feedback", None)
-        if self._rereview_due():
-            return self._go("CRITIQUE", f"re-review of the revised draft, round {self.st.round}")
-        return self._go("GATE", "presentation review of the draft")
-
-    def _rereview_due(self) -> bool:
-        """hb1 cause G: a draft revised for write-up findings as a new round is re-reviewed by the domain and red-team
-        critics at that round before the gate (set by FIX_LOOP; cleared by the re-review)."""
-        return self.st.tries.get("rereview") == self.st.round and self.st.post_write
+        if mode != "not_accepted":
+            res_p = self._task(f"WRITE#{self._visit()}:r{self.st.round}:presentation", "critique",
+                               self.run_dir, "critique-presentation", self.st.round, writeup=True)
+            if res_p is None:
+                return self._budget_out("WRITE")
+        else:
+            from lib.safe_io import remove_nofollow
+            remove_nofollow(self.run_dir, "critique_presentation.yaml", missing_ok=True)
+        if self._critics_behind_round():
+            return self._go("CRITIQUE", f"critique round {self.st.round} of the revised draft")
+        return self._go("GATE", "not-accepted report written; final gate" if mode == "not_accepted"
+                        else f"draft written ({mode}) and presentation reviewed")
 
     def _last_decision(self) -> dict | None:
         for name in (f"gate_r{self.st.round - (1 if self.st.round_pending else 0)}_post.json",
@@ -4504,17 +2268,6 @@ class Machine:
             except (OSError, ValueError):
                 continue
         return None
-
-    def _withhold_if_acceptance_language(self) -> None:
-        """F6 S1-7: whatever path ends the run, a report it did not accept is never left deliverable with
-        acceptance language in it: report.md is moved to report_withheld.md."""
-        rp = os.path.join(self.run_dir, "report.md")
-        if (not self.st.v2_rules or self.st.status in ACCEPTED_STATUSES or not os.path.exists(rp)
-                or not report_acceptance_findings(self.run_dir, "not_accepted")):
-            return
-        _quarantine_report(self.run_dir)
-        if str(self.st.status).startswith("completed"):
-            self.st.status = "completed_no_report"
 
     def _finish(self) -> None:
         self._reveal_hidden_seed()
@@ -4541,12 +2294,6 @@ class _Journaled:
         from v2_tasks import TaskResult
         res = self.m._task(key, name, *args)
         return res if res is not None else TaskResult(False, None, 0.0, "no budget left for this task")
-
-
-def _write_json(run_dir: str, rel: str, obj) -> None:
-    """A harness record in the run dir, published atomically with no link followed (lib.safe_io)."""
-    from lib.safe_io import write_nofollow
-    write_nofollow(run_dir, rel.replace(os.sep, "/"), json.dumps(obj, indent=1, default=str).encode(), atomic=True)
 
 
 def _rep_error(rep: dict) -> str:
@@ -4754,59 +2501,6 @@ def _with_abs_paths(spec: dict, run_dir: str) -> dict:
     return AB._abs_spec(spec, run_dir)
 
 
-ACCEPTED_STATUSES = ("completed", "completed_with_report_restored")
-# The final statuses under which a post-write gate's decision delivers report.md (accepted, declared or not accepted,
-# each with its write-up): only these retire a stale report_withheld.md (_retire_stale_withheld)
-DELIVERED_STATUSES = ACCEPTED_STATUSES + ("completed_scope_declared", "completed_scope_declined",
-                                          "completed_gate_not_accepted")
-STATUS_MARK = "<!-- harness: run status -->"
-
-
-def _draft_file_problems(run_dir: str) -> list[str]:
-    """The spec (required) and analysis_settings.yaml (optional) must each be a regular file with one link: the pre-sign
-    checks read them by path, so a symbolic or hard link would show them another file's content (Codex r4 P1-5)."""
-    import stat
-    out = []
-    for rel, required in ((AB.SPEC_FILE, True), (AB.SETTINGS_FILE, False)):
-        try:
-            st = os.lstat(os.path.join(run_dir, rel))
-        except FileNotFoundError:
-            if required:
-                out.append(f"spec unreadable: {rel} does not exist")
-            continue
-        except OSError as e:
-            out.append(f"{rel} cannot be read: {type(e).__name__}")
-            continue
-        if stat.S_ISLNK(st.st_mode) or not stat.S_ISREG(st.st_mode):
-            out.append(f"{rel} is a link or not a regular file: write it as a plain file")
-        elif st.st_nlink > 1:
-            out.append(f"{rel} has {st.st_nlink} hard links: write it as its own file")
-    return out
-
-
-def _special_files(run_dir: str, limit: int = 20000) -> list[str]:
-    """Every entry in the run directory that is not a regular file, a directory or a link to one (a FIFO, a device, a
-    socket), as problems: a check or a derivation that opens one can block with no writer. The whole run is walked
-    (no link followed), so the result does not depend on how a path in the spec is spelled (Codex r1 on #350). Fail
-    closed past `limit` entries."""
-    import stat
-    out, n = [], 0
-    for base, dirs, files in os.walk(run_dir):
-        for name in dirs + files:
-            n += 1
-            if n > limit:
-                return out + [f"the run directory has more than {limit} entries: its files were not checked"]
-            p = os.path.join(base, name)
-            try:
-                mode = os.stat(p).st_mode           # a link: its target's type
-            except OSError:
-                continue                            # a dangling link opens nothing
-            if not (stat.S_ISREG(mode) or stat.S_ISDIR(mode)):
-                out.append(f"{os.path.relpath(p, run_dir)!r} in the run is not a regular file: remove it, or write "
-                           "a plain file")
-    return out
-
-
 CARRIED = "from an earlier try, still unresolved: "
 
 
@@ -4824,390 +2518,6 @@ def _carry_feedback(errs: list, earlier: list | None, cap: int = 40) -> list:
     return out[:max(cap, len(errs))]          # the cap trims the carried items only (Codex r1 P2-6)
 
 
-def _status_line(run_dir: str, status: str | None) -> str:
-    """F6 S1-7: the run status, from .claude/orchestration/acceptance_language.yaml (a declared-scope
-    run reads "declared scope, not accepted"). Without a status: the run state's, else the write mode's."""
-    if status is None:
-        try:
-            st = load_state(run_dir)
-        except (OSError, ValueError, TypeError):
-            st = None
-        status = (st.status or {"declared": "completed_scope_declared", "not_accepted": "not_accepted"}.get(
-            st.write_mode or "", "pending")) if st else "pending"
-    try:
-        lines = load_acceptance_language()["status_lines"]
-    except Exception:  # noqa: BLE001 -- fail closed: never reads as accepted
-        lines = {}
-    text = lines.get(status) or (lines.get("pending") if status == "pending" else lines.get("other")) or "not accepted"
-    return f"{STATUS_MARK}\n**Run status: {text}.** (`{status}`; rendered by the harness)\n\n"
-
-
-def _lead_may_accept(item: dict, ledger: dict | None = None) -> bool:
-    """Owner policy (2026-11-24): under --signoff lead, the lead may provisionally accept harness-known
-    decision-test / conflict / departure items and non-HIGH findings, never an open critic HIGH finding.
-    Fails closed on missing or unrecognised severity, or when either the ledger or the request item says critic HIGH."""
-    fid = item.get("finding")
-    f = (ledger or {}).get(fid) if fid else None
-    kind = item.get("kind") or (getattr(f, "kind", None) if f is not None else None)
-    src = item.get("source") or (getattr(f, "source", None) if f is not None else None)
-    is_critic = (kind == FL.CRITIC_KIND) or (isinstance(src, str) and src.startswith("critique"))
-    if not is_critic:
-        return True
-    lsev = getattr(f, "severity", None) if f is not None else None
-    isev = item.get("severity")
-    if lsev is None and isev is None:
-        return False
-    if lsev is not None and not (isinstance(lsev, str) and lsev.upper() in FL.NON_HIGH_SEVERITIES):
-        return False
-    if isev is not None and not (isinstance(isev, str) and isev.upper() in FL.NON_HIGH_SEVERITIES):
-        return False
-    return True
-
-
-def _plan_changing(item: dict) -> bool:
-    """An owner item whose evidence shows the plan changes: a decision-bearing kind, a declaration whose decision
-    test changes the decision, or a W0-F evidence conflict whose verdict changes the plan (or whose test did not run:
-    W0-F counts that as changing it; Codex r4 of #316)."""
-    conf = item.get("conflict")
-    if item.get("kind") == "evidence_conflict_declared" and not isinstance(conf, dict):
-        return True     # a request saved before the verdict was carried: it holds only plan-changing or untested ones
-    return item.get("kind") in DECISION_BEARING_KINDS or (isinstance(conf, dict) and conf.get("changes_plan") is True) \
-        or any((d.get("test") or {}).get("decision_changes") is True
-               for d in item.get("declarations") or [] if isinstance(d, dict))
-
-
-def provisional_lines(run_dir: str) -> tuple[list[str], list[str]]:
-    """(lines above the draft, a section after it): the lead's provisional decisions of a --signoff lead run (D2),
-    the owner items answered (scripts/scope_signoff.py provisional) and the engine departures credited
-    (`provisional_lead` in engine_choice.json). Those whose decision test changes the plan head the report."""
-    import scope_signoff as SS
-    try:
-        rows = [(r.get("finding"), bool(r.get("plan_changing")), (r.get("review") or {}).get("decision"))
-                for r in SS.provisional(run_dir)]
-    except Exception as e:  # noqa: BLE001 -- fail closed: the report says the list could not be read
-        return ([f"**Provisional decisions: the list could not be read ({type(e).__name__}).**\n\n"],
-                ["", "## Provisional decisions (the lead's)", "", f"Could not be read: {type(e).__name__}: {e}"])
-    try:
-        ch = json.load(open(os.path.join(run_dir, AB.ENGINE_CHOICE)))
-        deps = [d for d in ch.get("engine_departures") or [] if isinstance(d, dict) and d.get("status") == "provisional_lead"]
-    except (OSError, ValueError, AttributeError):
-        deps = []
-    try:
-        changes = {str(t.get("id")) for t in (json.load(open(os.path.join(run_dir, AB.ANALYSIS_JSON))) or {}).get(
-            "decision_tests") or [] if isinstance(t, dict) and t.get("plan_changes")}
-    except (OSError, ValueError, AttributeError, TypeError):
-        changes = set()
-    rows += [(f"engine departure {d.get('benchmark') or d.get('component')}", str(d.get("decision_test")) in changes,
-              None) for d in deps]
-    if not rows:
-        return [], []
-    flagged = [f for f, pc, _r in rows if pc]
-    how = (f"`python3 scripts/scope_signoff.py review {run_dir} --finding <id> --confirm|--overturn`; an engine departure "
-           "is confirmed by the owner's signature of the spec in a relaunch")
-    top = [f"**Provisional decisions that change the plan.** This run was unattended (`--signoff lead`); the lead "
-           f"answered, provisionally, {len(flagged)} decision(s) that are the owner's and whose decision test changes the "
-           f"plan: {', '.join(map(str, flagged))}. The owner confirms or overturns each ({how}).\n\n"] if flagged else []
-    sec = ["", "## Provisional decisions (the lead's, under --signoff lead; for the owner's review)", "",
-           f"Each decision below is the owner's; the lead made it provisionally so the run could finish. Review: {how}.", ""]
-    # a decision test that did not run has no verdict on the plan (Codex r1 of #375, P1-3): never "no"
-    untested = [f for f, _pc, _r in rows if str(f).startswith(tuple(f"{k}:" for k in FL.NOT_RUN_KINDS))]
-    if untested:
-        top.append(f"**Provisional decisions on decision tests that did not run.** The lead accepted, provisionally, "
-                   f"going on without {len(untested)} declared decision test(s) that did not run: "
-                   f"{', '.join(map(str, untested))}. The plan was not tested against them. The owner confirms or "
-                   f"overturns each ({how}).\n\n")
-    sec += [f"- **{f}**: accepted provisionally; plan changes: "
-            f"{'not tested (the decision test did not run)' if f in untested else 'yes' if pc else 'no'}; owner review: "
-            f"{r or 'not yet'}." for f, pc, r in rows]
-    return top, sec
-
-
-def dependence_lines(run_dir: str, stale_out: list | None = None) -> list[str]:
-    """Owner decision (b), 2026-11-23: a decision test that changes the plan, which the owner (or, under --signoff lead,
-    the lead provisionally) accepted, lets the run ACCEPT; the report states the dependence at its top: which input the
-    test varies, at each plan-changing value how many units change package and which, the re-solved plan, and who
-    accepted it. From the ledger's owner_accepted rows and the record each answer bound: the record is read once, its
-    fingerprint recomputed from that read and compared with the accepted one, and a toolkit result file is hashed on
-    the bytes it is parsed from, against the hash the accept bound; a record changed since, or one without a bound
-    hash, is never shown as accepted, and its id goes to `stale_out` (Codex r1-r3 of #357)."""
-    try:
-        led = FL.load(run_dir)
-    except Exception as e:  # noqa: BLE001 -- fail closed: the report says the list could not be read
-        return [f"**Accepted dependence of the plan: the list could not be read ({type(e).__name__}).**\n\n"]
-    rows = sorted((f for f in led.values() if f.kind in DECISION_BEARING_KINDS and f.status == "owner_accepted"),
-                  key=lambda f: f.id)
-    if not rows:
-        return []
-    from toolkit.analysis import contract as _CT
-    import yaml
-    try:
-        ref = (_CT._verified_doc(run_dir)[3] or {}).get("reference_plan")
-    except Exception:  # noqa: BLE001 -- not the point-value plan: said of the delivered plan
-        ref = None
-    evs = {f.id: next((e for e in reversed(f.events or []) if isinstance(e, dict)
-                       and e.get("status") == "owner_accepted"), {}) for f in rows}
-    by_lead = all(e.get("by") == "lead" for e in evs.values())
-    # who decided: the lead alone in a lead run before any owner review (Codex r3 of #357, P1-9)
-    whose = ("The lead accepted the plan with that dependence, provisionally, under `--signoff lead`; the owner confirms "
-             "or overturns each" if by_lead else "Each was accepted as its line says")
-    out = ["## The plan depends on inputs the owner accepted\n\n" if not by_lead else
-           "## The plan depends on inputs the lead accepted provisionally\n\n",
-           "Each decision test below re-solves the plan over the range it tests and changes it there; each line says "
-           f"which plan its units and feasibility are counted against. {whose} (harness-rendered).\n\n"]
-    for f in rows:
-        ev = evs[f.id]
-        who = ("the lead, provisionally (`--signoff lead`; the owner confirms or overturns it)" if ev.get("by") == "lead"
-               else "the owner")
-        line = f"- **{f.key or f.id}**: accepted by {who}" + (f" at {ev['at']}" if ev.get("at") else "")
-        v_now = {"kind": f.kind, "key": f.key, "claim": f.claim, "source": "toolkit/analysis/contract.py"}
-        stale_line = (line + "; its record has changed since it was accepted, so the gate asks again and the values "
-                             "are not repeated here.\n")
-        # a record the accept bound that holds no verifiable values: listed, none shown (not a changed record)
-        bare_line = line + "; no verified values are recorded for it, so none are shown.\n"
-
-        def stale():
-            out.append(stale_line)
-            if stale_out is not None:
-                stale_out.append(f.id)
-        try:
-            rec = _bearing_record(run_dir, v_now)           # one read: fingerprinted and shown (P1-6)
-            same = bool(ev.get("fingerprint")) and _bearing_fp(v_now, rec) == ev["fingerprint"]
-        except Exception:  # noqa: BLE001 -- cannot be compared: not shown as accepted
-            rec, same = None, False
-        if not same:                  # P1-5 (r2): the record the answer bound is not the one there now
-            stale()
-            continue
-        if not isinstance(rec, dict):         # the accept bound no record: nothing shown
-            out.append(bare_line)
-            continue
-        res, changed = None, False
-        try:
-            if rec.get("path") and rec.get("result_sha256") and rec.get("result_sha256") == ev.get("result_sha256"):
-                raw = open(os.path.join(run_dir, str(rec["path"])), "rb").read()
-                # the bytes shown are the bytes the accept bound (P1-4): hashed as read, against the bound hash
-                if hashlib.sha256(raw).hexdigest() == ev["result_sha256"]:
-                    res = yaml.safe_load(raw.decode("utf-8")) or {}
-                else:
-                    changed = True
-        except Exception:  # noqa: BLE001 -- not verified: not shown
-            res = None
-        if changed:                          # other bytes than the accepted ones: a changed record
-            stale()
-            continue
-        if not isinstance(res, dict):        # no bound hash (r3, P1-8): never shown as accepted
-            out.append(bare_line)
-            continue
-        what = str(res.get("varied") or res.get("question") or "the input this test varies")
-        against = ("the point-value plan (the delivered plan is the expected-value plan over the uncertainty draws, "
-                   "which the test does not re-solve)") if ref == "point_plan" else "the delivered plan"   # P1-10
-        vals = []
-        for r in res.get("results") or []:
-            if not isinstance(r, dict) or not r.get("decision_changes"):
-                continue
-            ids = r.get("units_changed_ids")
-            names = f" ({', '.join(map(str, ids))})" if isinstance(ids, list) and ids else ""     # every one (P2-13)
-            cm = r.get("cost_multipliers")
-            # a price case names its cost items and multipliers, not "case" (P2-12)
-            at = ", ".join(f"{k} x{v}" for k, v in cm.items()) if isinstance(cm, dict) and cm else r.get("value")
-            vals.append(f"at {at}: {r.get('units_changed')} unit(s) change package{names}"
-                        + (f"; re-solved plan {r['recommendation']}" if r.get("recommendation") else "")
-                        + ("; the reference plan is not feasible there" if r.get("point_plan_feasible") is False else "")
-                        # an unproven solve: the change may lie within the solver's bound (P1-10)
-                        + ("; not settled within the solver's gap" if r.get("within_solver_gap") else ""))
-        out.append(f"{line}; varies {what}; counted against {against}"
-                   + (". " + "; ".join(vals) + ".\n" if vals else ".\n"))
-    return out + ["\n"]
-
-
-def amendment_lines(run_dir: str) -> list[str]:
-    """lead-gaps β: a run made by an amendment its owner has not signed (the lead's, provisional) heads its report with
-    the amendment: its id, reason and changes, from toolkit/spec/amend.py's record. Nothing once the owner signs. The
-    S7 handoff event in run_state.json keeps the heading when the record is lost (Codex r1) and selects the wording."""
-    p = os.path.join(run_dir, AMENDMENT_RECORD)
-    try:
-        st = load_state(run_dir)
-    except (OSError, ValueError):
-        st = None
-    s7 = next((h for h in (st.history if st else []) if isinstance(h, dict) and h.get("provisional_amendment")), None)
-    if not os.path.lexists(p) and s7 is None:
-        return []
-    try:
-        from toolkit.spec import signoff as SO
-        so = SO._spec_record(run_dir) if SO.status(run_dir) == "signed" else None
-        by = (so or {}).get("signed_by") or (so or {}).get("by")
-    except Exception:  # noqa: BLE001 -- unknown signer: listed as provisional
-        by = None
-    if by == "owner":
-        return []
-    try:
-        rec = json.load(open(p))
-        ch = "; ".join(f"{c.get('op')} `{c.get('path')}`" + ("" if c.get("op") == "remove" else
-                                                             f" to {json.dumps(c.get('after'), default=str)[:160]}")
-                       for c in rec.get("changes") or [] if isinstance(c, dict))
-        parent = _parent_of(run_dir, (rec.get("parent_run") or {}).get("run_dir"))
-    except (OSError, ValueError, AttributeError, TypeError) as e:
-        return [f"**Provisional amendment of the signed spec ({(s7 or {}).get('provisional_amendment') or 'unnamed'}): "
-                f"its record could not be read ({type(e).__name__}); the owner has not reviewed it.**\n\n"]
-    if s7 is not None:
-        how = "which the lead made from that run's rethink request and signed provisionally"
-        cmd = (f"the owner confirms it by amending the parent with the same patch and signing that child "
-               f"(`python3 -m toolkit.spec.amend {shlex.quote(str(parent))} --from-request --signoff owner`), or "
-               "overturns it by amending the parent differently or not at all")
-    else:          # a manual amendment (amend --patch) the lead signed
-        how = "made with toolkit/spec/amend.py and not signed by the owner"
-        cmd = "the owner confirms it by amending the parent with the same patch file and signing that child"
-    return [f"**Provisional amendment of the signed spec.** This run continues `{parent}` under amendment "
-            f"`{rec.get('id')}`, {how} (signed by {by or 'nobody yet'}); the owner has not reviewed it. Reason: "
-            f"{' '.join(str(rec.get('reason')).split())[:500]} Changes: {ch or 'none recorded'}. {cmd[0].upper() + cmd[1:]}."
-            "\n\n"]
-
-
-def render_report(run_dir: str, backend=None, status: str | None = None) -> str:
-    """report.md = the run status line, the writer's draft, and the blocks the harness renders from
-    artifacts: the headline numbers, the declared limits and open findings (in full, with their
-    required remedy), and the deliverable file the spec names."""
-    import yaml
-    import render_claims as RCL
-    backend = backend or AB.backend("toolkit")
-    draft = open(os.path.join(run_dir, "manuscript.md")).read()
-    known = _ledger_claims(run_dir)
-    if known is not None:
-        # The writer writes [CLAIM:id]; the harness substitutes the value (no number is typed).
-        try:
-            # the valid claims; an invalid one stays a reference, reported by report_claim_findings
-            draft, _unresolved = RCL.render_text(RCL.normalise_refs(draft, known), known)
-        except Exception:  # noqa: BLE001 -- left unrendered; report_claim_findings flags it
-            pass
-    try:
-        h = backend.headline(run_dir)
-    except FileNotFoundError:
-        if any(os.path.lexists(os.path.join(run_dir, "analysis", f)) for f in ("point.yaml", "estimates.yaml")):
-            raise
-        h = {}
-    lines = ["", "<!-- harness: rendered from analysis/analysis.json -->", "## Numbers (rendered by the harness)", "",
-             "| quantity | value |", "|---|---|"]
-    lines += [f"| {k} | {v:,.4g} |" if isinstance(v, (int, float)) else f"| {k} | {v} |" for k, v in h.items()]
-    try:    # engine parameter values the signed spec sets, each with the card value it replaces (HIGH when outside)
-        from toolkit.spec import engine_parameters as PV
-        sv = PV.report_block(run_dir)
-    except Exception as e:  # noqa: BLE001 -- fail closed: the report says the block could not be rendered
-        sv = ["## Engine parameter values set by the signed spec", "",
-              f"Could not be rendered from analysis/engine.yaml: {type(e).__name__}: {e}", ""]
-    if sv:
-        lines += [""] + sv[:-1]
-    decl, sd_find = [], []
-    if os.path.exists(os.path.join(run_dir, "scope_declaration.yaml")):
-        try:   # every shape the gate reads, each entry's full text (lib.scope_declarations)
-            from lib import scope_declarations as SD
-            _doc, decl, sd_find = SD.load(run_dir)
-        except Exception as e:  # noqa: BLE001 -- fail closed: the report says so
-            SD, sd_find = None, [{"claim": f"{type(e).__name__}: {e}"}]
-    if decl or sd_find:
-        lines += ["", "## Declared limits (rendered in full from scope_declaration.yaml)", ""]
-        lines += [f"- scope_declaration.yaml could not be read: {f.get('claim')}" for f in sd_find]
-        for e in decl:
-            ids = [str(x) for k in SD.STRUCTURED_ID_FIELDS
-                   for x in (e.get(k) if isinstance(e.get(k), list) else [e.get(k)]) if x]
-            text = " ".join(f"{f.replace('_', ' ').capitalize()}: {' '.join(str(e[f]).split())}"
-                            for f in SD.JUSTIFICATION_FIELDS if e.get(f))
-            fix = _remedy(e)
-            lines.append(f"- **{e.get('id') or 'unnamed'}** ({', '.join(ids) or 'no finding named'}): "
-                         f"{text or 'no text given.'}" + (f" Required remedy: {fix}" if fix else ""))
-    try:
-        dec2 = (yaml.safe_load(open(os.path.join(run_dir, DECLARED_FILE))) or {})
-    except OSError:
-        dec2 = {}
-    if dec2.get("declared"):
-        lines += ["", "## Open findings, declared (not resolved)", "", str(dec2.get("rationale") or ""), ""]
-        lines += [f"- **{e['id']}** ({e['severity']}, {e['source']}): {e['claim']} Required remedy: "
-                  f"{e.get('required_remedy') or 'not stated by the finding.'}"
-                  # (planner text, quoted by write_declared as the claim and remedy are)
-                  + (f" Harness gap (no fix task can make this change): {e['harness_gap']}" if e.get("harness_gap")
-                     else "") for e in dec2["declared"]]
-    try:            # v2 autonomy 1B-ii: who drafted and signed the evidence dossier, and its declared gaps
-        from toolkit.spec import evidence_draft as EDR
-        so = {}
-        for f in (SIGNOFF_FILE, "decision_brief.signoff.json"):     # Codex r1 P2-11: the record that binds the spec
-            try:
-                d_ = json.load(open(os.path.join(run_dir, f)))
-            except (OSError, ValueError):
-                continue
-            binds = isinstance(d_, dict) and ((d_.get("sha256") or {}).get(AB.SPEC_FILE) if isinstance(
-                d_.get("sha256"), dict) else None) or (isinstance(d_, dict) and d_.get("spec_sha256"))
-            if binds and (d_.get("signed_by") or d_.get("by")):     # r2 P2-5: a brief that never bound the spec
-                so = d_
-                break
-        eb = EDR.report_block(run_dir, so.get("signed_by") or so.get("by"))
-    except Exception as e:  # noqa: BLE001 -- fail closed: the report says the block could not be rendered
-        eb = ["## Evidence dossier", "", f"Could not be rendered from the evidence record: {type(e).__name__}.", ""]
-    if eb:
-        lines += [""] + eb[:-1]
-    from toolkit.analysis import conflicts as CF       # W0-F: every held-out calibration target
-    cl = CF.report_lines(run_dir)
-    if cl:
-        lines += [""] + cl[:-1]
-    wmp = os.path.join(run_dir, "world_model", "world_model.md")    # §14: rendered by the harness from score.json
-    try:
-        if os.path.isfile(wmp) and not os.path.islink(wmp):
-            lines += ["", open(wmp, encoding="utf-8").read().rstrip()]
-    except (OSError, ValueError) as e:      # fail soft: the report is rendered without it, and says so
-        lines += ["", f"## World model\n\nThe world-model section could not be read: {type(e).__name__}."]
-    top, prov = provisional_lines(run_dir)
-    lines += prov
-    stale_dt: list = []
-    from toolkit.engines.built import signoff as _BSIG
-    be_disc = _BSIG.report_disclaimer_lines(run_dir)
-    head = (_status_line(run_dir, status) + "".join(be_disc) + "".join(amendment_lines(run_dir)) + "".join(top)
-            + "".join(dependence_lines(run_dir, stale_dt)))
-    body = draft.rstrip() + "\n"
-    from toolkit.spec import review_conditions as RCN       # W0-G: conditions the lead deferred, at the top
-    rcl = RCN.report_lines(run_dir)
-    if rcl:
-        head = head + "\n".join(rcl) + "\n"
-    # hb2: what the harness quotes (findings, remedies, declarations) shows values or words, never a reference: a
-    # reference left in report.md is then the writer's, in the writer's span.
-    head, tail = RCL.quote_refs(head, known or {}), RCL.quote_refs("\n".join(lines), known or {})
-    full = head + body + tail + "\n"
-    _put(run_dir, "report.md", full)
-    # What the harness added, authenticated by the report's hash: writer_qa checks only the writer's span.
-    _write_json(run_dir, "report_render.json", {"report_sha256": hashlib.sha256(full.encode("utf-8")).hexdigest(),
-                                                "writer_span": [len(head), len(head) + len(body)],
-                                                "dependence_stale": sorted(stale_dt)})
-    _write_deliverable(run_dir)
-    return os.path.join(run_dir, "report.md")
-
-
-def _render_stale(run_dir: str) -> list:
-    """The accepted decision tests the last rendering could not state as accepted (dependence_lines); unreadable: all
-    of them count as stale (fail closed)."""
-    try:
-        doc = json.load(open(os.path.join(run_dir, "report_render.json")))
-        st = doc.get("dependence_stale") if isinstance(doc, dict) else None
-        return list(st) if isinstance(st, list) else ["report_render.json"]
-    except (OSError, ValueError):
-        return ["report_render.json"]
-
-
-def _write_deliverable(run_dir: str) -> None:
-    """The spec may name a deliverable file and its columns (from the allocation the harness
-    computed): `deliverable_file: {path, columns: {out_col: allocation_col}, package_names: {...}}`."""
-    import csv
-    import yaml
-    spec = yaml.safe_load(open(os.path.join(run_dir, AB.SPEC_FILE))) or {}
-    df = spec.get("deliverable_file")
-    src = os.path.join(run_dir, AB.ALLOCATION_CSV)
-    if not isinstance(df, dict) or not os.path.exists(src) or deliverable_problems(run_dir):
-        return                      # an invalid destination is a HIGH finding, never written
-    rows = list(csv.DictReader(open(src)))
-    names = df.get("package_names") or {}
-    import io
-    buf = io.StringIO(newline="")
-    w = csv.writer(buf)
-    cols = df["columns"]
-    w.writerow(list(cols))
-    for r in rows:
-        w.writerow([names.get(r[c], r[c]) if c == "package" else r[c] for c in cols.values()])
-    _put(run_dir, str(df["path"]), buf.getvalue())
 
 
 # A relaunch with reuse (a new run dir from another one's spec and stored rows) names its parent here; the launcher
@@ -5283,7 +2593,7 @@ def _record_invocation(run_dir: str, budget_usd, cap_usd) -> None:
 
 def init_run(run_dir: str, question: str, max_rounds: int = 3, signoff: str = "owner", gate_mode: str = "v2",
              budget_usd: float | None = None, derived_inputs: bool = True, derive_unsandboxed: bool = False,
-             world_model: bool = True, engine_build_usd: float | None = None,
+             engine_build_usd: float | None = None,
              engine_unsandboxed: bool = False, acquire: str = "off") -> RunState:
     if acquire not in ("off", "auto"):
         raise ValueError(f"acquire must be 'off' or 'auto', got {acquire!r}")
@@ -5297,7 +2607,7 @@ def init_run(run_dir: str, question: str, max_rounds: int = 3, signoff: str = "o
     st = RunState(question=question, state="ACQUIRE" if acquire == "auto" else "SPEC",
                   max_rounds=max_rounds, signoff=signoff, gate_mode=gate_mode, budget_usd=budget_usd,
                   derived_inputs=derived_inputs, derive_unsandboxed=derive_unsandboxed,
-                  engine_unsandboxed=engine_unsandboxed, world_model_stages=world_model,
+                  engine_unsandboxed=engine_unsandboxed,
                   engine_build_cap_usd=eb_cap, acquire=acquire)
     try:   # keep what main.py recorded first (run_dir, pipeline, commit, launcher: scripts/lib/pipeline_id.py)
         meta = json.load(open(os.path.join(run_dir, "metadata.json")))
@@ -5321,853 +2631,46 @@ def run_v2(question: str, run_dir: str, tasks, max_rounds: int = 3, signoff: str
            acquire: str = "off") -> str:
     """Entry point for main.py --v2 (and the dry run). Resumes when run_state.json exists, also a run that ended
     run_failed because its analysis step timed out, was killed or lost engine rows to the machine
-    (Machine.reopen_interrupted_analysis). Holds the whole-run lock across --signoff lead runs AND across every
-    built-engine run / build-lane state in any mode (owner decision on #330, BE31)."""
+    (Machine.reopen_interrupted_analysis). Holds _run_lock across built-engine runs/states (BE31)."""
     try:
         prev = load_state(run_dir)
     except (OSError, ValueError):
         prev = None
     need_lock = (
-        signoff == "lead"
-        or (prev is not None and (
-            prev.signoff == "lead"
-            or prev.state in ("ENGINE_BUILD", "ENGINE_ADMIT", "ENGINE_REVIEW", "ENGINE_SIGN")
+        (prev is not None and (
+            prev.state in ("ENGINE_BUILD", "ENGINE_ADMIT", "ENGINE_REVIEW", "ENGINE_SIGN")
             or bool(getattr(prev, "engine_build", None))
         ))
         or spec_has_engine_build(run_dir)
     )
-    if not need_lock:
-        return _run_v2_chain(question, run_dir, tasks, max_rounds, signoff, budget_usd, log, derive_unsandboxed,
-                             backend, cross_engine_check, _depth, _stamp, engine_build_usd, engine_unsandboxed,
-                             acquire=acquire)
-    os.makedirs(run_dir, exist_ok=True)
-    with _amend_lock(run_dir):     # held through hand-off, child run, and built-engine stages (BE31)
-        return _run_v2_chain(question, run_dir, tasks, max_rounds, signoff, budget_usd, log, derive_unsandboxed,
-                             backend, cross_engine_check, _depth, _stamp, engine_build_usd, engine_unsandboxed,
-                             acquire=acquire)
 
-
-def _run_v2_chain(question, run_dir, tasks, max_rounds, signoff, budget_usd, log, derive_unsandboxed, backend,
-                  cross_engine_check, _depth, _stamp, engine_build_usd=None, engine_unsandboxed=False,
-                  acquire="off") -> str:
-    """One run dir, then the child its provisional amendment handed it to (run_v2, under the caller's lock)."""
-    child, status = _run_v2_once(question, run_dir, tasks, max_rounds, signoff, budget_usd, log,
-                                 derive_unsandboxed, backend, cross_engine_check, _stamp,
-                                 engine_build_usd, engine_unsandboxed, acquire=acquire)
-    if child is None or _depth >= 8:          # a bounded chain (a restored cycle cannot recurse: Codex r2)
-        return status
-    # lead-gaps β: the run continues in the child its provisional amendment made (same process, commit and launcher);
-    # the child is stamped only once its own lock is held
-    try:
-        meta = json.load(open(os.path.join(run_dir, "metadata.json")))
-        ident = {k: meta.get(k) for k in ("pipeline", "commit", "launcher")}
-    except (OSError, ValueError, AttributeError) as e:
-        log(f"[machine] the child run's identity was not read: {type(e).__name__}: {e}")
-        ident = None
-    cst = load_state(child)
-    log(f"[machine] continuing in {child} (provisional amendment)")
-    return run_v2(cst.question, child, tasks.for_run_dir(child), max_rounds=cst.max_rounds, signoff="lead",
-                  budget_usd=cst.budget_usd, log=log, derive_unsandboxed=derive_unsandboxed, backend=backend,
-                  cross_engine_check=cross_engine_check, _depth=_depth + 1, _stamp=ident,
-                  engine_build_usd=getattr(cst, "engine_build_cap_usd", None),
-                  engine_unsandboxed=engine_unsandboxed,
-                  acquire=getattr(cst, "acquire", "off"))
-
-
-def _run_v2_once(question, run_dir, tasks, max_rounds, signoff, budget_usd, log, derive_unsandboxed, backend,
-                 cross_engine_check, stamp, engine_build_usd=None, engine_unsandboxed=False,
-                 acquire="off") -> tuple:
-    """(the child to continue in or None, the status) of one run dir."""
-    if stamp:
-        try:
-            from lib import pipeline_id
-            pipeline_id.stamp(run_dir, stamp)
-        except Exception as e:  # noqa: BLE001 -- the identity stamp only; the run records its own invocation below
-            log(f"[machine] the child run's identity was not stamped: {type(e).__name__}: {e}")
-    st = init_run(run_dir, question, max_rounds, signoff, "v2", budget_usd, derive_unsandboxed=derive_unsandboxed,
-                  engine_build_usd=engine_build_usd, engine_unsandboxed=engine_unsandboxed, acquire=acquire)
-    if st.paused == AWAITING_BUDGET and budget_usd and budget_usd > (st.budget_usd or 0):
-        # the owner resumes a run paused below the allowance floor with a higher cap: recorded, never lowered
-        st.history.append({"at": _now(), "budget_raised": {"from": st.budget_usd, "to": budget_usd},
-                           "spent_usd": round(st.spent_usd, 4)})
-        st.budget_usd = budget_usd
-        save_state(run_dir, st)
-    if st.paused == AWAITING_BUDGET and engine_build_usd is not None:
-        new_cap = min(float(engine_build_usd), ENGINE_BUILD_CAP_MAX_USD)
-        if new_cap > float(st.engine_build_cap_usd or ENGINE_BUILD_CAP_USD):
-            st.history.append({"at": _now(), "engine_build_cap_raised": {"from": st.engine_build_cap_usd, "to": new_cap}})
-            st.engine_build_cap_usd = new_cap
+    def _run_once() -> str:
+        st = init_run(run_dir, question, max_rounds, signoff, "v2", budget_usd, derive_unsandboxed=derive_unsandboxed,
+                      engine_build_usd=engine_build_usd, engine_unsandboxed=engine_unsandboxed, acquire=acquire)
+        if st.paused == AWAITING_BUDGET and budget_usd and budget_usd > (st.budget_usd or 0):
+            st.history.append({"at": _now(), "budget_raised": {"from": st.budget_usd, "to": budget_usd},
+                               "spent_usd": round(st.spent_usd, 4)})
+            st.budget_usd = budget_usd
             save_state(run_dir, st)
-    _record_invocation(run_dir, budget_usd, st.budget_usd)
-    m = Machine(run_dir, tasks, st, backend=backend, log=log, cross_engine_check=cross_engine_check)
-    m.reopen_interrupted_analysis()
-    status = m.run()
-    return handoff_child(run_dir), status
+        if st.paused == AWAITING_BUDGET and engine_build_usd is not None:
+            new_cap = min(float(engine_build_usd), ENGINE_BUILD_CAP_MAX_USD)
+            if new_cap > float(st.engine_build_cap_usd or ENGINE_BUILD_CAP_USD):
+                st.history.append({"at": _now(), "engine_build_cap_raised": {"from": st.engine_build_cap_usd, "to": new_cap}})
+                st.engine_build_cap_usd = new_cap
+                save_state(run_dir, st)
+        _record_invocation(run_dir, budget_usd, st.budget_usd)
+        m = Machine(run_dir, tasks, st, backend=backend, log=log, cross_engine_check=cross_engine_check)
+        m.reopen_interrupted_analysis()
+        return m.run()
 
-
-def _child_of(run_dir: str, recorded, strict: bool = False) -> str | None:
-    """The child dir a parent recorded, resolved beside the parent as it is now (a restored copy moves both: Codex r1),
-    and only when the child's metadata names this parent (by directory name)."""
-    if not isinstance(recorded, str) or not recorded:
-        return None
-    here = os.path.join(os.path.dirname(os.path.abspath(run_dir)), os.path.basename(recorded.rstrip(os.sep)))
-    if os.path.islink(here):          # a link to another tree is not this run's child (Codex r1 of #349)
-        return None
-    try:
-        pr = (json.load(open(os.path.join(here, "metadata.json"))) or {}).get("parent_run") or {}
-    except (OSError, ValueError, AttributeError):
-        return None
-    ok_ = os.path.basename(str(pr.get("run_dir") or "").rstrip(os.sep)) == os.path.basename(os.path.abspath(run_dir))
-    if ok_ and strict:      # a finished parent: the child binds its final state (r2); a missing digest binds none (r3)
-        try:
-            ok_ = isinstance(pr.get("run_state_sha256"), str) and hashlib.sha256(
-                open(os.path.join(run_dir, STATE_FILE), "rb").read()).hexdigest() == pr["run_state_sha256"]
-        except OSError:
-            ok_ = False
-    return here if ok_ and os.path.realpath(here) != os.path.realpath(run_dir) else None
-
-
-def _parent_of(run_dir: str, recorded):
-    """The parent a child run continues: its sibling of the recorded name when that sibling hands off to this child (a
-    parent and child moved together: Codex r3 on #342, P2-12), else the recorded path."""
-    if not isinstance(recorded, str) or not recorded:
-        return recorded
-    here = os.path.join(os.path.dirname(os.path.abspath(run_dir)), os.path.basename(recorded.rstrip(os.sep)))
-    c = handoff_child(here)
-    if c and os.path.realpath(c) == os.path.realpath(run_dir):
-        return here
-    # a manual amendment's parent keeps its status: the parent-state digest the child records (in its metadata or its
-    # amendment record: Codex r2 of #349)
-    for rel in ("metadata.json", AMENDMENT_RECORD):
-        try:
-            bound = ((json.load(open(os.path.join(run_dir, rel))) or {}).get("parent_run") or {}).get(
-                "run_state_sha256")
-            if not os.path.islink(here) and isinstance(bound, str) and bound == hashlib.sha256(
-                    open(os.path.join(here, STATE_FILE), "rb").read()).hexdigest():
-                return here
-        except (OSError, ValueError, AttributeError):
-            continue
-    return recorded
-
-
-def _own_spec_digest(run_dir: str):
-    """The spec digest the run's own sign-off record binds (decision_spec.signoff.json; never a legacy brief's)."""
-    from toolkit.spec import signoff as SO
-    try:
-        rec = json.load(open(os.path.join(run_dir, SO.SPEC_SIGNOFF)))
-        m = rec.get("sha256")
-        return (m.get(AB.SPEC_FILE) if isinstance(m, dict) else None) or rec.get("spec_sha256")
-    except (OSError, ValueError, AttributeError):
-        return None
-
-
-def _made_by(child: str, req: dict, parent: str) -> bool:
-    """`child` is the run toolkit/spec/amend.py made from this rethink request of `parent`: from the signed spec the
-    request names, which the parent's own sign-off binds, with the request's patch (its id and content digest). A
-    same-named child from another backup or another patch is not this request's (Codex r1 and r2 of #349)."""
-    from toolkit.spec import amend as AM
-    try:
-        meta = json.load(open(os.path.join(child, "metadata.json")))
-    except (OSError, ValueError):
-        return False
-    req = req if isinstance(req, dict) else {}
-    sig, patch = req.get("signed_spec_sha256"), req.get("patch")
-    if not (isinstance(meta, dict) and isinstance(sig, str) and isinstance(patch, dict)):
-        return False
-    return meta.get("parent_spec_sha256") == sig == _own_spec_digest(parent) \
-        and meta.get("amendment") == str(patch.get("id") or "unnamed") \
-        and meta.get("patch_sha256") == AM.patch_sha256(patch)
-
-
-def handoff_child(run_dir: str) -> str | None:
-    """The child run a provisional lead amendment handed this run to (`amended_provisional`), when it has a state."""
-    st = _state_or_none(run_dir)
-    if st is None or st.status != AMENDED_PROVISIONAL:
-        return None
-    child = _child_of(run_dir, next((h.get("amended_to") for h in reversed(st.history)
-                                     if isinstance(h, dict) and h.get("amended_to")), None), strict=True)
-    return child if child and os.path.isfile(os.path.join(child, STATE_FILE)) else None
-
-
-def _state_or_none(run_dir: str):
-    """The run's state, or None when it is missing or cannot be read as one (Codex r3 of #349: `[]` too)."""
-    try:
-        return load_state(run_dir)
-    except Exception:  # noqa: BLE001 -- unreadable, or not a run state
-        return None
-
-
-def handoff_chain(run_dir: str, limit: int = 8, kept: bool = False) -> list[str]:
-    """Every child run this run continued in, in order; with `kept`, also a child an amendment refused at signing
-    left for the owner, or one an interrupted hand-off signed (main.py stores each with the run: Codex r1): only
-    after a recorded refusal or an unfinished hand-off, and only the child this run's request made (Codex r3 on #342,
-    P1-11; Codex r1 of #349)."""
-    return list(iter_handoff_chain(run_dir, limit, kept))
-
-
-def iter_handoff_chain(run_dir: str, limit: int = 8, kept: bool = False):
-    """handoff_chain, one run at a time: main.py stores each run before it reads the next (Codex r2 of #349)."""
-    out, cur = [], run_dir
-    while len(out) < limit:
-        nxt = handoff_child(cur)
-        if nxt is None and kept:
-            nxt = _kept_child(cur)
-            if nxt is not None and nxt not in out:
-                yield nxt
-            return
-        if nxt is None or nxt in out:
-            return
-        out.append(nxt)
-        yield nxt
-        cur = nxt
-
-
-def _kept_child(run_dir: str) -> str | None:
-    """A refused amendment's kept child, or the lead-signed child of a hand-off interrupted before the parent was saved
-    FINAL; only the child this run's request made (Codex r1 and r2 of #349)."""
-    try:
-        req = json.load(open(os.path.join(run_dir, SPEC_RETHINK_REQUEST)))
-    except (OSError, ValueError):
-        return None
-    la = req.get("lead_amendment") if isinstance(req, dict) else None
-    if not isinstance(la, dict):
-        return None
-    status = la.get("status")
-    if status in ("started", "signed_provisionally"):
-        st = _state_or_none(run_dir)
-        if st is None or st.status == AMENDED_PROVISIONAL:
-            return None
-    elif status != "refused":
-        return None
-    child = _child_of(run_dir, la.get("child"))
-    if child is None or not _made_by(child, req, run_dir):
-        return None
-    if status != "refused":              # an unfinished hand-off: only a child with its state and the lead's signature
-        from toolkit.spec import signoff as SO
-        if not (_state_or_none(child) is not None and SO.status(child) == "signed"
-                and (SO._spec_record(child) or {}).get("signed_by") == "lead"):
-            return None
-    return child
+    if not need_lock:
+        return _run_once()
+    os.makedirs(run_dir, exist_ok=True)
+    with _run_lock(run_dir):
+        return _run_once()
 
 
 # ------------------------------------------------------------------ self-test
-def _t_owner_disposes(run_dir: str) -> None:
-    """Self-tests: the owner disposes of each open review condition (deferred to the owner) and the sheet is
-    regenerated, as an owner does before signing (W0-G, owner decision 2026-11-21)."""
-    import yaml
-    from toolkit.spec import review_conditions as RC
-    rows = RC.parse(RC.read_bytes(run_dir))
-    for r in rows:
-        if not r.get("disposition"):
-            r.update(disposition="deferred", owner="owner", due="2026-12-31")
-    if rows:
-        from lib.safe_io import write_nofollow
-        write_nofollow(run_dir, RC.FILE, yaml.safe_dump({"conditions": rows}, sort_keys=False).encode(), atomic=True)
-        if os.path.exists(os.path.join(run_dir, SIGNOFF_SHEET)):
-            from toolkit.spec import signoff as SO
-            SO.write_sheet(run_dir)
-
-
-def _self_test_lead_amend(ok, td: str) -> None:
-    """lead-gaps β self-tests: S7 (a rethink of a signed spec) under --signoff lead with the fix plan's patch becomes a
-    child run signed provisionally by the lead; under owner sign-off, or without a valid patch, the run pauses."""
-    import yaml
-    from v2_tasks import StubTasks
-    from toolkit.spec import amend as AM, schema, signoff as SO
-
-    def parent(name, mode, patch, spent=3.0):
-        d = os.path.join(os.path.realpath(td), name)
-        os.makedirs(d)
-        _write_json(d, "metadata.json", {"pipeline": "v2", "commit": "0" * 40, "launcher": "t"})
-        raw = yaml.safe_load(open(schema.toy_spec(d)))      # the toy's critique findings declared, as in amend's tests
-        raw["principle_departures"] = [{"principle": 2, "check": "headline_comparator", "reason": "toy"},
-                                       {"principle": 3, "check": "baseline_burden", "reason": "toy"}]
-        yaml.safe_dump(raw, open(os.path.join(d, AB.SPEC_FILE), "w"), sort_keys=False)
-        AM._pre_sign(d, False)
-        SO.write_sheet(d)
-        SO.sign(d, mode)
-        # the rethink names its motivating finding (amend.motivation requires one); MEDIUM: no review condition
-        open(os.path.join(d, FL.LEDGER), "w").write(json.dumps({
-            "id": "D-001", "kind": FL.CRITIC_KIND, "severity": "MEDIUM", "source": "critique-domain", "status": "open",
-            "owner_state": "SPEC", "claim": "the envelope is last year's", "fix_requires": "raise the envelope"}) + "\n")
-        task = {"id": "T1", "findings": ["D-001"], "action": "rethink", "owner_state": "SPEC",
-                "brief": "raise the envelope"}
-        _write_json(d, "fix_plan_r2.json", {"round": 2, "plan": {"tasks": [dict(task, **({"patch": patch} if patch
-                                                                                     else {}))]}})
-        st = RunState(question="q", state="SPEC", round=2, max_rounds=3, signoff=mode, budget_usd=5.0, spent_usd=spent)
-        save_state(d, st)
-        return d, open(os.path.join(d, AB.SPEC_FILE), "rb").read()
-
-    good = {"id": "A1", "reason": "the envelope is the decision year's", "spec": [
-        {"set": "constraints.envelope_usd", "value": 9500}]}
-    d, spec0 = parent("lead_amend", "lead", good)
-    m = Machine(d, StubTasks({}), log=lambda *a: None, cross_engine_check=False)
-    m.step()
-    st, child = load_state(d), handoff_child(d)
-    rq = json.load(open(os.path.join(d, SPEC_RETHINK_REQUEST)))
-    cst = load_state(child) if child else None
-    ok(st.state == "FINAL" and st.status == AMENDED_PROVISIONAL and child == d + ".amend1" and rq.get("patch") == good
-       and (rq.get("lead_amendment") or {}).get("status") == "signed_provisionally"
-       and open(os.path.join(d, AB.SPEC_FILE), "rb").read() == spec0 and not any(h.get("paused") for h in st.history),
-       f"T_LEAD_AMEND under --signoff lead the rethink's patch makes a child run and the parent ends "
-       f"amended_provisional, unchanged and never paused ({st.state}, {st.status}, {child}, {rq.get('lead_amendment')})")
-    ok(cst is not None and SO.status(child) == "signed" and (SO._spec_record(child) or {}).get("signed_by") == "lead"
-       and "Provisional" in (SO._spec_record(child) or {}).get("note", "") and cst.state == "SIGN" and not cst.paused
-       and cst.signoff == "lead" and cst.budget_usd == 2.0
-       and yaml.safe_load(open(os.path.join(child, AB.SPEC_FILE)))["constraints"]["envelope_usd"] == 9500
-       and Machine(child, StubTasks({}), log=lambda *a: None)._signed_by() == "lead",
-       f"T_LEAD_AMEND_CHILD the child's spec carries the patch, signed by the lead provisionally; it resumes at SIGN with "
-       f"what is left of the cap ({cst and (cst.state, cst.paused, cst.budget_usd)})")
-    meta_c = json.load(open(os.path.join(child, "metadata.json"))) if child else {}
-    ok((meta_c.get("parent_run") or {}).get("run_state_sha256")
-       == hashlib.sha256(open(os.path.join(d, STATE_FILE), "rb").read()).hexdigest() and handoff_chain(d) == [child],
-       "T_LEAD_AMEND_LINK the child's parent link binds the parent's final state; the chain lists the child")
-    al = amendment_lines(child) if child else []
-    rec_sha = hashlib.sha256(open(os.path.join(child, AB.SPEC_FILE), "rb").read()).hexdigest() if child else None
-    ok(al and "Provisional amendment" in al[0] and "`A1`" in al[0] and "constraints.envelope_usd" in al[0]
-       and "9500" in al[0] and amendment_lines(d) == [],
-       f"T_LEAD_AMEND_REPORT the child's report heads with the amendment, as provisional ({al[:1]})")
-    if child:            # run_v2 continues in the child (stopped here at FINAL to keep the test small)
-        cst.state, cst.status = "FINAL", "completed"
-        save_state(child, cst)
-        seen = []
-        s = run_v2("q", d, StubTasks({}), signoff="lead", log=seen.append, cross_engine_check=False)
-        inv = json.load(open(os.path.join(child, "metadata.json"))).get("invocations") or []
-        ok(s == "completed" and any("continuing in" in str(x) for x in seen) and inv and inv[-1].get("commit") == "0" * 40,
-           f"T_LEAD_AMEND_HANDOFF run_v2 continues in the child and returns its status, stamped with the parent's "
-           f"identity ({s}, {inv[-1:]})")
-        rec2 = AM.amend(d, from_request=True, signoff="owner", log=lambda *a: None)     # the owner's confirmation
-        SO.sign(rec2["child"], "owner", expect_sha256=rec2["spec_sha256"], expect_sheet_sha256=rec2["sheet_sha256"],
-                expect_derivations_sha256=rec2["derivations_sha256"])
-        ok("--from-request --signoff owner" in al[0] and amendment_lines(rec2["child"]) == []
-           and rec2["spec_sha256"] == rec_sha,
-           "T_LEAD_AMEND_OWNER the owner confirms by amending the parent with the same patch (the same spec) and "
-           "signing; an owner-signed amendment is not provisional")
-    for name, mode, patch, why in (("owner_amend", "owner", good, None),
-                                   ("lead_nopatch", "lead", None, "no machine-readable patch"),
-                                   ("lead_badpatch", "lead", {"id": "A2", "reason": "r", "spec": [
-                                       {"set": "constraints.no_such_leaf", "value": 1}]}, "not found")):
-        d, spec0 = parent(name, mode, patch)
-        m = Machine(d, StubTasks({}), log=lambda *a: None, cross_engine_check=False)
-        s = m.run()
-        rq = json.load(open(os.path.join(d, SPEC_RETHINK_REQUEST)))
-        la = rq.get("lead_amendment")
-        ok(s == "paused:awaiting_spec_amendment" and not os.path.lexists(d + ".amend1")
-           and open(os.path.join(d, AB.SPEC_FILE), "rb").read() == spec0
-           and (la is None if why is None else (la.get("status") == "refused" and why in la.get("why", "")))
-           and (mode == "lead" or "patch" not in rq),
-           f"T_LEAD_AMEND_PAUSE {name}: the run pauses for the owner as before, nothing amended; an owner run's "
-           f"request carries no generated patch, so `amend --from-request --patch` stays the owner's ({s}, {la})")
-        _mp = json.load(open(os.path.join(d, "metadata.json")))
-        ok(_mp.get("status") == s and _mp.get("paused_state") == "SPEC" and _mp.get("paused_why")
-           and (why is None or why in _mp["paused_why"]),
-           f"PS2 {name}: the amendment pause is recorded in metadata.json with its reason, the lead's refusal "
-           f"included ({_mp.get('status')}, {_mp.get('paused_why')})")
-        if name == "lead_badpatch":
-            s2 = Machine(d, StubTasks({}), log=lambda *a: None, cross_engine_check=False).run()
-            la2 = json.load(open(os.path.join(d, SPEC_RETHINK_REQUEST))).get("lead_amendment")
-            ok(s2 == s and la2 == la and handoff_chain(d, kept=True) == [],
-               "T_LEAD_AMEND_REPLAY a resume keeps the first refusal (its reason) and amends nothing")
-    # Codex r1: no budget left pauses (a zero cap is not an unlimited one)
-    d, _ = parent("lead_nobudget", "lead", good, spent=4.99999)      # rounds to nothing left (Codex r2)
-    s = Machine(d, StubTasks({}), log=lambda *a: None, cross_engine_check=False).run()
-    la = json.load(open(os.path.join(d, SPEC_RETHINK_REQUEST))).get("lead_amendment") or {}
-    ok(s == "paused:awaiting_spec_amendment" and "no budget" in la.get("why", "") and not os.path.lexists(d + ".amend1"),
-       f"T_LEAD_AMEND_BUDGET with no budget left the lead does not amend ({s}, {la})")
-    # Codex r1: an interruption after the child is signed is finished on resume, never repeated
-    d, _ = parent("lead_interrupt", "lead", good)
-    mi = Machine(d, StubTasks({}), log=lambda *a: None, cross_engine_check=False)
-
-    def _boom(*a, **k):
-        raise KeyboardInterrupt("stopped")
-    mi._go = _boom
-    try:
-        mi.step()
-    except KeyboardInterrupt:
-        pass
-    Machine(d, StubTasks({}), log=lambda *a: None, cross_engine_check=False).step()
-    sti = load_state(d)
-    ok(sti.status == AMENDED_PROVISIONAL and handoff_child(d) == d + ".amend1" and not os.path.lexists(d + ".amend2"),
-       f"T_LEAD_AMEND_RESUME an interrupted handoff is finished with the same child ({sti.status})")
-    # Codex r1: a restored copy (parent and child moved together) resumes its own child; a lost record keeps the flag
-    import shutil as _sh
-    mv = os.path.join(os.path.realpath(td), "moved")
-    os.makedirs(mv)
-    _sh.copytree(d, os.path.join(mv, "lead_interrupt"))
-    _sh.copytree(d + ".amend1", os.path.join(mv, "lead_interrupt.amend1"))
-    ok(handoff_child(os.path.join(mv, "lead_interrupt")) == os.path.join(mv, "lead_interrupt.amend1"),
-       "T_LEAD_AMEND_MOVED a moved parent resolves its child beside it, not at the recorded absolute path")
-    mc = os.path.join(mv, "lead_interrupt.amend1", "metadata.json")
-    meta_m = json.load(open(mc))
-    json.dump(dict(meta_m, parent_run=dict(meta_m["parent_run"], run_state_sha256="0" * 64)), open(mc, "w"))
-    cyc = os.path.join(mv, "cyc")
-    os.makedirs(cyc)
-    save_state(cyc, RunState(question="q", state="FINAL", status=AMENDED_PROVISIONAL, history=[{"amended_to": cyc}]))
-    _write_json(cyc, "metadata.json", {"parent_run": {"run_dir": cyc}})
-    ok(handoff_child(os.path.join(mv, "lead_interrupt")) is None and handoff_child(cyc) is None
-       and handoff_chain(cyc, kept=True) == [],
-       "T_LEAD_AMEND_STRICT a sibling bound to another parent state, or the run itself, is never resumed (Codex r2)")
-    json.dump(meta_m, open(mc, "w"))
-    lost = os.path.join(mv, "lead_interrupt.amend1")
-    os.remove(os.path.join(lost, AMENDMENT_RECORD))
-    al2 = amendment_lines(lost)
-    ok(al2 and "could not be read" in al2[0] and Machine(lost, StubTasks({}), log=lambda *a: None)._provisional_amendment()
-       and AMENDMENT_RECORD in harness_owned(),
-       f"T_LEAD_AMEND_LOST without its record the child still heads its report as provisional and refuses a second lead "
-       f"amendment; no deliverable may overwrite the record ({al2[:1]})")
-    # Owner decision (#330 review): a legacy decision-brief signature never satisfies the lead's check in v2
-    d, spec0 = parent("lead_brief", "lead", good)
-    _write_json(d, "decision_brief.signoff.json", {"signed_by": "owner", "sha256": {AB.SPEC_FILE: "0" * 64}})
-    s = Machine(d, StubTasks({}), log=lambda *a: None, cross_engine_check=False).run()
-    la = json.load(open(os.path.join(d, SPEC_RETHINK_REQUEST))).get("lead_amendment") or {}
-    ok(s == "paused:awaiting_spec_amendment" and la.get("status") == "refused" and "decision brief" in la.get("why", "")
-       and not os.path.lexists(d + ".amend1") and open(os.path.join(d, AB.SPEC_FILE), "rb").read() == spec0,
-       f"T_LEAD_AMEND_BRIEF a legacy decision-brief signature is refused for a lead amendment, with the reason recorded "
-       f"({s}, {la})")
-    # Owner decision (#330 review): two processes resuming the same parent never both amend it. A held lock stops the
-    # second resumer with a clear error and nothing written; a real race leaves one child and one clear failure.
-    d, _ = parent("lead_locked", "lead", good)
-    rq0 = open(os.path.join(d, SPEC_RETHINK_REQUEST), "rb").read() if os.path.exists(
-        os.path.join(d, SPEC_RETHINK_REQUEST)) else None
-    import threading
-    errs = []
-
-    def _second():                 # another holder: a thread of its own (the lock nests within one thread)
-        try:
-            Machine(d, StubTasks({}), log=lambda *a: None, cross_engine_check=False).step()
-            errs.append(None)
-        except AmendmentLocked as e:
-            errs.append(str(e))
-    with _amend_lock(d):
-        t1 = threading.Thread(target=_second)
-        t1.start()
-        t1.join(60)
-    err = errs[0] if errs else None
-    rq1 = open(os.path.join(d, SPEC_RETHINK_REQUEST), "rb").read() if os.path.exists(
-        os.path.join(d, SPEC_RETHINK_REQUEST)) else None
-    ok(err and "another process" in err and not os.path.lexists(d + ".amend1") and rq1 == rq0
-       and load_state(d).status is None,
-       f"T_LEAD_AMEND_LOCKED a second resumer fails clearly while the lock is held and amends nothing ({err}; "
-       f"{rq0 is None})")
-    d, _ = parent("lead_race", "lead", good)
-    real_amend, gate = AM.amend, threading.Barrier(2)
-
-    def slow_amend(*a, **k):
-        import time as _t
-        _t.sleep(1.0)                 # both resumers overlap inside the amendment
-        return real_amend(*a, **k)
-    got = []
-
-    def resume():
-        try:
-            gate.wait()
-            Machine(d, StubTasks({}), log=lambda *a: None, cross_engine_check=False).step()
-            got.append("ok")
-        except AmendmentLocked as e:
-            got.append(f"locked: {e}")
-    AM.amend = slow_amend
-    try:
-        th = [threading.Thread(target=resume) for _ in range(2)]
-        [t.start() for t in th]
-        [t.join(60) for t in th]
-    finally:
-        AM.amend = real_amend
-    ok(sorted(g[:6] for g in got) == ["locked", "ok"] and handoff_child(d) == d + ".amend1"
-       and not os.path.lexists(d + ".amend2") and load_state(d).status == AMENDED_PROVISIONAL,
-       f"T_LEAD_AMEND_RACE two racing resumers: one amends and hands off, the other fails clearly ({got})")
-    # Codex r3: run_v2 holds the lock from before it reads the state to the hand-off, so a second process resuming a
-    # handed-off parent fails before writing to the parent or its child
-    child = handoff_child(d)
-    snap = {f: open(f, "rb").read() for f in (os.path.join(d, STATE_FILE), os.path.join(child, "metadata.json"),
-                                               os.path.join(child, STATE_FILE))}
-    with _amend_lock(d):
-        def other():
-            try:
-                run_v2("q", d, StubTasks({}), signoff="lead", log=lambda *a: None, cross_engine_check=False)
-                got2.append("ran")
-            except AmendmentLocked:
-                got2.append("locked")
-        got2 = []
-        t2 = threading.Thread(target=other)
-        t2.start()
-        t2.join(60)
-    ok(got2 == ["locked"] and all(open(f, "rb").read() == b for f, b in snap.items()),
-       f"T_LEAD_AMEND_RUNV2_LOCK a second run_v2 on a held lead run fails clearly, parent and child untouched ({got2})")
-    # Codex r3: recovering an interrupted hand-off still refuses a legacy decision-brief signature (the child is kept)
-    d, _ = parent("lead_interrupt_brief", "lead", good)
-    mi = Machine(d, StubTasks({}), log=lambda *a: None, cross_engine_check=False)
-    mi._go = _boom
-    try:
-        mi.step()
-    except KeyboardInterrupt:
-        pass
-    _write_json(d, "decision_brief.signoff.json", {"signed_by": "owner", "sha256": {AB.SPEC_FILE: "0" * 64}})
-    s = Machine(d, StubTasks({}), log=lambda *a: None, cross_engine_check=False).run()
-    la = json.load(open(os.path.join(d, SPEC_RETHINK_REQUEST))).get("lead_amendment") or {}
-    ok(s == "paused:awaiting_spec_amendment" and la.get("status") == "refused" and "decision brief" in la.get("why", "")
-       and la.get("child") == d + ".amend1" and handoff_child(d) is None,
-       f"T_LEAD_AMEND_BRIEF_RESUME an interrupted hand-off with a legacy brief signature is refused, the child kept ({la})")
-    ok(AMEND_LOCK.startswith("analysis/") and "analysis/*" in harness_owned(),
-       "T_LEAD_AMEND_LOCK_PATH the lock lives under a path reserved for every run (no owner-mode deliverable changes)")
-    ok(handoff_chain(d, kept=True) == [d + ".amend1"],
-       "T_LEAD_AMEND_KEPT_CHAIN a refused amendment's verified kept child is stored with the run")
-    _self_test_lead_amend_r3(ok, td, parent, good, _boom)
-
-
-def _self_test_lead_amend_r3(ok, td: str, parent, good: dict, _boom) -> None:
-    """Codex round 3 of #342 on the lead amendment (#330): findings 4-12, each from its reproduction."""
-    import shutil as _sh
-    import threading
-    from v2_tasks import StubTasks
-    tdr = os.path.realpath(td)
-
-    def machine(rd):
-        return Machine(rd, StubTasks({}), log=lambda *a: None, cross_engine_check=False)
-
-    def interrupted(name):       # the child made and signed by the lead, the parent not yet FINAL
-        d_ = parent(name, "lead", good)[0]
-        mi = machine(d_)
-        mi._go = _boom
-        try:
-            mi.step()
-        except KeyboardInterrupt:
-            pass
-        return d_
-
-    def pair(src, where):        # the parent and its child, copied together to another directory
-        os.makedirs(os.path.join(tdr, where))
-        for x in (src, src + ".amend1"):
-            _sh.copytree(x, os.path.join(tdr, where, os.path.basename(x)))
-        return os.path.join(tdr, where, os.path.basename(src))
-    # P1-4: an interruption just after the parent's FINAL state is saved still leaves a child bound to that state
-    d = parent("r3_final_window", "lead", good)[0]
-    real_save = globals()["save_state"]
-
-    def save_then_stop(rd, st):
-        real_save(rd, st)
-        if st.status == AMENDED_PROVISIONAL and os.path.realpath(rd) == d:
-            raise KeyboardInterrupt("stopped after FINAL")
-    globals()["save_state"] = save_then_stop
-    try:
-        machine(d).step()
-    except KeyboardInterrupt:
-        pass
-    finally:
-        globals()["save_state"] = real_save
-    ok(load_state(d).status == AMENDED_PROVISIONAL and handoff_child(d) == d + ".amend1",
-       f"T_R3_FINAL_WINDOW (P1-4) interrupted after the parent's FINAL is saved, the child already binds it "
-       f"({handoff_child(d)})")
-    # P1-5: recovering a restored copy of the parent alone never writes to the original tree
-    d = interrupted("r3_restore")
-    c0 = d + ".amend1"
-    snap = {f: open(os.path.join(c0, f), "rb").read() for f in ("metadata.json", STATE_FILE, AMENDMENT_RECORD)}
-    os.makedirs(os.path.join(tdr, "r3_restored"))
-    r = os.path.join(tdr, "r3_restored", "r3_restore")
-    _sh.copytree(d, r)
-    s = machine(r).run()
-    la = json.load(open(os.path.join(r, SPEC_RETHINK_REQUEST))).get("lead_amendment") or {}
-    ok(all(open(os.path.join(c0, f), "rb").read() == b for f, b in snap.items()) and handoff_child(r) is None
-       and s == "paused:awaiting_spec_amendment" and la.get("status") == "refused" and c0 not in json.dumps(la),
-       f"T_R3_RESTORED_ALONE (P1-5) a restored parent without its child is refused, the original child untouched "
-       f"({s}, {la})")
-    # P1-6: the parent's signature is checked again when an interrupted hand-off is recovered
-    d = interrupted("r3_resig")
-    open(os.path.join(d, AB.SPEC_FILE), "ab").write(b"# edited after signing\n")
-    s = machine(d).run()
-    la = json.load(open(os.path.join(d, SPEC_RETHINK_REQUEST))).get("lead_amendment") or {}
-    ok(s == "paused:awaiting_spec_amendment" and la.get("status") == "refused"
-       and "sign-off no longer holds" in la.get("why", "") and handoff_child(d) is None,
-       f"T_R3_RECOVER_PARENT_SIG (P1-6) a recovered hand-off whose parent spec changed since signing is refused ({la})")
-    # P1-10 and P1-11: strict lineage needs the matching parent digest; the kept-child fallback only follows a refusal
-    src = interrupted("r3_lineage")
-    machine(src).step()
-    for where, digest in (("r3_nodigest", None), ("r3_otherdigest", "0" * 64)):
-        p = pair(src, where)
-        mc = os.path.join(p + ".amend1", "metadata.json")
-        meta = json.load(open(mc))
-        pr = {k: v for k, v in meta["parent_run"].items() if k != "run_state_sha256"}
-        json.dump(dict(meta, parent_run=dict(pr, **({"run_state_sha256": digest} if digest else {}))), open(mc, "w"))
-        try:
-            la = json.load(open(os.path.join(p, SPEC_RETHINK_REQUEST))).get("lead_amendment")
-        except (OSError, ValueError, AttributeError):
-            la = None
-        ok(load_state(p).status == AMENDED_PROVISIONAL and handoff_child(p) is None
-           and handoff_chain(p) == [] and handoff_chain(p, kept=True) == [],
-           f"T_R3_STRICT_LINEAGE (P1-10, P1-11) {where}: a child without the parent's final digest is neither resumed "
-           f"nor stored with it (status={load_state(p).status!r}, kept={handoff_chain(p, kept=True)}, "
-           f"lead_amendment={la!r})")
-    # P2-12: a parent and child moved together, the original tree gone: the confirmation names the moved parent
-    p = pair(src, "r3_moved")
-    _sh.move(src, src + ".gone")
-    try:
-        al = amendment_lines(p + ".amend1")
-    finally:
-        _sh.move(src + ".gone", src)
-    ok(al and shlex.quote(p) in al[0] and f"`{src}`" not in al[0] and f"{shlex.quote(src)} " not in al[0]
-       and "signed by lead" in al[0],
-       f"T_R3_MOVED_COMMAND (P2-12) the owner's confirmation command names the moved parent ({al[:1]})")
-    # P1-8: the parent stays held across the hand-off; a second resumer cannot take over its child
-    d = parent("r3_handover", "lead", good)[0]
-    paused, go, got_b = threading.Event(), threading.Event(), []
-
-    def log_a(msg):
-        if "continuing in" in str(msg):
-            cst = load_state(d + ".amend1")
-            cst.state, cst.status = "FINAL", "completed"     # the child stops at once (the test stays small)
-            save_state(d + ".amend1", cst)
-            paused.set()
-            go.wait(60)
-    res_a = []
-    ta = threading.Thread(target=lambda: res_a.append(run_v2("q", d, StubTasks({}), signoff="lead", log=log_a,
-                                                             cross_engine_check=False)))
-    ta.start()
-    paused.wait(60)
-
-    def second():
-        try:
-            got_b.append(run_v2("q", d, StubTasks({}), signoff="lead", log=lambda *a: None, cross_engine_check=False))
-        except AmendmentLocked:
-            got_b.append("locked")
-    tb = threading.Thread(target=second)
-    tb.start()
-    tb.join(60)
-    go.set()
-    ta.join(60)
-    ok(got_b == ["locked"] and res_a == ["completed"],
-       f"T_R3_HANDOVER (P1-8) a second resumer during the hand-off fails clearly; the first continues in the child "
-       f"({got_b}, {res_a})")
-    # P1-9: a direct Machine whose constructor read the state before another process's hand-off never writes it back
-    d = parent("r3_stale_ctor", "lead", good)[0]
-    real_load, read, release, errs = globals()["load_state"], threading.Event(), threading.Event(), []
-    blocked = []
-
-    def slow_load(rd):
-        st_ = real_load(rd)
-        if threading.current_thread().name == "r3-second" and not blocked:
-            blocked.append(1)
-            read.set()
-            release.wait(30)
-        return st_
-
-    def ctor():
-        try:
-            machine(d)
-        except AmendmentLocked as e:
-            errs.append(str(e))
-    globals()["load_state"] = slow_load
-    try:
-        t2 = threading.Thread(target=ctor, name="r3-second")
-        t2.start()
-        read.wait(30)
-        try:
-            machine(d).step()
-        except AmendmentLocked as e:
-            errs.append(str(e))
-        release.set()
-        t2.join(60)
-    finally:
-        globals()["load_state"] = real_load
-    made = os.path.lexists(d + ".amend1")
-    ok(made == (load_state(d).status == AMENDED_PROVISIONAL),
-       f"T_R3_STALE_CTOR (P1-9) a constructor that read the state before the hand-off never writes it back "
-       f"(child made: {made}; parent status {load_state(d).status}; {len(errs)} refused)")
-    _self_test_lead_amend_r4(ok, tdr, parent, good, interrupted, pair, machine)
-
-
-def _self_test_lead_amend_r4(ok, tdr: str, parent, good: dict, interrupted, pair, machine) -> None:
-    """Codex round 1 of #349 on the lead amendment's recovery, lineage and storage."""
-    import shutil as _sh
-    from toolkit.spec import amend as AM
-    # R1-1: an interrupted hand-off (the parent still at SPEC) stores its verified signed child
-    d = interrupted("r4_store")
-    ok(load_state(d).status is None and handoff_chain(d, kept=True) == [d + ".amend1"],
-       f"T_R4_STORE_INTERRUPTED an interrupted hand-off's signed child is stored with the parent "
-       f"({handoff_chain(d, kept=True)})")
-    # R1-2: recovery never adopts a same-named child made from another spec or another amendment
-    for name, field, value in (("r4_foreign_spec", "parent_spec_sha256", "f" * 64), ("r4_foreign_id", "amendment", "B1")):
-        d = interrupted(name)
-        mc = os.path.join(d + ".amend1", "metadata.json")
-        json.dump(dict(json.load(open(mc)), **{field: value}), open(mc, "w"))
-        before = open(mc, "rb").read()
-        s = machine(d).run()
-        la = json.load(open(os.path.join(d, SPEC_RETHINK_REQUEST))).get("lead_amendment") or {}
-        ok(s == "paused:awaiting_spec_amendment" and la.get("status") == "refused" and open(mc, "rb").read() == before
-           and handoff_chain(d, kept=True) == [],
-           f"T_R4_FOREIGN_CHILD {name}: a child this request did not make is neither adopted, relinked nor stored ({la})")
-    # R1-3: a restored parent whose sibling is a link to the original child never writes through it
-    d = interrupted("r4_link")
-    snap = {f: open(os.path.join(d + ".amend1", f), "rb").read() for f in ("metadata.json", AMENDMENT_RECORD)}
-    os.makedirs(os.path.join(tdr, "r4_linked"))
-    r = os.path.join(tdr, "r4_linked", "r4_link")
-    _sh.copytree(d, r)
-    os.symlink(d + ".amend1", r + ".amend1")
-    s = machine(r).run()
-    ok(s == "paused:awaiting_spec_amendment" and handoff_child(r) is None and handoff_chain(r, kept=True) == []
-       and all(open(os.path.join(d + ".amend1", f), "rb").read() == b for f, b in snap.items()),
-       f"T_R4_LINKED_CHILD a linked sibling is not a child: refused, the original untouched ({s})")
-    # R1-4: a lineage write that fails leaves the parent at SPEC, recoverable; the next resume finishes the hand-off
-    # (Codex r2 of #349: the error injected, so it holds for any user, and the retry on the same machine)
-    d = interrupted("r4_readonly")
-    real_wj, failed = globals()["_write_json"], []
-
-    def fail_once(rd, rel, doc):
-        if os.path.realpath(rd) == d + ".amend1" and not failed:
-            failed.append(rel)
-            raise PermissionError("injected")
-        return real_wj(rd, rel, doc)
-    m4 = machine(d)
-    globals()["_write_json"] = fail_once
-    try:
-        m4.run()
-        raised = None
-    except OSError as e:
-        raised = type(e).__name__
-    finally:
-        globals()["_write_json"] = real_wj
-    st1, meta1 = load_state(d), json.load(open(os.path.join(d, "metadata.json")))
-    s = m4.run()
-    ok(raised and st1.status is None and st1.state == "SPEC" and meta1.get("status") != AMENDED_PROVISIONAL
-       and m4.st.state == "FINAL" and s == AMENDED_PROVISIONAL and handoff_child(d) == d + ".amend1",
-       f"T_R4_RELINK_FAILS a failed lineage write is raised before the parent is FINAL (state and metadata); the same "
-       f"machine's retry finishes it ({raised}, {st1.state}, {meta1.get('status')}, {s})")
-    # R1-6: the kept child is verified by the signed digest the request names, not the working spec's bytes
-    d = interrupted("r4_kept")
-    sp, keep = os.path.join(d, AB.SPEC_FILE), None
-    _write_json(d, "decision_brief.signoff.json", {"signed_by": "owner", "sha256": {AB.SPEC_FILE: "0" * 64}})
-    machine(d).run()                                  # refused (the legacy brief), the child kept
-    keep = open(sp, "rb").read()
-    os.remove(sp)
-    gone = handoff_chain(d, kept=True)
-    open(sp, "wb").write(b"# another spec\n")
-    mc = os.path.join(d + ".amend1", "metadata.json")
-    meta0 = open(mc, "rb").read()
-    json.dump(dict(json.loads(meta0), parent_spec_sha256=hashlib.sha256(b"# another spec\n").hexdigest()), open(mc, "w"))
-    other = handoff_chain(d, kept=True)
-    open(sp, "wb").write(keep)
-    open(mc, "wb").write(meta0)
-    ok(gone == [d + ".amend1"] and other == [],
-       f"T_R4_KEPT_SIGNED_DIGEST a kept child is stored by the request's signed digest: also without the working spec, "
-       f"never by replacement bytes ({gone}, {other})")
-    # R1-7 (P2): a manual amendment moved with its parent names the moved parent (verified by the parent-state digest)
-    d = parent("r4_manual", "lead", good)[0]
-    st = load_state(d)
-    st.state, st.status = "FINAL", "completed"
-    save_state(d, st)
-    import yaml
-    pf = os.path.join(tdr, "r4_manual_patch.yaml")
-    yaml.safe_dump(good, open(pf, "w"))
-    AM.amend(d, pf, signoff="lead", log=lambda *a: None)
-    p = pair(d, "r4_moved_manual")
-    _sh.move(d, d + ".gone")
-    try:
-        al = amendment_lines(p + ".amend1")
-    finally:
-        _sh.move(d + ".gone", d)
-    ok(al and f"`{p}`" in al[0] and f"`{d}`" not in al[0],
-       f"T_R4_MOVED_MANUAL a moved manual amendment names its moved parent ({al[:1]})")
-    _self_test_lead_amend_r5(ok, tdr, interrupted, pair, machine)
-
-
-def _self_test_lead_amend_r5(ok, tdr: str, interrupted, pair, machine) -> None:
-    """Codex round 2 of #349: the child matched by its patch's content and the parent's own sign-off; storage of a
-    kept or unfinished child."""
-    import shutil as _sh
-    from toolkit.spec import signoff as SO
-    # R2-1: the same patch id with other content is not this request's child
-    d = interrupted("r5_patch")
-    rp = os.path.join(d, SPEC_RETHINK_REQUEST)
-    req = json.load(open(rp))
-    _write_json(d, SPEC_RETHINK_REQUEST, dict(req, patch=dict(req["patch"], spec=[
-        {"set": "constraints.envelope_usd", "value": 8700}])))
-    s = machine(d).run()
-    la = json.load(open(rp)).get("lead_amendment") or {}
-    ok(s == "paused:awaiting_spec_amendment" and la.get("status") == "refused" and handoff_child(d) is None,
-       f"T_R5_PATCH_CONTENT a child made from another patch under the same id is not adopted ({s}, {la.get('why')})")
-    # R2-2: a kept child and its request must match the parent's own sign-off record, not only each other
-    d = interrupted("r5_signoff")
-    _write_json(d, "decision_brief.signoff.json", {"signed_by": "owner", "sha256": {AB.SPEC_FILE: "0" * 64}})
-    machine(d).run()                                  # refused (the legacy brief), the child kept
-    sop = os.path.join(d, SO.SPEC_SIGNOFF)
-    so0 = open(sop, "rb").read()
-    rec = json.loads(so0)
-    rec["sha256"] = dict(rec.get("sha256") or {}, **{AB.SPEC_FILE: "e" * 64})
-    open(sop, "w").write(json.dumps(rec))
-    other = handoff_chain(d, kept=True)
-    open(sop, "wb").write(so0)
-    # R2-7: a damaged parent state does not drop a recorded refusal's kept child
-    stp = os.path.join(d, STATE_FILE)
-    st0 = open(stp, "rb").read()
-    damaged = []
-    for bad_state in (st0[:20], b"[]"):              # unparseable, and parseable but not a state (Codex r3 of #349)
-        open(stp, "wb").write(bad_state)
-        try:
-            damaged.append(handoff_chain(d, kept=True))
-        except Exception as e:  # noqa: BLE001 -- the finding
-            damaged.append(type(e).__name__)
-    open(stp, "wb").write(st0)
-    damaged = damaged[0] if damaged[0] == damaged[1] else damaged
-    # R1-5 follow-up: a malformed lead_amendment record is not an error
-    req = json.load(open(os.path.join(d, SPEC_RETHINK_REQUEST)))
-    _write_json(d, SPEC_RETHINK_REQUEST, dict(req, lead_amendment=["bad"]))
-    try:
-        bad = handoff_chain(d, kept=True)
-    except Exception as e:  # noqa: BLE001 -- the finding
-        bad = type(e).__name__
-    _write_json(d, SPEC_RETHINK_REQUEST, req)
-    ok(other == [] and damaged == [d + ".amend1"] and bad == [],
-       f"T_R5_KEPT_PARENT_SIGNOFF a kept child is stored only when the parent's own sign-off binds the request's spec; "
-       f"a damaged parent state keeps it; a malformed record stores nothing ({other}, {damaged}, {bad})")
-    # R2-8: an unfinished hand-off stores its child only once the child has its state and the lead's signature
-    d = interrupted("r5_unsigned")
-    os.remove(os.path.join(d + ".amend1", SO.SPEC_SIGNOFF))
-    unsigned = handoff_chain(d, kept=True)
-    d = interrupted("r6_bad_child_state")            # Codex r3 of #349: a child state that cannot be resumed
-    open(os.path.join(d + ".amend1", STATE_FILE), "wb").write(b"")
-    ok(unsigned == [] and handoff_chain(d, kept=True) == [],
-       f"T_R5_UNFINISHED_UNSIGNED an unfinished hand-off's unsigned child, or one whose state cannot be read, is not "
-       f"stored ({unsigned}, {handoff_chain(d, kept=True)})")
-    # Codex r3 of #349: a failure anywhere before the parent's FINAL state is saved (its own metadata write included)
-    # puts the machine back, and parent metadata the hand-off created is removed again
-    for name, where, drop_meta in (("r6_parent_meta", "parent", False), ("r6_no_meta", "child", True)):
-        d = interrupted(name)
-        if drop_meta:
-            os.remove(os.path.join(d, "metadata.json"))
-        real_wj, failed = globals()["_write_json"], []
-
-        def fail_once(rd, rel, doc):
-            if os.path.realpath(rd) == (d if where == "parent" else d + ".amend1") and not failed \
-                    and (where == "child" or rel == "metadata.json"):
-                failed.append(rel)
-                raise PermissionError("injected")
-            return real_wj(rd, rel, doc)
-        m6 = machine(d)
-        globals()["_write_json"] = fail_once
-        try:
-            m6.run()
-        except OSError:
-            pass
-        finally:
-            globals()["_write_json"] = real_wj
-        meta6 = os.path.join(d, "metadata.json")
-        meta_ok = not os.path.exists(meta6) if drop_meta else json.load(open(meta6)).get("status") != AMENDED_PROVISIONAL
-        st6 = load_state(d)
-        s = m6.run()
-        ok(failed and meta_ok and st6.state == "SPEC" and s == AMENDED_PROVISIONAL and handoff_child(d) == d + ".amend1",
-           f"T_R6_ROLLBACK {name}: a failed write before the parent's FINAL is saved leaves it at SPEC with its metadata as "
-           f"it was; the same machine's retry finishes the hand-off ({failed}, {meta_ok}, {st6.state}, {s})")
-    # R2-9 (P2): a moved manual amendment without its metadata names its parent from the amendment record's digest
-    src = os.path.join(tdr, "r4_manual")
-    p = pair(src, "r5_moved_manual")
-    os.remove(os.path.join(p + ".amend1", "metadata.json"))
-    _sh.move(src, src + ".gone")
-    try:
-        al = amendment_lines(p + ".amend1")
-    finally:
-        _sh.move(src + ".gone", src)
-    ok(al and f"`{p}`" in al[0],
-       f"T_R5_MOVED_NO_METADATA a moved manual amendment without metadata names its moved parent ({al[:1]})")
-
-
 def _self_test() -> int:
     import tempfile
     import shutil
@@ -6354,78 +2857,9 @@ def _self_test() -> int:
         status = _ToolkitMachine(d, T, st, log=lambda *a: None, cross_engine_check=False).run()
         hist = [h["to"] for h in load_state(d).history if "to" in h]
         ok(status == "completed", f"T10 toy run completes: {status} via {hist}")
-        ok(hist[:8] == ["EVIDENCE", "SIGN", "ENGINE_CHOICE", "PREREGISTER", "CONFIGURE", "ANALYZE", "SCORE", "CRITIQUE"]
+        ok(hist[:5] == ["EVIDENCE", "SIGN", "ENGINE_CHOICE", "ANALYZE", "CRITIQUE"]
            and "FIX_LOOP" in hist
-           and hist[-3:] == ["PRESENTATION", "GATE", "FINAL"], f"T11 the path SPEC..FIX_LOOP..WRITE..FINAL {hist}")
-        # SM-CK1-3 (owner 2026-11-23): the structural checklist. The gate records each critic's answers to all five
-        # items; a missing item is a schema repair, never a round; not_applicable answers raise nothing.
-        from toolkit.spec import critique_checklist as CLk
-        g1 = json.load(open(os.path.join(d, "gate_r1.json")))
-        ck = g1.get("critique_checklist") or {}
-        ok(set(ck) == set(CLk.ITEMS) and all(set(ck[i]["critics"]) == {"critique-domain", "critique-redteam"}
-                                             for i in CLk.ITEMS),
-           f"SM-CK1 the gate record holds both critics' answers to all five items: {json.dumps(ck)[:300]}")
-        dropped = []
-
-        def drop_once(reviewer, rn, answers):
-            if reviewer == "critique-domain" and not dropped:
-                dropped.append(rn)
-                answers.pop("surveillance_ranking")
-            return answers
-        dk, Tk, stk = new_run("ck_missing", {"checklist": drop_once})
-        status_k = _ToolkitMachine(dk, Tk, stk, log=lambda *a: None, cross_engine_check=False).run()
-        s2 = load_state(dk)
-        ok(status_k == "completed" and Tk.calls.count("critique:critique-domain:1") == 2
-           and Tk.calls.count("critique:critique-redteam:1") == 1 and not any(c.endswith(":2") and c.startswith(
-               "critique:") for c in Tk.calls) and any("schema" in str(h.get("why", "")) for h in s2.history),
-           f"SM-CK2 a missing checklist item is a schema repair of that critic in the same round: {status_k}, "
-           f"{[c for c in Tk.calls if c.startswith('critique')]}")
-        runs_ck = {}
-        for name, edit in (("ck_pass", None), ("ck_na", lambda r, n, a: {i: {"answer": "not_applicable",
-                                                                             "reason": "stub: cannot arise"} for i in a})):
-            dk, Tk, stk = new_run(name, {"checklist": edit} if edit else {})
-            status_k = _ToolkitMachine(dk, Tk, stk, log=lambda *a: None, cross_engine_check=False).run()
-            s3 = load_state(dk)
-            runs_ck[name] = (status_k, [h["to"] for h in s3.history if "to" in h], s3.round,
-                             len(json.load(open(os.path.join(dk, "gate_r1.json"))).get("unresolved_high") or []))
-        ok(runs_ck["ck_na"] == runs_ck["ck_pass"] and runs_ck["ck_na"][0] == "completed",
-           f"SM-CK3 not_applicable answers (with reasons) cost no round and raise no finding (same path as pass): "
-           f"{runs_ck['ck_na'][0]}, round {runs_ck['ck_na'][2]} vs {runs_ck['ck_pass'][2]}")
-        # SM-CK6 (Codex r3 of #366, P1-3): a run that had used its schema repairs before the upgrade, whose critics then
-        # write no checklist once, gets one repair outside the count and completes; a second missing checklist counts
-        mig = []
-
-        def no_checklist_once(reviewer, rn, answers):
-            if reviewer == "critique-domain" and not mig:
-                mig.append(rn)
-                return None
-            return answers
-        dk, Tk, stk = new_run("ck_upgrade", {"checklist": no_checklist_once})
-        stk.tries["schema"] = MAX_SCHEMA_REPAIRS
-        status_k = _ToolkitMachine(dk, Tk, stk, log=lambda *a: None, cross_engine_check=False).run()
-        ok(status_k == "completed" and Tk.calls.count("critique:critique-domain:1") == 2
-           and load_state(dk).tries.get("checklist_upgrade") == 1 and CHECKLIST_MISSING in CLk.problems(None, "f", [])[0],
-           f"SM-CK6 a pre-upgrade run gets one checklist repair outside the schema count: {status_k}")
-        # SM-CK7 (P1-5): a replay of stored gates ignores a malformed legacy checklist field (here a date key)
-        rd7 = os.path.join(td, "ck_replay")
-        os.makedirs(rd7)
-        import datetime as _dt7
-        for r in CRITICS:
-            __import__("yaml").safe_dump({"reviewer": r, "round": 1, "verdict": "PASS",
-                                          "structural_mismatch": {"detected": False}, "carried_forward": [],
-                                          "blockers": [], "checklist": {"burn_in_drift": {
-                                              "reason": {_dt7.date(2026, 11, 23): "reviewed"}}}},
-                                         open(os.path.join(rd7, __import__("validate_critique_yaml").FILENAMES[r]), "w"))
-        open(os.path.join(rd7, STATE_FILE), "w").write("{}")
-        g7 = v2_gate(rd7, 1, 3, False, [], history=False, checklist_rules=False)
-        try:
-            json.dumps(g7)
-            j7 = True
-        except TypeError:
-            j7 = False
-        ok(not g7.get("schema_errors") and "critique_checklist" not in g7 and j7,
-           f"SM-CK7 a replay (checklist_rules off) neither requires nor records a legacy checklist field: "
-           f"{g7.get('action')}, {g7.get('schema_errors')}")
+           and hist[-2:] == ["GATE", "FINAL"], f"T11 the path SPEC..FIX_LOOP..WRITE..FINAL {hist}")
         from toolkit.spec import evidence_draft as EDR_
         ok("draft_evidence" not in T.calls and (EDR_.read_record(d) or {}).get("status") == "not_required",
            f"T11b a spec whose options need no decision input passes EVIDENCE with no task ({EDR_.read_record(d)})")
@@ -6480,31 +2914,9 @@ def _self_test() -> int:
            and _mp.get("paused_why") and "finished" not in _mp,
            f"PS1 a paused run records paused:<reason>, its state and why in metadata.json, and no finish time "
            f"({[_mp.get(k) for k in ('status', 'paused_state', 'paused_why', 'finished')]})")
-        from toolkit.spec import review_conditions as _RC
-        _rows = _RC.parse(_RC.read_bytes(d))
-        try:
-            toolkit.sign(d, "owner", "early")
-            _early = "signed"
-        except ValueError as e:
-            _early = str(e)
-        ok(_rows and all(r["source"] == "spec_critique" and not r.get("disposition") for r in _rows)
-           and "review conditions" in _early,
-           f"T17rc (W0-G, owner 2026-11-21) at SIGN the spec critique's HIGH findings are imported as open conditions; "
-           f"the owner's signature waits for their dispositions ({len(_rows)} row(s); {_early[:80]})")
-        _t_owner_disposes(d)
         toolkit.sign(d, "owner", "ok")
         ok(_ToolkitMachine(d, StubTasks(T.s), None, log=lambda *a: None, cross_engine_check=False).run() == "completed",
            "T18 after the owner signs, the resumed run completes")
-
-        d, T, st = new_run("lead_rc", {}, signoff="lead")
-        s = _ToolkitMachine(d, T, st, log=lambda *a: None, cross_engine_check=False).run()
-        _rows = _RC.parse(_RC.read_bytes(d)) if os.path.exists(os.path.join(d, _RC.FILE)) else []
-        _rep = open(os.path.join(d, "report.md")).read() if os.path.exists(os.path.join(d, "report.md")) else ""
-        ok(s == "completed" and _rows and all(r["disposition"] == "deferred" and r["owner"] == "owner"
-                                              and r.get("provisional") for r in _rows)
-           and _RC.REPORT_HEADING in _rep and _rep.index(_RC.REPORT_HEADING) < _rep.index("## Numbers"),
-           f"T18rc (W0-G, D2) under --signoff lead each condition is deferred to the owner provisionally, listed at the "
-           f"top of the report, and the run proceeds ({s}, {len(_rows)} row(s))")
 
         # T19: a fix that edits the signed spec, or puts a decision leaf in the settings file, is
         # undone before anything is rebuilt; the spec stays as signed.
@@ -6517,7 +2929,7 @@ def _self_test() -> int:
         class Spy(StubTasks):
             def fix(self, task, run_dir, evidence):
                 nonlocal signed_before
-                signed_before = signed_before or _own_spec_digest(run_dir)
+                signed_before = signed_before or signed_hash(run_dir)
                 return super().fix(task, run_dir, evidence)
         s = _ToolkitMachine(d, Spy(T.s), st, log=lambda *a: None, cross_engine_check=False).run()
         rows = FX.impact_rows(d)
@@ -6603,7 +3015,6 @@ def _self_test() -> int:
         d, T, st = new_run("rethink_signed", {"critics": {1: {"critique-domain": [rk]}}, "plan": plan40},
                            signoff="owner", max_rounds=3)
         _ToolkitMachine(d, T, st, log=lambda *a: None, cross_engine_check=False).run()
-        _t_owner_disposes(d)
         toolkit.sign(d, "owner", "first")
         signed_bytes = open(os.path.join(d, AB.SPEC_FILE), "rb").read()
         T2 = StubTasks(T.s)
@@ -6656,7 +3067,6 @@ def _self_test() -> int:
         rq6 = json.load(open(os.path.join(d, "spec_rethink_request.json")))
         ok(rq6.get("signing_evidence") == "missing" and "requested_at" in rq6,
            f"R3-2f the amendment request notes missing signing evidence ({rq6.get('signing_evidence')})")
-        _self_test_lead_amend(ok, td)
 
         # R3-1 (F6 run 3): a write-up finding is never a FIX_LOOP task; the writer gets it with the draft.
         wup = {"id": "R-030", "severity": "HIGH", "target_stage": "WRITE", "claim": "the report overstates the effect"}
@@ -6667,36 +3077,6 @@ def _self_test() -> int:
         ok("FIX_LOOP" in p and not any(c.startswith("fix:") for c in T.calls)
            and any(f.get("id") == "R-030" for f in got),
            f"R3-1 a write-up finding goes to the writer, not to a FIX_LOOP task ({s}, {T.calls}, {got})")
-        # HG1 (Codex review of #341, r1 P1-5 and r3 P2-10; changed by hb2 fix 4): a blocking harness gap is declared,
-        # not fixed (the gate declares it after the revised draft), so it no longer keeps a loop with no task,
-        # write-up findings and a draft off the write-up route, which names it; an open blocking finding a fix task
-        # could work on still does (HG1d). HG1c (r3 P2-8): the fix loop is given the settings of the backend this
-        # machine runs.
-        def hg_route(blocking, fixable=False):
-            d, T, st = new_run(f"harness_gap_route_{len(blocking)}{'_fx' if fixable else ''}", {}, max_rounds=3)
-            if fixable:
-                FL.save(d, {"D-002": FL.Finding(id="D-002", kind="critique_blocker", severity="HIGH",
-                                                source="critique-domain", status="open", owner_state="ANALYZE",
-                                                blocking=True)})
-            mh = _ToolkitMachine(d, T, st, log=lambda *a: None, cross_engine_check=False)
-            mh.st.state, mh._has_draft = "FIX_LOOP", (lambda: True)
-            seen, _rl = {}, FX.run_loop
-            try:
-                FX.run_loop = lambda *a, **k: seen.update(k) or {
-                    "round": 1, "tasks": 0, "rows": 0, "passed": 0, "rethink": None, "write_up": ["R-030"],
-                    "owner_amendments": [], "harness_gaps": ["D-001"], "harness_gaps_blocking": blocking}
-                return mh.h_FIX_LOOP(), seen.get("settings"), mh.backend
-            finally:
-                FX.run_loop = _rl
-        to_hg, set_hg, be_hg = hg_route(["D-001"])
-        why_hg = str(load_state(os.path.join(td, "harness_gap_route_1")).history[-1].get("why"))
-        ok(to_hg == "WRITE" and "harness gap (D-001)" in why_hg,
-           f"HG1 a blocking harness gap goes with the write-up route, named in it ({to_hg}, {why_hg!r})")
-        ok(hg_route(["D-001"], fixable=True)[0] == "CRITIQUE",
-           "HG1d an open blocking finding a task could fix keeps the loop off the write-up route")
-        ok(hg_route([])[0] == "WRITE", "HG1b a non-blocking harness gap leaves the write-up-only WRITE route open")
-        ok(set_hg is not None and tuple(set_hg) == tuple(getattr(be_hg, "settings_paths", AB.SETTINGS_PATHS)),
-           f"HG1c the fix loop is given the running backend's settings ({set_hg})")
 
         # R3-3 (F6 run 3): a finding whose remedy is an owner amendment goes to OWNER_DECISION, never a SPEC rethink.
         amend = {"id": "D-031", "severity": "HIGH", "target_stage": "PLAN", "claim": "the comparator omits the funded plan",
@@ -6896,7 +3276,6 @@ def _self_test() -> int:
                                             cross_engine_check=False)
         d, T, st = new_run("dt_owner", {}, signoff="owner", max_rounds=1)
         mk(d, T, st).run()
-        _t_owner_disposes(d)        # W0-G (from v2): the owner disposes the spec critique's conditions before signing
         toolkit.sign(d, "owner", "ok")
         s_o = mk(d, StubTasks(T.s), None).run()
         st_o = load_state(d)
@@ -6960,7 +3339,6 @@ def _self_test() -> int:
            f"({s_r3}, {to_r3[-8:]}, critique rounds {crit_r3}, gate r1 {g_r1.get('action')})")
         d2, T2, st2 = new_run("dt_owner_r3", {}, signoff="owner", max_rounds=3)
         mk(d2, T2, st2).run()
-        _t_owner_disposes(d2)
         toolkit.sign(d2, "owner", "ok")
         s_p = mk(d2, StubTasks(T2.s), None).run()
         st_p = load_state(d2)
@@ -7155,19 +3533,6 @@ def _self_test() -> int:
            f"fingerprinted item ({g['action']})")
         gn = v2_gate(dd, 2, 2, False, [dict(dtf)], history=False, signoff="none")
         ok(gn["action"] == "RUN_FAILED", f"T30b under --signoff none nobody can accept it: not declarable ({gn['action']})")
-        open(os.path.join(dd, "decision_spec.yaml"), "w").write("not: [a spec\n")      # unreadable: every item is the critics'
-        gck = v2_gate(dd, 2, 2, False, [dict(dtf)], history=False)
-        os.remove(os.path.join(dd, "decision_spec.yaml"))
-        open(os.path.join(dd, STATE_FILE), "w").write("{}")       # a run whose spec is gone (Codex r1 of #366, P1-3)
-        gck5 = v2_gate(dd, 2, 2, False, [dict(dtf)], history=False)
-        os.remove(os.path.join(dd, STATE_FILE))
-        ok(gck5.get("action") is None and len([e for e in gck5.get("schema_errors") or []
-                                               if "missing required key 'checklist'" in e]) == len(CRITICS),
-           f"SM-CK5 a run without its spec still requires every checklist item: {(gck5.get('schema_errors') or [])[:2]}")
-        ok(gck.get("action") is None and len([e for e in gck.get("schema_errors") or []
-                                              if "missing required key 'checklist'" in e]) == len(CRITICS),
-           f"SM-CK4 with a decision spec in the run, critiques without the checklist are "
-           f"schema errors: {(gck.get('schema_errors') or [])[:2]}")
         # T_OWNER_ANSWERED (1F): the harness-recorded answer to that item releases it; whose answer counts follows the
         # run's sign-off mode (a lead's only under --signoff lead, D2)
         import scope_signoff as _ss
@@ -7417,7 +3782,7 @@ def _self_test() -> int:
            f"T37 a schema repair re-runs only the failing critic, with its errors ({s}, {[c for c in T.calls if 'critique' in c][:6]})")
 
         # T37b: invalid YAML in critique_presentation.yaml ("invalid YAML in /.../critique_presentation.yaml: ...")
-        # routes directly back to PRESENTATION with its errors, never re-runs domain/redteam, and finishes cleanly.
+        # routes directly back to CRITIQUE with its errors, never re-runs domain/redteam, and finishes cleanly.
         class BadPresYaml(StubTasks):
             def critique(self, run_dir, reviewer, round_n, feedback=None):
                 res = super().critique(run_dir, reviewer, round_n)
@@ -7430,16 +3795,16 @@ def _self_test() -> int:
         T_p = BadPresYaml(T_p.s)
         s_p = _ToolkitMachine(d_p, T_p, st_p, log=lambda *a: None, cross_engine_check=False).run()
         hist_p = load_state(d_p).history
-        pres_route = any(h.get("from") == "GATE" and h.get("to") == "PRESENTATION" for h in hist_p)
+        pres_route = any(h.get("from") == "GATE" and h.get("to") == "CRITIQUE" for h in hist_p)
         ok(s_p in ("completed", "completed_scope_declared") and pres_route
            and "feedback:critique-presentation:True" in T_p.calls
            and T_p.calls.count("critique:critique-domain:1") == 1
            and T_p.calls.count("critique:critique-redteam:1") == 1
            and os.path.exists(os.path.join(d_p, "report.md")),
-           f"T37b invalid presentation YAML routes to PRESENTATION with errors and keeps report.md "
+           f"T37b invalid presentation YAML routes to CRITIQUE with errors and keeps report.md "
            f"({s_p}, pres_route={pres_route}, calls={[c for c in T_p.calls if 'critique' in c or 'feedback' in c]})")
         # T37c: a presentation schema error whose body mentions another critique filename (e.g. reviewer: critique_domain.yaml)
-        # still routes to PRESENTATION via schema_errors_by_reviewer, never to critique-domain.
+        # still routes to CRITIQUE via schema_errors_by_reviewer, never re-running critique-domain.
         class BadPresReviewer(StubTasks):
             def critique(self, run_dir, reviewer, round_n, feedback=None):
                 res = super().critique(run_dir, reviewer, round_n)
@@ -7456,10 +3821,10 @@ def _self_test() -> int:
         s_p2 = _ToolkitMachine(d_p2, T_p2, st_p2, log=lambda *a: None, cross_engine_check=False).run()
         hist_p2 = load_state(d_p2).history
         ok(s_p2 in ("completed", "completed_scope_declared")
-           and any(h.get("from") == "GATE" and h.get("to") == "PRESENTATION" for h in hist_p2)
+           and any(h.get("from") == "GATE" and h.get("to") == "CRITIQUE" for h in hist_p2)
            and "feedback:critique-presentation:True" in T_p2.calls
            and T_p2.calls.count("critique:critique-domain:1") == 1,
-           f"T37c presentation error naming critique_domain.yaml routes to PRESENTATION ({s_p2})")
+           f"T37c presentation error naming critique_domain.yaml routes to CRITIQUE ({s_p2})")
 
         # T74-T75 (two v2 eval runs, 2026-11-05, both completed_gate_error with no verdict): in round 2
         # the critics marked blockers resolved without resolved_in_round or resolved_evidence and wrote
@@ -7693,11 +4058,6 @@ def _self_test() -> int:
         os.makedirs(os.path.join(fr, "models"))
         shutil.copy(os.path.join(FX_DIR, "claims_ledger.yaml"), os.path.join(fr, "models", "claims_ledger.yaml"))
         yaml.safe_dump({"schema_version": 1, "constraints": {"envelope_usd": 18000000}}, open(os.path.join(fr, AB.SPEC_FILE), "w"))
-        open(os.path.join(fr, "manuscript.md"), "w").write(
-            "1. Within the 18000000 budget for 2026-2028, D09 gets nothing; the plan averts 999,999 cases.\n")
-        k44 = [f for f in report_claim_findings(fr) if f["kind"] == "report_number_typed"]
-        ok(k44 and "999,999" in k44[0]["claim"] and "18000000" not in k44[0]["claim"] and "2026" not in k44[0]["claim"],
-           f"T44 a typed result number is HIGH; the owner's given numbers, years, ids and list numbers are not ({k44[:1]})")
         open(os.path.join(fr, "manuscript.md"), "w").write("Intro.\n<!-- harness: copied -->\nheadline.point and [CLAIM:nope].\n")
         k44b = {f["kind"] for f in report_claim_findings(fr)}
         ok({"report_claim_id_raw", "report_claim_unresolved"} <= k44b, f"T44b no marker the writer copies hides an id ({k44b})")
@@ -7798,43 +4158,10 @@ def _self_test() -> int:
         ok(not any(f["kind"].startswith("report_") for f in m51.harness_findings()),
            "T51 golden replays (v2_rules off) do not run the v2 report checks")
 
-        # T52-T55: Codex round 2 on #95 (each failed on 7aa9642).
-        for txt in ("Benefit is -987654 cases.", "Benefit is 987K cases.", "Benefit is 987e6 cases."):
-            open(os.path.join(fr, "manuscript.md"), "w").write(txt + "\n")
-            if not any(f["kind"] == "report_number_typed" for f in report_claim_findings(fr)):
-                ok(False, f"T52 signed, magnitude-suffixed and scientific numbers are typed numbers: {txt}")
-                break
-        else:
-            ok(True, "T52 signed, magnitude-suffixed and scientific numbers are typed numbers")
-        json.dump({"question": "Choose packages for 10 districts.", "started": "2026-10-31T16:42:57Z"},
-                  open(os.path.join(fr, "metadata.json"), "w"))
-        open(os.path.join(fr, "manuscript.md"), "w").write("Across 10 districts it reduces cases by 57%.\n")
-        k53 = [f for f in report_claim_findings(fr) if f["kind"] == "report_number_typed"]
-        ok(k53 and "57%" in k53[0]["claim"] and "10" not in k53[0]["claim"].split("(")[1].split(")")[0].split(", "),
-           f"T53 only the question's own numbers are given; a timestamp's digits are not ({k53[:1]})")
         open(os.path.join(fr, "manuscript.md"), "w").write("The plan averts\n```\n[CLAIM:headline.point]\n```\n")
         render_report(fr, toolkit)
         ok(any(f["kind"] == "report_claim_unrendered" for f in report_claim_findings(fr)),
            "T54 a claim reference left unrendered in the report (in a fenced block) is a HIGH finding")
-        # T56: the typed-number rule is a text heuristic: MEDIUM and declarable (process rule 4), and the
-        # interval level and any value in the spec, the ledger or the question are not typed numbers.
-        open(os.path.join(fr, "manuscript.md"), "w").write(
-            "A 95% interval; about 1.3M cases for $17.9M across 10 districts; 3 years.\n")
-        k56 = [f for f in report_claim_findings(fr) if f["kind"] == "report_number_typed"]
-        ok(k56 and k56[0]["severity"] == "LOW" and "(3)" in k56[0]["claim"],
-           f"T56 typed numbers are LOW (advisory); 95%, 1.3M, $17.9M and 10 are exempt ({k56[:1]})")
-        # T57: a run whose only open finding is a typed number reaches ACCEPT; the finding is reported
-        # in findings.jsonl (advisory), not planned and not declared.
-        d57, T57, st57 = new_run("typed_only", {"manuscript": "The plan averts 999 cases. It averts [CLAIM:headline.point] cases.\n"})
-        os.makedirs(os.path.join(d57, "models"), exist_ok=True)
-        shutil.copy(os.path.join(FX_DIR, "claims_ledger.yaml"), os.path.join(d57, "models", "claims_ledger.yaml"))
-        s57 = _ToolkitMachine(d57, T57, st57, log=lambda *a: None, cross_engine_check=False).run()
-        led57 = FL.load(d57)
-        typed57 = [f for f in led57.values() if f.kind == "report_number_typed"]
-        ok(s57 == "completed" and typed57 and typed57[0].severity == "LOW" and not typed57[0].blocking
-           and not os.path.exists(os.path.join(d57, DECLARED_FILE))
-           and json.load(open(os.path.join(d57, "final_gate.json")))["action"] == "ACCEPT",
-           f"T57 a run whose only open finding is a typed number reaches ACCEPT; the finding is advisory ({s57})")
         fe = os.path.join(td, "t55")
         os.makedirs(os.path.join(fe, "data"))
         yaml.safe_dump({"engine": {"ref": "toolkit.engines.contract:ToyEngine",
@@ -7863,7 +4190,7 @@ def _self_test() -> int:
         except Exception as e:  # noqa: BLE001 -- before the fix this is the failure
             ok(False, f"SP: {type(e).__name__}: {e}")
         try:
-            _self_test_built_engine(ok, td)
+            pass  # built-engine tests run in agents/engine_build_stage.py --self-test
         except Exception as e:  # noqa: BLE001
             import traceback
             traceback.print_exc()
@@ -8017,24 +4344,6 @@ def _self_test() -> int:
         except Exception as e:  # noqa: BLE001 -- the α tests fail, they do not crash the suite
             ok(False, f"T80/T81 raised {type(e).__name__}: {e}")
         try:
-            open(os.path.join(f80, "manuscript.md"), "w").write(
-                "<!-- harness: rendered from analysis/analysis.json -->\nThe allocation was accepted and is validated.\n")
-            k82 = [(f["kind"], f["severity"]) for f in report_acceptance_findings(f80, "declared")]
-            ok(("report_acceptance_language", "MEDIUM") in k82 and not report_acceptance_findings(f80, "accepted"),
-               f"T82 acceptance language in a declared-scope write-up is found, behind a forged harness marker too; "
-               f"in an accepted one it is not ({k82})")
-        except Exception as e:  # noqa: BLE001
-            ok(False, f"T82 raised {type(e).__name__}: {e}")
-        try:   # round 3: an indented block marker still ends the negated clause, in the machine's check too
-            hits82 = []
-            for t82 in ("Not run\n  - Validated against trials.\n", "Not accepted\n   ## Validated allocation\n",
-                        "Not tested\n  > Validated by the trial\n"):
-                open(os.path.join(f80, "manuscript.md"), "w").write(t82)
-                hits82.append(bool(report_acceptance_findings(f80, "declared")))
-            ok(all(hits82), f"T82b indented bullets, headings and quotes keep their clause boundary ({hits82})")
-        except Exception as e:  # noqa: BLE001
-            ok(False, f"T82b raised {type(e).__name__}: {e}")
-        try:
             nj = {"action": "ACCEPT", "rule_matched": 4,
                   "done_when_status": {"D-009": {"passes": None, "result": "not_judged", "open": True,
                                                  "severity": "MEDIUM", "detail": "not judged"}}}
@@ -8044,128 +4353,50 @@ def _self_test() -> int:
                f"T83 a required check that is not judged cannot yield ACCEPT ({r83.get('action')})")
         except Exception as e:  # noqa: BLE001
             ok(False, f"T83 raised {type(e).__name__}: {e}")
-        # T84-T85: a declared report is not delivered with acceptance language: the writer repairs it, or the
-        # report is withheld. The draft is written in accepted mode first (the pre-write gate accepts).
-        nofix84 = {"id": "P-084", "severity": "HIGH", "target_stage": "WRITE", "claim": "cannot fix"}
-        for name, extra, want in (("t84", {"manuscript_repair": "The plan was tested against the trials.\n"},
-                                   "completed_scope_declared"), ("t85", {}, "completed_no_report")):
-            d, T, st = new_run(name, dict({"critics": {1: {"critique-presentation": [nofix84]}},
-                                           "manuscript": "The plan is validated against the trials.\n"}, **extra),
-                               max_rounds=1)
-            try:
-                s = _ToolkitMachine(d, T, st, log=lambda *a: None, cross_engine_check=False).run()
-            except Exception as e:  # noqa: BLE001
-                s = f"raised {type(e).__name__}: {e}"
-            rp = os.path.join(d, "report.md")
-            rec = json.load(open(os.path.join(d, "final_gate.json"))) if os.path.exists(os.path.join(d, "final_gate.json")) else {}
-            al = rec.get("report_acceptance_language") or {}
-            if name == "t84":
-                ok(s == want and any(c.endswith(":repair") for c in T.calls) and os.path.exists(rp)
-                   and "validated" not in open(rp).read() and al.get("repairs") == 1 and not al.get("remaining"),
-                   f"T84 a declared report with acceptance language goes back to the writer and is delivered repaired ({s}, {al})")
-                # T84b (baseline hb2 §5 fix 8): the rejected draft's report_withheld.md stayed beside the delivered
-                # report.md, and harness_metrics counted the run as not done. Delivery retires it.
-                ok(not os.path.lexists(os.path.join(d, "report_withheld.md")),
-                   "T84b once the repaired report.md is delivered, the stale report_withheld.md is retired")
-                # T84c-T84d (Codex r1 of #355): only a post-write gate's decision delivers the repaired draft; a run
-                # that ends before it (the budget, at WRITE or PRESENTATION) keeps the quarantined copy, and a
-                # directory at that name never stops the run's end.
-                t84 = {}
-                for case, frm, gate, wh_dir in (("budget_at_write", "WRITE", {}, False),
-                                                ("gate_no_action", "GATE", {"post_write": True, "action": None}, False),
-                                                ("gate_dir", "GATE", {"post_write": True, "action": "ACCEPT"}, True),
-                                                ("gate_ok", "GATE", {"post_write": True, "action": "ACCEPT"}, False)):
-                    dc = os.path.join(td, "t84c_" + case)
-                    os.makedirs(dc)
-                    open(os.path.join(dc, "report.md"), "w").write("repaired\n")
-                    if wh_dir:
-                        os.makedirs(os.path.join(dc, "report_withheld.md"))
-                    else:
-                        open(os.path.join(dc, "report_withheld.md"), "w").write("rejected\n")
-                    mc = Machine(dc, StubTasks({}), RunState(question="q", state=frm, v2_rules=False, last_gate=gate),
-                                 backend=toolkit, log=lambda *a: None)
-                    try:
-                        mc._go("FINAL", "t", "budget_exhausted" if frm == "WRITE" else "completed")
-                        t84[case] = os.path.lexists(os.path.join(dc, "report_withheld.md"))
-                    except Exception as e:  # noqa: BLE001 -- the test is that it does not raise
-                        t84[case] = repr(e)
-                # T84d (Codex r2 of #355): a post-write gate that ends the run without delivering the report (a
-                # validator error) keeps the quarantined copy too.
-                dc = os.path.join(td, "t84d")
-                os.makedirs(dc)
-                open(os.path.join(dc, "report.md"), "w").write("repaired\n")
-                open(os.path.join(dc, "report_withheld.md"), "w").write("rejected\n")
-                mc = Machine(dc, StubTasks({}), RunState(question="q", state="GATE", v2_rules=False,
-                                                         last_gate={"post_write": True, "action": "VALIDATOR_ERROR"}),
-                             backend=toolkit, log=lambda *a: None)
-                mc._go("FINAL", "validator error", "completed_gate_error")
-                t84["validator_error"] = os.path.lexists(os.path.join(dc, "report_withheld.md"))
-                # T84e (Codex r3): an owner-declined declaration's report is delivered too
-                dc = os.path.join(td, "t84e")
-                os.makedirs(dc)
-                open(os.path.join(dc, "report.md"), "w").write("repaired\n")
-                open(os.path.join(dc, "report_withheld.md"), "w").write("rejected\n")
-                mc = Machine(dc, StubTasks({}), RunState(question="q", state="GATE", v2_rules=False,
-                                                         last_gate={"post_write": True, "action": "RUN_FAILED"}),
-                             backend=toolkit, log=lambda *a: None)
-                mc._go("FINAL", "declined", "completed_scope_declined")
-                t84["declined"] = os.path.lexists(os.path.join(dc, "report_withheld.md"))
-                ok(t84 == {"budget_at_write": True, "gate_no_action": True, "gate_dir": True, "gate_ok": False,
-                           "validator_error": True, "declined": False},
-                   f"T84c the quarantined draft is retired only after a post-write gate decided, never a directory ({t84})")
+        # T84c-T84e (Codex r1-r3 of #355): only a post-write gate's decision retires a stale report_withheld.md;
+        # a run that ends before it (the budget, at WRITE) keeps it, and a directory at that name never stops FINAL.
+        t84 = {}
+        for case, frm, gate, wh_dir in (("budget_at_write", "WRITE", {}, False),
+                                        ("gate_no_action", "GATE", {"post_write": True, "action": None}, False),
+                                        ("gate_dir", "GATE", {"post_write": True, "action": "ACCEPT"}, True),
+                                        ("gate_ok", "GATE", {"post_write": True, "action": "ACCEPT"}, False)):
+            dc = os.path.join(td, "t84c_" + case)
+            os.makedirs(dc)
+            open(os.path.join(dc, "report.md"), "w").write("repaired\n")
+            if wh_dir:
+                os.makedirs(os.path.join(dc, "report_withheld.md"))
             else:
-                ok(s == want and not os.path.exists(rp) and os.path.exists(os.path.join(d, "report_withheld.md"))
-                   and al.get("remaining"),
-                   f"T85 an unrepaired declared report is withheld, not delivered ({s}, {al})")
-        # T88 (round 2): a repaired draft goes through the whole post-write gate again: a repair that adds an
-        # unresolved claim reference (non-declarable HIGH) ends RUN_FAILED, not a delivered declared report.
-        # T89: a Markdown soft break inside a negated sentence is not acceptance language (nothing withheld).
-        for name, extra, want in (("t88", {"manuscript": "The plan is validated against the trials.\n",
-                                           "manuscript_repair": "The plan was tested; see [CLAIM:missing_claim].\n"},
-                                   "run_failed"),
-                                  ("t89", {"manuscript": "The model is not yet\nvalidated against the trials.\n"},
-                                   "completed_scope_declared")):
-            d, T, st = new_run(name, dict({"critics": {1: {"critique-presentation": [nofix84]}}}, **extra), max_rounds=1)
-            os.makedirs(os.path.join(d, "models"), exist_ok=True)
-            if not os.path.exists(os.path.join(d, "models", "claims_ledger.yaml")):
-                shutil.copy(os.path.join(REPO, "tests", "fixtures", "v2blind1", "claims_ledger.yaml"),
-                            os.path.join(d, "models", "claims_ledger.yaml"))
+                open(os.path.join(dc, "report_withheld.md"), "w").write("rejected\n")
+            mc = Machine(dc, StubTasks({}), RunState(question="q", state=frm, v2_rules=False, last_gate=gate),
+                         backend=toolkit, log=lambda *a: None)
             try:
-                s = _ToolkitMachine(d, T, st, log=lambda *a: None, cross_engine_check=False).run()
-            except Exception as e:  # noqa: BLE001
-                s = f"raised {type(e).__name__}: {e}"
-            if name == "t88":
-                ok(s == want and any(c.endswith(":repair") for c in T.calls),
-                   f"T88 a language repair is re-checked by the full post-write gate ({s})")
-            else:
-                ok(s == want and not any(c.endswith(":repair") for c in T.calls)
-                   and os.path.exists(os.path.join(d, "report.md")),
-                   f"T89 'not yet' + soft break + 'validated' is negated: delivered, no repair ({s})")
-        # T90-T91 (round 3): the rejected report is quarantined before its repair; a repair with no budget or a
-        # failed repair task ends with no deliverable report.md (the rejected one stays in report_withheld.md).
-        from v2_tasks import TaskResult as _TR
-        for name, outcome in (("t90", None), ("t91", _TR(False, None, 0.0, "stub: failed"))):
-            d, T, st = new_run(name, {"critics": {1: {"critique-presentation": [nofix84]}},
-                                      "manuscript": "The plan is validated against the trials.\n"}, max_rounds=1)
-            m = _ToolkitMachine(d, T, st, log=lambda *a: None, cross_engine_check=False)
-            real_task = m._task
-
-            def _task(key, name_, *args, _real=real_task, _out=outcome, **kw):
-                if name_ == "write" and len(args) > 2:      # the language repair (feedback given)
-                    return _out
-                return _real(key, name_, *args, **kw)
-            m._task = _task
-            try:
-                s = m.run()
-            except Exception as e:  # noqa: BLE001
-                s = f"raised {type(e).__name__}: {e}"
-            rp, wp = os.path.join(d, "report.md"), os.path.join(d, "report_withheld.md")
-            ok(s == "completed_no_report" and not os.path.exists(rp) and os.path.exists(wp)
-               and "validated" in open(wp).read(),
-               f"T{name[1:]} a repair {'with no budget' if outcome is None else 'that fails'} leaves no deliverable "
-               f"report with acceptance language ({s}, report.md exists: {os.path.exists(rp)})")
-        # T92: the quarantine move goes through lib.safe_io: a planted link at report_withheld.md is replaced,
-        # never written through, and a linked report.md is refused, never moved.
+                mc._go("FINAL", "t", "budget_exhausted" if frm == "WRITE" else "completed")
+                t84[case] = os.path.lexists(os.path.join(dc, "report_withheld.md"))
+            except Exception as e:  # noqa: BLE001 -- the test is that it does not raise
+                t84[case] = repr(e)
+        dc = os.path.join(td, "t84d")
+        os.makedirs(dc)
+        open(os.path.join(dc, "report.md"), "w").write("repaired\n")
+        open(os.path.join(dc, "report_withheld.md"), "w").write("rejected\n")
+        mc = Machine(dc, StubTasks({}), RunState(question="q", state="GATE", v2_rules=False,
+                                                 last_gate={"post_write": True, "action": "VALIDATOR_ERROR"}),
+                     backend=toolkit, log=lambda *a: None)
+        mc._go("FINAL", "validator error", "completed_gate_error")
+        t84["validator_error"] = os.path.lexists(os.path.join(dc, "report_withheld.md"))
+        dc = os.path.join(td, "t84e")
+        os.makedirs(dc)
+        open(os.path.join(dc, "report.md"), "w").write("repaired\n")
+        open(os.path.join(dc, "report_withheld.md"), "w").write("rejected\n")
+        mc = Machine(dc, StubTasks({}), RunState(question="q", state="GATE", v2_rules=False,
+                                                 last_gate={"post_write": True, "action": "RUN_FAILED"}),
+                     backend=toolkit, log=lambda *a: None)
+        mc._go("FINAL", "declined", "completed_scope_declined")
+        t84["declined"] = os.path.lexists(os.path.join(dc, "report_withheld.md"))
+        ok(t84 == {"budget_at_write": True, "gate_no_action": True, "gate_dir": True, "gate_ok": False,
+                   "validator_error": True, "declined": False},
+           f"T84c the withheld draft is retired only after a post-write gate decided, never a directory ({t84})")
+        # T92: _withhold_report goes through lib.safe_io: a planted link at report_withheld.md is replaced,
+        # never written through, and a linked report.md is removed without following the link.
         d92, o92 = os.path.join(td, "t92"), os.path.join(td, "t92out")
         os.makedirs(d92)
         os.makedirs(o92)
@@ -8173,20 +4404,17 @@ def _self_test() -> int:
         open(os.path.join(d92, "report.md"), "w").write("rejected report\n")
         os.symlink(os.path.join(o92, "v"), os.path.join(d92, "report_withheld.md"))
         try:
-            _quarantine_report(d92)
+            _withhold_report(d92)
             moved = (not os.path.exists(os.path.join(d92, "report.md"))
                      and not os.path.islink(os.path.join(d92, "report_withheld.md"))
                      and open(os.path.join(d92, "report_withheld.md")).read() == "rejected report\n")
             os.symlink(os.path.join(o92, "v"), os.path.join(d92, "report.md"))
-            try:
-                _quarantine_report(d92)
-                refused = False
-            except (ValueError, OSError):
-                refused = True
+            _withhold_report(d92)
+            link_removed = not os.path.lexists(os.path.join(d92, "report.md"))
         except Exception as e:  # noqa: BLE001
-            moved, refused = f"raised {type(e).__name__}: {e}", False
-        ok(moved is True and refused and open(os.path.join(o92, "v")).read() == "untouched",
-           f"T92 the report quarantine never follows a link ({moved}, refused a linked report: {refused})")
+            moved, link_removed = f"raised {type(e).__name__}: {e}", False
+        ok(moved is True and link_removed and open(os.path.join(o92, "v")).read() == "untouched",
+           f"T92 _withhold_report never follows a link ({moved}, linked report removed: {link_removed})")
         # T86-T87 through h_GATE: an open finding whose only test is a judgement is never accepted. The fix loop
         # and rule 3m handle it first; rule 3j is the backstop when no open finding is listed for it.
         judged_only = {"id": "D-086", "severity": "MEDIUM", "target_stage": "ANALYZE", "claim": "needs a judgement",
@@ -8265,8 +4493,8 @@ if __name__ == "__main__":         # the local pool's spawned processes import t
 
 
 def _self_test_auto1a(ok, td: str, toolkit, new_run) -> None:
-    """v2 autonomy brief, PR 1A (docs/design/v2-autonomy-brief.md §4; item numbers are the re-audit's): the
-    PRESENTATION budget stop, the gate before a rewrite, harness ids, the RETHINK back-edges and claim references."""
+    """v2 autonomy brief, PR 1A (docs/design/v2-autonomy-brief.md §4): inline presentation review
+    budget stop, the gate before a rewrite, harness ids, the RETHINK back-edges and claim references."""
     from types import SimpleNamespace as NS
     import yaml
     from v2_tasks import StubTasks
@@ -8282,14 +4510,17 @@ def _self_test_auto1a(ok, td: str, toolkit, new_run) -> None:
 
     def budget():
         d, T, st = new_run("a1_pres", {}, budget=20.0)
-        st.state, st.spent_usd = "PRESENTATION", 16.5        # past cap less reserve, $3.50 of the reserve left
+        st.state, st.write_mode, st.spent_usd = "WRITE", "accepted", 16.5        # past cap less reserve, $3.50 left
         save_state(d, st)
         mk(d, T, st).step()
         s = load_state(d)
-        ok(s.state == "GATE" and s.forced_status is None and T.calls == ["critique:critique-presentation:1"],
-           f"T_PRES_BUDGET the presentation review runs on the write-up reserve ({s.state}, {s.forced_status}, {T.calls})")
+        ok(s.state == "GATE" and s.forced_status is None
+           and T.calls == ["write:accepted", "critique:critique-presentation:1"],
+           f"T_PRES_BUDGET the write & presentation review run on the write-up reserve ({s.state}, {s.forced_status}, {T.calls})")
         d, T, st = new_run("a1_pres_out", {}, budget=20.0)
-        st.state, st.spent_usd = "PRESENTATION", 20.0
+        st.state, st.write_mode, st.spent_usd = "WRITE", "accepted", 20.0
+        st.journal["WRITE#0:accepted"] = {"task": "write", "status": "completed", "ok": True}
+        open(os.path.join(d, "manuscript.md"), "w").write("# Report\n")
         save_state(d, st)
         mk(d, T, st).step()
         s = load_state(d)
@@ -8310,7 +4541,6 @@ def _self_test_auto1a(ok, td: str, toolkit, new_run) -> None:
            f"T_WRITE_RB a write-up task keeps its read-back allowance; other tasks still stop at the reserve ({T.rb})")
 
     def post_write():
-        # T_PW_GATE (2.1): the pre-write gate after a post-write modelling fix, one round on.
         d = os.path.join(td, "a1_pw")
         os.makedirs(d)
         S = StubTasks({"critics": {1: {"critique-presentation": [
@@ -8318,23 +4548,25 @@ def _self_test_auto1a(ok, td: str, toolkit, new_run) -> None:
              "done_when": [{"file": "manuscript.md", "contains": "Figure 1 shows"}]}]}}})
         S.critique(d, "critique-presentation", 1)
         for r in CRITICS:
-            S.critique(d, r, 2)
+            S.critique(d, r, 1)
         open(os.path.join(d, "manuscript.md"), "w").write("# Report\n")
-        g, gp = (v2_gate(d, 2, 3, pw, [], history=False) for pw in (False, True))
+        g = v2_gate(d, 1, 3, False, [], history=False)
+        for r in CRITICS:
+            S.critique(d, r, 2)
+        gp = v2_gate(d, 2, 3, True, [], history=False)
         kinds = {v.get("kind") for v in g.get("rigor_violations") or []}
         ok(not g.get("schema_errors") and g.get("action") and "P-001" in {o["id"] for o in open_findings(d, g)}
            and not kinds & {"done_when_dropped", "critique_presentation_missing"} and gp.get("schema_errors"),
-           f"T_PW_GATE a pre-write gate reads the last draft's presentation review as of its own round; the "
-           f"post-write gate needs this round's ({g.get('schema_errors')}, {g.get('action')}, {sorted(kinds)}, "
-           f"post {bool(gp.get('schema_errors'))})")
+           f"T_PW_GATE round-1 gate reads round-1 presentation review; round-2 gate rejects stale round-1 "
+           f"({g.get('schema_errors')}, {g.get('action')}, {sorted(kinds)}, post {bool(gp.get('schema_errors'))})")
         d = os.path.join(td, "a1_ofp")
         os.makedirs(d)
         yaml.safe_dump({"reviewer": "critique-domain", "round": 1, "blockers": [
-            {"id": "D-061", "severity": "MEDIUM", "category": "PRESENTATION", "target_stage": "ANALYZE", "claim": "c"},
+            {"id": "D-061", "severity": "MEDIUM", "category": "METHODS", "target_stage": "WRITE", "claim": "c"},
             {"id": "D-062", "severity": "MEDIUM", "category": "METHODS", "target_stage": "ANALYZE", "claim": "c"}]},
             open(os.path.join(d, "critique_domain.yaml"), "w"))
         got = [o["id"] for o in open_findings(d, {"action": "ACCEPT", "rigor_violations": []})]
-        ok(got == ["D-062"], f"T_OF_PRES a PRESENTATION finding waits for the draft ({got})")
+        ok(got == ["D-062"], f"T_OF_PRES a WRITE-targeted finding waits for the draft ({got})")
 
     def ids():
         class B:
@@ -8415,8 +4647,10 @@ def _self_test_auto1a(ok, td: str, toolkit, new_run) -> None:
     def r1_resume():
         # CX1-3: a presentation review that spent the last of the cap, then a crash before the transition.
         d, T, st = new_run("a1_cx3", {}, budget=20.0)
-        st.state, st.spent_usd = "PRESENTATION", 20.0
-        st.journal["PRESENTATION#0:r1"] = {"task": "critique", "status": "completed", "ok": True}
+        st.state, st.write_mode, st.spent_usd = "WRITE", "accepted", 20.0
+        st.journal["WRITE#0:accepted"] = {"task": "write", "status": "completed", "ok": True}
+        st.journal["WRITE#0:r1:presentation"] = {"task": "critique", "status": "completed", "ok": True}
+        open(os.path.join(d, "manuscript.md"), "w").write("# Report\n")
         save_state(d, st)
         mk(d, T, st).step()
         s = load_state(d)
@@ -8445,11 +4679,11 @@ def _self_test_auto1a(ok, td: str, toolkit, new_run) -> None:
         d = os.path.join(td, "a1_cx5")
         os.makedirs(d)
         yaml.safe_dump({"reviewer": "critique-domain", "round": 1, "blockers": [
-            {"id": "D-061", "severity": "MEDIUM", "category": "PRESENTATION", "target_stage": "ANALYZE", "claim": "c"}]},
+            {"id": "D-061", "severity": "MEDIUM", "category": "METHODS", "target_stage": "WRITE", "claim": "c"}]},
             open(os.path.join(d, "critique_domain.yaml"), "w"))
         open(os.path.join(d, "report.md"), "w").write("# Report\n")
         got = [o["id"] for o in open_findings(d, {"action": "ACCEPT", "rigor_violations": []})]
-        ok(got == ["D-061"], f"CX1-5 with report.md and no manuscript.md a PRESENTATION finding is not deferred ({got})")
+        ok(got == ["D-061"], f"CX1-5 with report.md and no manuscript.md a WRITE finding is not deferred ({got})")
 
     def r1_rethink():
         # CX1-7: a fix plan file that is not a plan does not stop a back-edge; a gate's own back-edge reads none.
@@ -8529,16 +4763,18 @@ def _self_test_auto1a(ok, td: str, toolkit, new_run) -> None:
         ok("done_when_regressed:D-071" in got and "D-071" in got, f"CX3-6 a regression is listed beside its finding ({got})")
 
     def r3_presentation():
-        # CX3-1: documented behaviour, pinned (the base does this in an uninterrupted run).
+        # CX3-1: a failed presentation task in WRITE goes to GATE, live and replayed alike.
         class NoReview(StubTasks):
             def critique(self, run_dir, reviewer, round_n, feedback=None):
                 return self._r(f"critique:{reviewer}:{round_n}", False, note="no review written")
         states = []
         for name, journal in (("live", None), ("replay", {"task": "critique", "status": "completed", "ok": False})):
             d, T, st = new_run("a1_cx31" + name, {}, budget=20.0)
-            st.state, st.spent_usd = "PRESENTATION", 20.0 if journal else 16.5
+            st.state, st.write_mode, st.spent_usd = "WRITE", "accepted", 20.0 if journal else 16.5
             if journal:
-                st.journal["PRESENTATION#0:r1"] = journal
+                st.journal["WRITE#0:accepted"] = {"task": "write", "status": "completed", "ok": True}
+                st.journal["WRITE#0:r1:presentation"] = journal
+                open(os.path.join(d, "manuscript.md"), "w").write("# Report\n")
             save_state(d, st)
             mk(d, NoReview(T.s), st).step()
             states.append(load_state(d).state)
@@ -8581,54 +4817,52 @@ def _self_test_writeup_rounds(ok, td: str, toolkit, new_run) -> None:
             traceback.print_exc()
             ok(False, f"{name}: {type(e).__name__}: {e}")
 
-    def rereview():
+    def writeup_rereview():
         # WR1-WR3: a HIGH write-up finding: ACCEPT pre-write, the post-write gate patches it, the writer revises
         wup = {"id": "R-030", "severity": "HIGH", "target_stage": "WRITE", "claim": "the report overstates the effect",
                "done_when": [{"file": "manuscript.md", "contains": "(?i)effect is bounded"}]}
-        d, T, st = new_run("wr_rereview", {"critics": {1: {"critique-redteam": [wup]}}}, max_rounds=3)
+        d, T, st = new_run("wr_writeup_rev", {"critics": {1: {"critique-redteam": [wup]}}}, max_rounds=3)
         s = mk(d, T, st).run()
         h = hist(d)
         edges = [(x["from"], x["to"]) for x in h]
         whys = [str(x.get("why")) for x in h]
         st2 = load_state(d)
-        ok(("FIX_LOOP", "WRITE") in edges and ("PRESENTATION", "CRITIQUE") in edges
+        ok(("FIX_LOOP", "WRITE") in edges and ("WRITE", "CRITIQUE") in edges
            and not any(w.startswith("schema errors") for w in whys),
-           f"WR1 a write-up-only fix goes WRITE -> PRESENTATION -> CRITIQUE, never through a schema repair "
+           f"WR1 a write-up-only fix goes WRITE -> CRITIQUE, never through a schema repair "
            f"({s}, {edges[-8:]}, {[w for w in whys if 'schema' in w]})")
-        i = edges.index(("PRESENTATION", "CRITIQUE"))
+        i = edges.index(("WRITE", "CRITIQUE"))
         r = h[i]["round"]
-        ok("re-review" in whys[i] and f"critique:critique-domain:{r}" in T.calls
+        ok(f"critique:critique-domain:{r}" in T.calls
            and f"critique:critique-redteam:{r}" in T.calls and edges[i + 1] == ("CRITIQUE", "GATE")
            and h[i + 1]["round"] == r,
            f"WR2 the re-review runs the domain and red-team critics at the revised draft's round, then the gate "
            f"({whys[i]!r}, round {r}, {T.calls[-6:]})")
-        ok("schema" not in (st2.tries or {}) and "rereview" not in (st2.tries or {}),
-           f"WR3 the re-review uses no schema repair and leaves no pending re-review ({st2.tries})")
+        ok("schema" not in (st2.tries or {}),
+           f"WR3 the re-review uses no schema repair ({st2.tries})")
 
-    def rereview_not_accepted():
-        # WR1b: the same route for a not-accepted draft (which otherwise goes WRITE -> GATE): its presentation review
-        # is redone at the new round too, so the gate finds no stale file (Codex r1 of #344, P2-5)
+    def writeup_rereview_not_accepted():
+        # WR1b: a revised not-accepted draft when domain/redteam are behind round goes WRITE -> CRITIQUE -> GATE
         import shutil
-        src = os.path.join(td, "wr_rereview")
-        d = os.path.join(td, "wr_rereview_na")
+        src = os.path.join(td, "wr_writeup_rev")
+        d = os.path.join(td, "wr_writeup_rev_na")
         shutil.copytree(src, d)
         T, st = StubTasks({}), load_state(d)
         st.state, st.round, st.post_write, st.round_pending, st.write_mode = "WRITE", 2, False, False, "not_accepted"
         st.status, st.forced_status = None, None
-        st.tries["rereview"] = 2
         save_state(d, st)
-        for r in CRITICS + ("critique-presentation",):
+        for r in CRITICS:
             StubTasks({}).critique(d, r, 1)
         m = mk(d, T, st)
-        for _ in range(4):
+        for _ in range(3):
             m.step()
         h = hist(d)
         e = [(x["from"], x["to"]) for x in h]
-        ok(e[-4:-1] == [("WRITE", "PRESENTATION"), ("PRESENTATION", "CRITIQUE"), ("CRITIQUE", "GATE")]
+        ok(e[-3:-1] == [("WRITE", "CRITIQUE"), ("CRITIQUE", "GATE")] and e[-1][0] == "GATE"
            and "critique:critique-domain:2" in T.calls and "critique:critique-redteam:2" in T.calls
-           and "critique:critique-presentation:2" in T.calls and not str(h[-1].get("why")).startswith("schema errors"),
-           f"WR1b a revised not-accepted draft goes WRITE -> PRESENTATION -> CRITIQUE (re-review) -> GATE, and the gate "
-           f"finds no stale round ({e[-4:]}, {h[-1].get('why')!r}, {T.calls})")
+           and not os.path.exists(os.path.join(d, "critique_presentation.yaml"))
+           and not str(h[-1].get("why")).startswith("schema errors"),
+           f"WR1b a revised not-accepted draft goes WRITE -> CRITIQUE -> GATE ({e[-3:]}, {h[-1].get('why')!r}, {T.calls})")
 
     def owner_held_run():
         # WR4-WR6: malaria R2 in miniature. A MEDIUM finding whose remedy is an owner amendment, with a test that fails;
@@ -8847,137 +5081,20 @@ def _self_test_writeup_rounds(ok, td: str, toolkit, new_run) -> None:
                f"WR8 pre-write, a fix loop with no task goes to {want} ({name}: {s2.state}, round {s2.round}, "
                f"pending {s2.round_pending}, mode {s2.write_mode}, {last.get('why')!r})")
 
-    def hb2_rules_unit():
-        # HB2-1..HB2-3 (hb2 fixes 1 and 4): a declared harness gap is not fix-loop work for the medium rule (dengue R2
-        # R-001); a rule-2 gate whose HIGHs are all owner-held or gaps declares them now; anything else keeps rule 2
-        op = [{"id": "R-001", "tested": True, "severity": "MEDIUM", "source": "critique-redteam", "claim": "c"}]
-        acc = {"action": "ACCEPT", "rule_matched": "4"}
-        g1 = apply_medium_rule(acc, op, 2, True, harness_gaps={"R-001"})
-        g2 = apply_medium_rule(acc, op + [dict(op[0], id="R-002")], 2, True, harness_gaps={"R-001"})
-        ok(g1["action"] == "DECLARE_SCOPE" and g1["rule_matched"] == "3m" and "harness" in g1["rationale"]
-           and g2["action"] == "PATCH_OR_RETHINK" and g2["open_tested"] == ["R-002"],
-           f"HB2-1 a declared harness gap is declared, not sent to the fix loop ({g1['action']}, {g2.get('open_tested')})")
-        led = {"D-1": FL.Finding(id="D-1", kind="critique_blocker", severity="HIGH", source="critique-domain"),
-               "R-1": FL.Finding(id="R-1", kind="critique_blocker", severity="HIGH", source="critique-redteam")}
-        r2 = {"action": "PATCH_OR_RETHINK", "rule_matched": 2, "accept_blockers": [],
-              "unresolved_high": [{"reviewer": "critique-domain", "id": "D-1"}, {"reviewer": "critique-redteam",
-                                                                                 "id": "R-1"}]}
-        op2 = [{"id": "D-1", "tested": True}, {"id": "R-1", "tested": True}, {"id": "W-1", "tested": False}]
-        h1 = apply_held_rule(r2, led, ["D-1"], ["R-1"], op2)
-        h2 = apply_held_rule(r2, led, ["D-1"], [], op2)
-        h3 = apply_held_rule(dict(r2, unresolved_high=r2["unresolved_high"] + [{"reviewer": "rigor-artifacts",
-                                                                                "id": "RIG-001", "kind": "k"}]),
-                             led, ["D-1"], ["R-1"], op2)
-        h4 = apply_held_rule(dict(r2, accept_blockers=[{"id": "REQ-001"}]), led, ["D-1"], ["R-1"], op2)
-        # Codex r1 of #357 (P1-3): a MEDIUM with a test a fix task can work to keeps the round
-        h5 = apply_held_rule(r2, led, ["D-1"], ["R-1"], op2 + [{"id": "R-002", "tested": True}])
-        ok(h1["action"] == "DECLARE_SCOPE" and h1["rule_matched"] == "3h" and h1["declared_open"] == ["D-1", "R-1", "W-1"]
-           and h2["action"] == h3["action"] == h4["action"] == h5["action"] == "PATCH_OR_RETHINK"
-           and h5.get("open_tested") == ["R-002"],      # Codex r3 of #357 (P2-12): the fix loop's work, planned
-           f"HB2-2 a rule-2 gate holding only owner-held findings and harness gaps declares them now; a fixable one, a "
-           f"gate finding or a missing artifact keeps rule 2 ({h1['action']}, {h2['action']}, {h3['action']}, "
-           f"{h4['action']})")
-        # HB3-HELD (#375, Codex r1 P2-5; T36): an accepted decision_test_not_run is owner-held. A rule-2 gate whose only
-        # HIGH it is declares it now (rule 3h), and the shortcut takes it to WRITE: no fix loop with nothing to do
-        vn = {"kind": "decision_test_not_run", "stage": "ANALYZE", "key": "DT1", "severity": "HIGH", "claim": "c"}
-        fn = FL.gate_id(vn)
-        rn = {"action": "PATCH_OR_RETHINK", "rule_matched": "2", "accept_blockers": [], "rigor_violations": [vn],
-              "unresolved_high": [{"reviewer": "rigor-artifacts", "id": "RIG-001", "kind": "decision_test_not_run",
-                                   "claim": "ANALYZE/decision_test_not_run: c"}]}
-        ledn = {fn: FL.Finding(id=fn, kind="decision_test_not_run", key="DT1", severity="HIGH",
-                               source="rigor-artifacts", status="owner_accepted")}
-        opn = [{"id": fn, "tested": True}]
-        n1 = apply_held_rule(rn, ledn, [fn], [], opn)
-        n2 = apply_held_rule(rn, ledn, [], [], opn)                           # not answered: the fix loop asks
-        vk = dict(vn, kind="allocation_unstable")                            # another gate kind: never held here
-        rk = dict(rn, rigor_violations=[vk], unresolved_high=[dict(rn["unresolved_high"][0], kind="allocation_unstable",
-                                                                   claim="ANALYZE/allocation_unstable: c")])
-        n3 = apply_held_rule(rk, {FL.gate_id(vk): ledn[fn]}, [FL.gate_id(vk)], [], [{"id": FL.gate_id(vk),
-                                                                                   "tested": True}])
-        ok(n1["action"] == "DECLARE_SCOPE" and n1["rule_matched"] == "3h" and n1["declared_open"] == [fn]
-           and n2["action"] == n3["action"] == "PATCH_OR_RETHINK",
-           f"HB3-HELD an accepted unrun decision test, the only HIGH, is declared now (rule 3h); unanswered, or another "
-           f"gate kind, keeps rule 2 ({n1['action']}/{n1.get('rule_matched')}, {n2['action']}, {n3['action']})")
-
-    def hb2_gap_prewrite():
-        # HB2-4 (dengue R2 in miniature): pre-write, the fix loop declares the only tested finding a harness gap and
-        # plans no task; the run writes in that round instead of running FIX_LOOP -> CRITIQUE twice
-        import fix_loop as _FX
-        real = _FX.run_loop
-        for name, gate, want in (
-                ("hb2_gap_4m", {"action": "PATCH_OR_RETHINK", "rule_matched": "4m", "open_tested": ["R-001"],
-                                "unresolved_high": [], "owner_held": ["D-002"], "open_tested_ids": ["R-001"]}, "WRITE"),
-                ("hb2_gap_r2", {"action": "PATCH_OR_RETHINK", "rule_matched": 2, "unresolved_high": [
-                    {"reviewer": "critique-redteam", "id": "R-001"}, {"reviewer": "critique-domain", "id": "W"}],
-                    "owner_held": [], "open_tested_ids": ["R-001", "W"]}, "WRITE"),
-                ("hb2_gap_r2_gate", {"action": "PATCH_OR_RETHINK", "rule_matched": 2, "unresolved_high": [
-                    {"reviewer": "rigor-artifacts", "id": "RIG-001", "kind": "k"}], "owner_held": []}, "CRITIQUE"),
-                # Codex r2 of #357 (P2-9): a non-blocking MEDIUM with a test a task can work to keeps the round
-                ("hb2_gap_r2_medium", {"action": "PATCH_OR_RETHINK", "rule_matched": 2, "unresolved_high": [
-                    {"reviewer": "critique-redteam", "id": "R-001"}, {"reviewer": "critique-domain", "id": "W"}],
-                    "owner_held": [], "open_tested_ids": ["M", "R-001", "W"]}, "CRITIQUE"),
-                # Codex r3 of #357 (P2-11): a harness check with its own test (no done_when) keeps the round too
-                ("hb2_gap_r2_check", {"action": "PATCH_OR_RETHINK", "rule_matched": 2, "unresolved_high": [
-                    {"reviewer": "critique-redteam", "id": "R-001"}], "owner_held": [],
-                    "open_tested_ids": ["R-001", "uncertainty_draws_low:draws"]}, "CRITIQUE")):
-            d, T, st = new_run(name, {}, max_rounds=3)
-            json.dump(gate, open(os.path.join(d, "gate_r1.json"), "w"))
-            gap = FL.Finding(id="R-001", kind="critique_blocker", severity="MEDIUM", source="critique-redteam",
-                             status="open", owner_state="ANALYZE", blocking=True, fix_requires="emit the claims")
-            led = {"R-001": gap,
-                   "W": FL.Finding(id="W", kind="critique_blocker", severity="HIGH", source="critique-domain",
-                                   status="open", owner_state="WRITE", target_stage="WRITE", blocking=True)}
-            if name == "hb2_gap_r2_medium":
-                led["M"] = FL.Finding(id="M", kind="critique_blocker", severity="MEDIUM", source="critique-domain",
-                                      status="open", owner_state="ANALYZE", done_when=[
-                                          {"file": "analysis_settings.yaml", "key": "uncertainty.draws", "op": ">=",
-                                           "value": 32}])
-            FL.save(d, led)
-            st.state, st.round, st.round_pending, st.post_write = "FIX_LOOP", 1, True, False
-            save_state(d, st)
-
-            def fake(rd, *a, **k):
-                lg = FL.load(rd)
-                FL._event(lg["R-001"], 1, FL.HARNESS_GAP, "fix_planner", "only harness code",
-                          key=FL.harness_gap_key(lg["R-001"]))
-                FL.save(rd, lg)
-                return {"round": 1, "tasks": 0, "rows": 0, "passed": 0, "rethink": None, "write_up": ["W"],
-                        "owner_amendments": [], "harness_gaps": ["R-001"], "harness_gaps_blocking": ["R-001"]}
-            _FX.run_loop = fake
-            try:
-                mk(d, T, st).step()
-            finally:
-                _FX.run_loop = real
-            s2 = load_state(d)
-            ok(s2.state == want and (want == "CRITIQUE" or (s2.round == 1 and s2.write_mode == "declared")),
-               f"HB2-4 a fix loop that declares a harness gap and plans no task goes to {want} ({name}: {s2.state}, "
-               f"round {s2.round}, mode {s2.write_mode})")
-
-    def hb2_declared_gap_and_fp():
-        # HB2-7 (Codex r3 of #357): a declared harness gap keeps the planner's reason in the declaration (P2-13); an
-        # accept given under the earlier contract (no disposition in the fingerprint) does not authorize ACCEPT (P1-1);
+    def hb2_fp_and_stale():
+        # HB2-7 (Codex r3 of #357): an accept given under the earlier contract does not authorize ACCEPT (P1-1);
         # a report rendering that could not state an accepted test is read as stale, unreadable too (P1-7)
-        import yaml as _y7
-        dg = os.path.join(td, "hb2_declared_gap")
+        dg = os.path.join(td, "hb2_fp_stale")
         os.makedirs(dg)
-        g7 = FL.Finding(id="R-001", kind="critique_blocker", severity="MEDIUM", source="critique-redteam",
-                        fix_requires="emit the claims")
-        FL._event(g7, 1, FL.HARNESS_GAP, "fix_planner", "only harness code. Needs: toolkit/analysis/estimates.py",
-                  key=FL.harness_gap_key(g7))
-        FL.save(dg, {"R-001": g7})
-        write_declared(dg, [{"id": "R-001", "severity": "MEDIUM", "source": "critique-redteam", "claim": "c",
-                             "fix_requires": "emit the claims", "tested": True}], {"rule_matched": "3m"})
-        dec7 = _y7.safe_load(open(os.path.join(dg, DECLARED_FILE)))["declared"][0]
         v7 = {"kind": "decision_test_changes_plan", "key": "DT1", "claim": "c"}
         old7 = hashlib.sha256(json.dumps({"finding": FL.gate_id(v7), "claim": "c", "evidence": None}, sort_keys=True,
                                          default=str).encode()).hexdigest()[:16]
         st_missing = _render_stale(dg)
         json.dump({"dependence_stale": []}, open(os.path.join(dg, "report_render.json"), "w"))
-        ok("estimates.py" in str(dec7.get("harness_gap")) and _bearing_fp(v7, None) != old7
+        ok(_bearing_fp(v7, None) != old7
            and _bearing_item(dg, v7)["fingerprint"] == _bearing_fp(v7, None)
            and st_missing and _render_stale(dg) == [],
-           f"HB2-7 a declared gap keeps its reason; the accept binds the disposition; a stale rendering is read "
-           f"({dec7}, {st_missing})")
+           f"HB2-7 the accept binds the disposition and a stale rendering is read ({st_missing})")
 
     def hb2_request_and_report():
         # HB2-5 (Codex r1 of #357, P1-4): rule 2o asks only the findings whose resolution is the owner's; a
@@ -9044,10 +5161,10 @@ def _self_test_writeup_rounds(ok, td: str, toolkit, new_run) -> None:
            f"HB2-6 the accepted dependence names its reference plan, the price case, every unit, an unsettled solve, "
            f"who accepted it, and never shows a changed or unbound record as accepted ({txt!r}, {txt_l!r}, {st6})")
 
-    for name, fn in (("HB2-5-6", hb2_request_and_report), ("HB2-7", hb2_declared_gap_and_fp), ("WR1-WR3", rereview), ("WR1b", rereview_not_accepted),
+    for name, fn in (("HB2-5-6", hb2_request_and_report), ("HB2-7", hb2_fp_and_stale), ("WR1-WR3", writeup_rereview), ("WR1b", writeup_rereview_not_accepted),
                      ("WR4-WR6", owner_held_run),
                      ("WR7", medium_rule_unit), ("WR8", zero_tasks_prewrite), ("WR9", pending_post_write),
-                     ("WR10", answer_binds_current_text), ("HB2-1-3", hb2_rules_unit), ("HB2-4", hb2_gap_prewrite)):
+                     ("WR10", answer_binds_current_text)):
         case(name, fn)
 
 
@@ -9170,11 +5287,11 @@ def _self_test_resume(ok, td: str, toolkit, new_run) -> None:
     class Unreadable(Batch):
         def pipeline_steps(self, spec_path, run_dir):
             raise ValueError("MA_COMPUTE_MAX_CORE_HOURS='lots' is not a number")
-    d, T = toy_run("configure_unreadable")
+    d, T = toy_run("analyze_unreadable")
     s1 = run_v2("toy question", d, T, signoff="none", log=quiet, backend=Unreadable(30), cross_engine_check=False)
     st = load_state(d)
-    ok(s1 == "run_failed" and st.history[-1]["from"] == "CONFIGURE" and "MA_COMPUTE_MAX_CORE_HOURS" in st.history[-1]["why"],
-       f"T60d an unreadable compute budget fails the run at CONFIGURE (fail closed): {st.history[-1]}")
+    ok(s1 == "run_failed" and st.history[-1]["from"] == "ANALYZE" and "MA_COMPUTE_MAX_CORE_HOURS" in st.history[-1]["why"],
+       f"T60d an unreadable compute budget fails the run at ANALYZE (fail closed): {st.history[-1]}")
     # T61 (Nigeria v2 full run F3, 2026-11-02: 16 of 256 design points failed with kind infra when the autoscaler
     # retired busy workers, the analysis failed closed, and the run could not be resumed): an analysis that failed
     # only because engine rows failed with kind infra is resumable, read from the batch summary compute.py wrote.
@@ -9397,7 +5514,6 @@ def _self_test_geometry(ok, td: str) -> None:
        and [f.get("proposed") for f in rep["findings"]] == [why] and still,
        f"IG-M2a proposed by name with a reason, the spec reaches SIGN, where the owner decides; until then the gate "
        f"still carries the swap ({m2.st.state}, {m2.st.paused}, {still})")
-    _t_owner_disposes(d2)
     toolkit.sign(d2, "owner")
     m2.step()
     ok(m2.st.state == "ENGINE_CHOICE" and "reciprocal_swap" not in {f["kind"] for f in m2.harness_findings()},
@@ -9493,10 +5609,9 @@ def _self_test_derived(ok, td: str) -> None:
            and "engine_attribute_unbound" in sheet and "group" in sheet,
            f"DI8a engine auto: the full checks run per candidate in SPEC, before SIGN; the candidate that needs an "
            f"unbound attribute is shown ineligible with the reason ({m.st.state}, {m.st.tries.get('spec_feedback')})")
-        _t_owner_disposes(d)
         toolkit.sign(d, "owner")
         for _ in range(6):
-            if m.st.state in ("CONFIGURE", "FINAL"):
+            if m.st.state in ("ANALYZE", "FINAL"):
                 break
             m.step()
         ec = json.load(open(os.path.join(d, AB.ENGINE_CHOICE)))
@@ -9566,7 +5681,7 @@ def _self_test_evidence(ok, td: str) -> None:
        and g.get("sources_unchecked") == ["parameter:eff_a"]
        and "provisional" in so.get("note", "") and EDR.RECORD in so.get("note", ""),
        f"T_DOSSIER_GAPS the gaps are declared in the record and the lead's note ({rec.get('gaps')}; {so.get('note')})")
-    # T_SIGN_REPAIR: the sheet goes stale between EVIDENCE and SIGN; the refusal sends the run back, then it signs
+    # T_SIGN_NO_REPAIR: a refused lead sign-off pauses cleanly for the owner at SIGN without auto-repair loops
     class Stale(StubTasks):
         def sign_spec(self, run_dir):
             if self.calls.count("sign_spec") == 0:
@@ -9581,18 +5696,17 @@ def _self_test_evidence(ok, td: str) -> None:
     m = Machine(d, T, init_run(d, "toy question", 3, "lead", "v2", None, derived_inputs=False), backend=toolkit,
                 log=lambda *a: None, cross_engine_check=False)
     hist = until(m)
-    ok(hist[:5] == ["EVIDENCE", "SIGN", "EVIDENCE", "SIGN", "ENGINE_CHOICE"] and m.st.tries.get("sign_repair") == 1
-       and T.calls.count("draft_evidence") == 1 and (_signoff(d) or {}).get("signed_by") == "lead",
-       f"T_SIGN_REPAIR a refused lead sign-off goes back to EVIDENCE once, which rewrites the sheet, then signs ({hist}; "
-       f"{T.calls})")
-    # T_EVIDENCE_EXHAUSTED: a task that never supplies the evidence: three drafts, two repairs, then the owner
+    ok(m.st.state == "SIGN" and m.st.paused == "awaiting_signoff"
+       and not os.path.exists(os.path.join(d, SIGNOFF_FILE)),
+       f"T_SIGN_NO_REPAIR a refused lead sign-off waits for the owner at SIGN without looping ({hist}; {T.calls})")
+    # T_EVIDENCE_EXHAUSTED: a task that never supplies the evidence pauses at SIGN for the owner, unsigned
     m, T = setup("ev_none", "lead", {})
     hist = until(m)
     rec = EDR.read_record(m.run_dir) or {}
     ok(m.st.state == "SIGN" and m.st.paused == "awaiting_signoff" and T.calls.count("draft_evidence") == EDR.MAX_TRIES
-       and m.st.tries.get("sign_repair") == MAX_SIGN_REPAIRS and rec.get("status") == "incomplete"
+       and rec.get("status") == "incomplete"
        and not os.path.exists(os.path.join(m.run_dir, SIGNOFF_FILE)),
-       f"T_EVIDENCE_EXHAUSTED the check is never loosened: after {EDR.MAX_TRIES} drafts and {MAX_SIGN_REPAIRS} repairs "
+       f"T_EVIDENCE_EXHAUSTED the check is never loosened: after {EDR.MAX_TRIES} drafts "
        f"the run waits for the owner, unsigned ({hist}; {T.calls})")
     # T_EVIDENCE_OWNER: under --signoff owner the drafted dossier is on the sheet the owner signs
     m, T = setup("ev_owner", "owner", {"evidence": fill})
@@ -9601,15 +5715,14 @@ def _self_test_evidence(ok, td: str) -> None:
         os.path.join(m.run_dir, SIGNOFF_SHEET)) else ""
     ok(m.st.state == "SIGN" and m.st.paused == "awaiting_signoff" and ED.SECTION in sheet, f"T_EVIDENCE_OWNER the "
        f"owner is shown the drafted dossier on the sheet ({m.st.state}, {m.st.paused})")
-    _t_owner_disposes(m.run_dir)        # W0-G (v2 merge): the owner disposes of the review conditions before signing
     toolkit.sign(m.run_dir, "owner")
     m.step()
     ok(m.st.state == "ENGINE_CHOICE", f"T_EVIDENCE_OWNER_SIGNED once the owner signs, the run goes on ({m.st.state})")
     # T_EVIDENCE_NONE: --signoff none: the drafted dossier covers the engine at ENGINE_CHOICE (it failed there before)
     m, T = setup("ev_unsigned", "none", {"evidence": fill})
-    hist = until(m, stop=("PREREGISTER", "CONFIGURE"))
-    ok(hist[:4] == ["EVIDENCE", "SIGN", "ENGINE_CHOICE", hist[3] if len(hist) > 3 else None]
-       and m.st.state in ("PREREGISTER", "CONFIGURE"),
+    hist = until(m, stop=("ANALYZE",))
+    ok(hist[:4] == ["EVIDENCE", "SIGN", "ENGINE_CHOICE", "ANALYZE"]
+       and m.st.state == "ANALYZE",
        f"T_EVIDENCE_NONE --signoff none passes ENGINE_CHOICE's coverage check with the drafted dossier ({hist})")
     # BE27: --signoff none refuses an engine.build spec at SPEC so no paid build starts unsigned
     from toolkit.engines.built import requested as _BREQ
@@ -9736,12 +5849,9 @@ def _self_test_evidence(ok, td: str) -> None:
 
 
 def _self_test_claim_refs(ok, td: str, toolkit, new_run) -> None:
-    """Harness baseline hb2: three runs ended RUN_FAILED (rule 5, post-write) on claim-reference findings the writer
-    could not repair before the round cap. CR1: the harness quoted a critic's remedy holding [CLAIM:x] in the report's
-    declared-findings block (measles R1, dengue R2). CR2: the writer copied a declared remedy's placeholder [CLAIM:id]
-    into Limitations (dengue R2). CR3: the writer named ledger ids in inline code (tb R2). CR4-CR5: whatever is left
-    is repaired inside WRITE, which costs no round; an unrepaired reference still fails closed."""
-    import shutil
+    """Harness baseline hb2: CR1: the harness quoted a critic's remedy holding [CLAIM:x] in the report's
+    declared-findings block. CR2: the writer copied a declared remedy's placeholder [CLAIM:id]
+    into Limitations. CR3: the writer named ledger ids in inline code."""
     import yaml
     from v2_tasks import StubTasks
 
@@ -9804,32 +5914,8 @@ def _self_test_claim_refs(ok, td: str, toolkit, new_run) -> None:
             got = {(f["kind"], f["severity"]) for f in report_claim_findings(d)}
             ok((want, "HIGH") in got, f"CR3b still a HIGH finding (fail closed): {txt.strip()!r} -> {got}")
 
-    def repair(name, script, want_calls, want_status):
-        d, T, st = new_run(name, script, max_rounds=1)
-        os.makedirs(os.path.join(d, "models"), exist_ok=True)
-        shutil.copy(os.path.join(REPO, "tests", "fixtures", "v2blind1", "claims_ledger.yaml"),
-                    os.path.join(d, "models", "claims_ledger.yaml"))
-        s = Machine(d, T, st, backend=toolkit, log=lambda *a: None, cross_engine_check=False).run()
-        h = load_state(d).history
-        reps = [x for x in h if "claim_repair" in x]
-        calls = [c for c in T.calls if c.endswith(":claims")]
-        rounds = {x.get("round") for x in h if x.get("from") == "WRITE" or x.get("to") == "WRITE"}
-        got = [f.get("id", "") for f in getattr(T, "write_findings", [])]
-        ok(len(calls) == want_calls and len(reps) == want_calls and s == want_status and len(rounds) == 1
-           and all(i.startswith("report_claim") for i in got) and got,
-           f"{name.upper()} {want_calls} claim repair(s) inside WRITE (no round), the writer told each finding; ends "
-           f"{want_status} ({s}, {calls}, {reps[-1:]}, rounds {rounds}, {got})")
-
     case("CR1-CR2", quoted)
     case("CR3", code_ids)
-    # CR4: the writer's draft has an id outside the ledger; the repair fixes it and the run is delivered.
-    case("CR4", lambda: repair("cr4", {"manuscript": "It averts [CLAIM:no.such.claim] cases.\n",
-                                       "manuscript_claim_repair": "It averts [CLAIM:headline.point] cases.\n"},
-                               1, "completed"))
-    # CR5: a writer that never repairs: MAX_CLAIM_REPAIRS sessions, then the gate refuses it (a number with no ledger
-    # entry is never accepted).
-    case("CR5", lambda: repair("cr5", {"manuscript": "It averts [CLAIM:no.such.claim] cases.\n"},
-                               MAX_CLAIM_REPAIRS, "run_failed"))
 
     # Codex round 1 of #353.
     def r1_units():
@@ -9858,7 +5944,8 @@ def _self_test_claim_refs(ok, td: str, toolkit, new_run) -> None:
                        open(os.path.join(d, "models", "claims_ledger.yaml"), "w"))
         render_report(d, toolkit)
         kinds = {f["kind"] for f in report_claim_findings(d)}
-        ok("report_claim_invalid" in kinds and not kinds & set(CLAIM_REF_KINDS),
+        ok("report_claim_invalid" in kinds
+           and not (kinds & {"report_claim_unresolved", "report_claim_id_raw", "report_claim_unrendered"}),
            f"CR9 a reference to an invalid ledger entry is reported once, as invalid: no writer repair ({kinds})")
         t = StubTasks({"manuscript": "revised\n"})
         dd = bare_run("cr10", "old\n")
@@ -9866,118 +5953,7 @@ def _self_test_claim_refs(ok, td: str, toolkit, new_run) -> None:
         ok("revised" in open(os.path.join(dd, "manuscript.md")).read(),
            "CR10 an ordinary WRITE visit with claim findings writes the draft; only a marked repair keeps it")
 
-    def r1_machine(name, write, want, check, what):
-        from v2_tasks import TaskResult
-        d, T, st = new_run(name, {"manuscript": "It averts [CLAIM:no.such.claim] cases.\n"}, max_rounds=1)
-        os.makedirs(os.path.join(d, "models"), exist_ok=True)
-        shutil.copy(os.path.join(REPO, "tests", "fixtures", "v2blind1", "claims_ledger.yaml"),
-                    os.path.join(d, "models", "claims_ledger.yaml"))
-        m = Machine(d, T, st, backend=toolkit, log=lambda *a: None, cross_engine_check=False)
-        real, reserve = m._task, []
-
-        def _task(key, name_, *a, _real=real, **kw):
-            if name_ == "write" and key.split(":")[-1].startswith("claims"):
-                reserve.append(bool(kw.get("writeup")))
-                return write(d, TaskResult)
-            return _real(key, name_, *a, **kw)
-        m._task = _task
-        s = m.run()
-        reps = [x for x in load_state(d).history if "claim_repair" in x]
-        ok(s == want and check(d, reps), f"{name.upper()} {what} ({s}, {reps})")
-        if name == "cr6":
-            ok(reserve and not any(reserve), f"CR20 a repair is paid outside the write-up reserve, which the "
-                                             f"presentation review and the gate keep ({reserve})")
-
-    def typed(d, TR):
-        open(os.path.join(d, "manuscript.md"), "w").write("# Report\n\nIt averts 987654321 cases.\n")
-        return TR(True, None, 0.0, "")
-
-    def unfinished(d, TR):
-        open(os.path.join(d, "manuscript.md"), "w").write("# Report\n\nIt averts [CLAIM:headline.point] cases.\n")
-        return TR(False, None, 0.0, "stub: ended before its output file")
-
     case("CR8-CR10", r1_units)
-    case("CR6", lambda: r1_machine(
-        "cr6", typed, "run_failed", lambda d, r: "987654321" not in open(os.path.join(d, "manuscript.md")).read()
-        and r and r[0].get("undone"), "a repair that types a number is undone; the gate refuses the reference"))
-    case("CR7", lambda: r1_machine(
-        "cr7", unfinished, "completed", lambda d, r: "[CLAIM:" not in open(os.path.join(d, "report.md")).read()
-        and len(r) == 1 and r[0]["ok"] is False, "an unfinished session's fix is rendered before the gate reads report.md"))
-    case("CR11", lambda: r1_machine("cr11", lambda d, TR: None, "run_failed", lambda d, r: r == [],
-                                    "a repair with no allowance runs no session and records none"))
-
-    def emptied(d, TR):
-        open(os.path.join(d, "manuscript.md"), "w").write("")
-        return TR(False, None, 0.0, "stub: truncated")
-
-    def year(d, TR):
-        open(os.path.join(d, "manuscript.md"), "w").write("# Report\n\nIt used 2025 replicates.\n")
-        return TR(True, None, 0.0, "")
-
-    def kept(d):
-        return "no.such.claim" in open(os.path.join(d, "manuscript.md")).read()
-    case("CR13", lambda: r1_machine("cr13", emptied, "run_failed", lambda d, r: kept(d) and r and r[0].get("undone"),
-                                    "a repair that empties the draft is undone"))
-    case("CR14", lambda: r1_machine("cr14", year, "run_failed", lambda d, r: kept(d) and r and r[0].get("undone"),
-                                    "a repair that adds any digit string, a year included, is undone"))
-
-    def crash():
-        # CR12: the process dies after the repair session and before its check; the resume checks it
-        from v2_tasks import TaskResult
-        d, T, st = new_run("cr12", {"manuscript": "It averts [CLAIM:no.such.claim] cases.\n"}, max_rounds=1)
-        os.makedirs(os.path.join(d, "models"), exist_ok=True)
-        shutil.copy(os.path.join(REPO, "tests", "fixtures", "v2blind1", "claims_ledger.yaml"),
-                    os.path.join(d, "models", "claims_ledger.yaml"))
-
-        def mk12(stx, session):
-            m = Machine(d, T, stx, backend=toolkit, log=lambda *a: None, cross_engine_check=False)
-            real = m._task
-
-            def _task(key, name_, *a, _real=real, **kw):
-                if name_ == "write" and key.split(":")[-1].startswith("claims"):
-                    return session(TaskResult)
-                return _real(key, name_, *a, **kw)
-            m._task = _task
-            return m
-
-        def typed12(TR):
-            open(os.path.join(d, "manuscript.md"), "w").write("# Report\n\nIt averts 987654321 cases.\n")
-            return TR(True, None, 0.0, "")
-        m = mk12(st, typed12)
-
-        def boom(before):
-            raise RuntimeError("killed before the check")
-        m._claim_repair_undo = boom
-        try:
-            m.run()
-        except RuntimeError:
-            pass
-        os.remove(os.path.join(d, "manuscript.md"))       # and the interrupted session had removed the draft
-        more = []
-
-        def again(TR):
-            more.append(1)
-            return TR(True, None, 0.0, "")
-        s12 = mk12(load_state(d), again).run()
-        ok(s12 == "run_failed" and len(more) == MAX_CLAIM_REPAIRS - 1
-           and "no.such.claim" in open(os.path.join(d, "manuscript.md")).read()
-           and "claim_repair" not in load_state(d).tries
-           and any("interrupted before its check" in str(h.get("undone")) for h in load_state(d).history),
-           f"CR12 a repair interrupted before its check is undone on resume, before the draft is read, and counts as "
-           f"one of the MAX_CLAIM_REPAIRS sessions ({s12}, {len(more)} more)")
-    case("CR12", crash)
-
-    def partial(d, TR):
-        open(os.path.join(d, "manuscript.md"), "w").write("# Report\n")
-        return TR(False, None, 0.0, "stub: stopped")
-
-    def code_ref(d, TR):
-        open(os.path.join(d, "manuscript.md"), "w").write("# Report\n\nIt averts `uq.units_stable_90` cases.\n")
-        return TR(True, None, 0.0, "")
-    case("CR17", lambda: r1_machine("cr17", partial, "run_failed", lambda d, r: kept(d) and r and r[0].get("undone"),
-                                    "a repair that drops the draft's other text is undone"))
-    case("CR18", lambda: r1_machine("cr18", code_ref, "completed", lambda d, r: r and not r[0].get("undone"),
-                                    "a repair to a known id in inline code (digits in the id) is kept"))
 
     def units3():
         RCL = __import__("render_claims")
@@ -10070,14 +6046,13 @@ def _self_test_hb2_spec(ok, td: str, toolkit, new_run) -> None:
     ok(len(T.fbs) >= 2 and any("7 decision input" in x for x in T.fbs[1]) and m.st.tries.get("spec") >= 2,
        f"HS6 the evidence stage's spec problems come back from the SPEC try ({T.fbs[1:2]}, {m.st.state})")
 
-    # HS7: the drafter's prompt states the two rules that cost SPEC retries; a fitted parameter is never moved under
-    # calibration (Codex r1 P2-7: calibration accepts kind calibrated only)
+    # HS7: the drafter's prompt states the calibrated/fitted engine_parameters rule; a fitted parameter is never moved
+    # under calibration (Codex r1 P2-7: calibration accepts kind calibrated only)
     from v2_sdk_tasks import PROMPTS
     pr = PROMPTS["draft_spec"]
-    ok("no digits" in pr and "decision test" in pr and "engine_parameters" in pr and "calibrated" in pr
-       and "a fitted one" in pr,
-       "HS7 the draft_spec prompt says: no digits in a decision test's text; no engine_parameters value for a "
-       "calibrated or fitted parameter (a fitted one is left to the engine)")
+    ok("engine_parameters" in pr and "calibrated" in pr and "a fitted one" in pr,
+       "HS7 the draft_spec prompt says: no engine_parameters value for a calibrated or fitted parameter "
+       "(a fitted one is left to the engine)")
 
     class Calls(Machine):
         """Records which reading checks ran."""
@@ -10204,11 +6179,6 @@ def _self_test_hb2_spec(ok, td: str, toolkit, new_run) -> None:
     t5.set_allowance(1.0)
     t5._session("draft_spec", "x", "y", ())
     ok(got == [5], f"HS13 a caller's explicit turn cap holds for the spec draft ({got})")
-    got.clear()
-    hw = os.path.join(hd, "wm")
-    os.makedirs(hw)
-    t5.world_model_seed(hw, {"question": "q"}, None, 1.0)
-    ok(got == [5], f"HS13b the explicit turn cap holds for the world-model seed's own session ({got})")
 
 
 def _self_test_spec_p1s(ok, td: str, toolkit, new_run) -> None:
@@ -10322,603 +6292,6 @@ def _self_test_spec_p1s(ok, td: str, toolkit, new_run) -> None:
     ok(refused, "SP2 SdkTasks(max_turns=0) is refused: the SDK reads 0 as no turn limit")
 
 
-def _self_test_built_engine(ok, td: str) -> None:
-    """BE28-BE31, BE33 (PR delta of #363): agent-built engine lifecycle, pause/sign/decline/retry,
-    A8 spec-amendment routing, single post-analysis ENGINE repair edge, committed hidden-seed reuse
-    + run-lock enforcement in owner mode, pre-dispatch compute reservation, build-cap pause/resume,
-    lead provisional sign-off + first-paragraph report disclaimer, and snapshot tamper detection."""
-    import shutil
-    import threading
-    from agents import run_finish as RF
-    from toolkit.engines.built import BUILT_ADAPTER_REF
-    from toolkit.engines.built import admission as BADM
-    from toolkit.engines.built import signoff as BSIG
-    from toolkit.engines.built import worker as BWORK
-    from v2_tasks import StubTasks
-
-    real_b = AB.backend()
-    if type(real_b).__name__ != "_ToolkitApi":
-        ok(True, "BE28-BE33 skipped: toolkit backend not active")
-        return
-
-    dev_un = BWORK.engine_sandbox_kind() is None
-
-    def _cf_build(*, include_trial_oob: bool = False) -> dict:
-        lo_t, hi_t = (0.80, 0.90) if include_trial_oob else (0.50, 0.75)
-        return {
-            "id": "cf_mod",
-            "kind": "closed_form",
-            "why": "Needs custom_coupled_hazard_scaling not represented on any registered engine card",
-            "mechanisms": ["custom_coupled_hazard_scaling", "exponential_survival"],
-            "request": {
-                "stochastic": False,
-                "per_capita_invariant_to_N": True,
-                "components": {"comp_a": {"values": [0, 1], "absent": 0}},
-                "unit_attributes": {
-                    "N": {"type": "continuous", "range": [1000.0, 10000.0]},
-                    "haz": {"type": "continuous", "range": [0.1, 0.5]},
-                },
-                "outputs": {
-                    "per_capita": ["cases"],
-                    "windows": {"w0": ["surv"]},
-                    "cost_drivers": ["units_delivered"],
-                },
-                "age_groups": ["all"],
-                "parameters": [
-                    {"name": "base_scale", "value": 1.0, "kind": "fixed", "lo": 0.5, "hi": 1.5,
-                     "units": "ratio", "source": "dossier:E1"},
-                ],
-                "attribute_binding": {"N": "required", "haz": "required"},
-                "decision_inputs": {
-                    "comp_a": {"inputs": [], "none_reason": "synthetic self-test component"},
-                },
-                "expected_effects": {
-                    "comp_a": {"cases": "-", "surv": "+", "units_delivered": "+"},
-                    "base_scale": {"cases": "+", "surv": "-"},
-                    "haz": {"cases": "+", "surv": "-"},
-                },
-                "inert": {"N": {"reason": "per-capita outcomes invariant to N"}},
-                "seed_test_setting": {"unit": {"N": 5000.0, "haz": 0.25}},
-                "reductions": [
-                    {
-                        "id": "RED_SURV",
-                        "oracle": "constant_hazard_survival",
-                        "oracle_args": {"hazard": 0.2, "dt": 1.0},
-                        "set": {"comp_a": 0, "base_scale": 1.0},
-                        "unit": {"N": 5000.0, "haz": 0.2},
-                        "horizon": {"start": 0.0, "stop": 1.0, "window": [0.0, 1.0],
-                                    "windows": {"w0": [0.0, 1.0]}},
-                        "compare": {"windows.w0.surv": {"abs": 1e-6}},
-                    },
-                ],
-                "trials": [
-                    {
-                        "id": "TR1",
-                        "dossier": "E1",
-                        "component": "comp_a",
-                        "arms": {"ctrl": {"comp_a": 0}, "trt": {"comp_a": 1}},
-                        "setting": {"unit": {"N": 5000.0, "haz": 0.2}},
-                        "window": [0.0, 1.0],
-                        "estimand_type": "ratio",
-                        "estimand_mapping": {"num": "trt", "den": "ctrl", "value": "per_capita.cases.all"},
-                        "published": {"lower": lo_t, "upper": hi_t, "level": 0.95},
-                    },
-                ],
-                "reference_tolerance": {"abs": 0.02, "rel": 0.04},
-            },
-        }
-
-    def _cf_files(*, tag: str = "v1", bad_static: bool = False) -> dict[str, bytes]:
-        if bad_static:
-            eng_src = "import os\nclass Model:\n    pass\n"
-        else:
-            eng_src = (
-                "import math\n"
-                "from toolkit.engines.contract import EngineCard, Outcomes, ParamSpec\n"
-                f"TAG = {tag!r}\n"
-                "class Model:\n"
-                "    def describe(self):\n"
-                "        return EngineCard(\n"
-                "            name='built:cf_mod', version='0.1',\n"
-                "            mechanisms=['custom_coupled_hazard_scaling', 'exponential_survival'],\n"
-                "            components={'comp_a': [0, 1]},\n"
-                "            unit_attributes={'N': 'pop', 'haz': 'hazard'},\n"
-                "            outputs={'per_capita': ['cases'], 'windows': ['surv'], 'cost_drivers': ['units_delivered']},\n"
-                "            age_groups=['all'], valid_ranges={'N': [1000.0, 10000.0], 'haz': [0.1, 0.5]},\n"
-                "        )\n"
-                "    def parameters(self):\n"
-                "        return [ParamSpec('base_scale', 1.0, 'fixed', units='ratio', lo=0.5, hi=1.5, source='dossier:E1')]\n"
-                "    def evaluate(self, params, unit, package, horizon):\n"
-                "        dt = max(float(horizon.stop) - float(horizon.start), 1e-6)\n"
-                "        haz = float(unit.attributes['haz'])\n"
-                "        bs = float(params.get('base_scale', 1.0))\n"
-                "        ca = int(package.components.get('comp_a', 0))\n"
-                "        h_eff = haz * bs * (1.0 - 0.4 * ca)\n"
-                "        surv = math.exp(-h_eff * dt)\n"
-                "        cases = 1.0 - surv\n"
-                "        return Outcomes(per_capita={'cases': {'all': cases}},\n"
-                "                        windows={'w0': {'surv': surv}},\n"
-                "                        cost_drivers={'units_delivered': float(ca)})\n"
-            )
-        card = (
-            "name: built:cf_mod\nversion: '0.1'\nkind: closed_form\n"
-            "mechanisms:\n  - custom_coupled_hazard_scaling\n  - exponential_survival\n"
-            "components:\n  comp_a: [0, 1]\n"
-            "unit_attributes:\n  N: pop\n  haz: hazard\n"
-            "outputs:\n  per_capita: [cases]\n  windows: [surv]\n  cost_drivers: [units_delivered]\n"
-            "age_groups: [all]\n"
-            "valid_ranges:\n  N: [1000.0, 10000.0]\n  haz: [0.1, 0.5]\n"
-            "benchmarks: []\nassumptions:\n  - constant hazard\nlimitations:\n  - synthetic\n"
-        )
-        return {
-            "engine.py": eng_src.encode("utf-8"),
-            "card.yaml": card.encode("utf-8"),
-            "ENGINE_NOTES.md": f"# cf_mod {tag}\n\nConstant-hazard survival model.\n".encode("utf-8"),
-        }
-
-    def _cf_spec(rd: str, *, include_trial_oob: bool = False) -> dict:
-        with open(os.path.join(rd, "units.csv"), "w", encoding="utf-8") as fh:
-            fh.write("id,region,grp,haz,pop\n0,r0,g0,0.20,2000\n1,r1,g1,0.35,4000\n2,r0,g0,0.15,3000\n3,r1,g1,0.40,5000\n")
-        return {
-            "schema_version": 1,
-            "question": "Which package per unit?",
-            "decision_maker": "programme manager",
-            "decision_date": 2026,
-            "engine": {"build": _cf_build(include_trial_oob=include_trial_oob)},
-            "horizon": {"start": 0, "stop": 1},
-            "decision_units": {
-                "csv": "units.csv", "id": "id", "region": "region",
-                "populations": {"all": {"column": "pop", "age_groups": ["all"]}},
-                "engine_attributes": {"N": {"column": "pop"}, "haz": {"column": "haz"}},
-            },
-            "options": {
-                "populations": {"total": "pop"},
-                "components": {"comp_a": {}},
-                "packages": {"generate": True},
-                "engine_map": {"comp_a": {"comp_a": 1}},
-                "prices": {"base_year": "2024", "index": {"2024": 1.0}},
-                "cost_items": [{"id": "ca", "component": "comp_a", "value": 1.0, "price_year": "2024",
-                                "price_rule": "as_published", "basis": "per_person", "includes": ["x"]}],
-            },
-            "objective": {"outcome": "cases", "horizon": [0, 1], "discounting": "none"},
-            "constraints": {"envelope_usd": 9000},
-            "comparator": {"package": "none", "text": "no package"},
-            "outcomes_reported": ["cases"],
-            "calibration": {"method": "none"},
-            "uncertainty": {
-                "sources": [{"kind": "costs", "items": {"ca": [0.8, 1.2]}}],
-                "excluded": [{"kind": k, "reason": "test"} for k in ("engine_parameters", "calibration", "emulator")],
-            },
-            "analysis": {
-                "evaluation": "direct",
-                "stability": {"holdout_group": "grp", "covariates": ["haz"]},
-                "sensitivity": {"parameters": ["base_scale"]},
-                "decision_tests": [],
-            },
-            "deliverable": {
-                "kind": "package_per_unit",
-                "allocation_file": "allocation_optimized.csv",
-                "columns": {"unit": "unit", "package": "package", "value": "cases_averted"},
-                "headline": {"name": "total_cases_averted", "outcome": "cases"},
-            },
-        }
-
-    class _FastBuiltBackend:
-        """Delegates spec/sign-off/choice to real `_ToolkitApi`, using a tiny no-op analyze step so
-        state-machine tests exercise real admission, sign-off, tamper, and gate paths in ~1s."""
-        settings_paths = getattr(real_b, "settings_paths", AB.SETTINGS_PATHS)
-
-        def pre_sign_problems(self, rd, derived=False):
-            return real_b.pre_sign_problems(rd, derived=derived)
-
-        def signoff_status(self, rd):
-            return real_b.signoff_status(rd)
-
-        def sign(self, rd, by, note="", **kw):
-            return real_b.sign(rd, by, note, **kw)
-
-        def signed_sha(self, rd):
-            return real_b.signed_sha(rd)
-
-        def choice_spec(self, rd):
-            return real_b.choice_spec(rd)
-
-        def eligible_engines(self, spec):
-            return []
-
-        def validate(self, spec_path):
-            return []
-
-        def pipeline_steps(self, spec_path, run_dir):
-            import shlex
-            code = (
-                "import json, os; "
-                "os.makedirs('analysis', exist_ok=True); "
-                "open('analysis/analysis.json', 'w').write(json.dumps({'headline': {'point': 10.0}})); "
-                "open('analysis/allocation_optimized.csv', 'w').write('unit,package,cases_averted\\n0,comp_a,10.0\\n')"
-            )
-            return [{
-                "id": "analyze",
-                "run": f"{shlex.quote(sys.executable)} -c {shlex.quote(code)}",
-                "inputs": ["decision_spec.yaml", "engine_choice.json", "engine_build/admission.json"],
-                "outputs": ["analysis/analysis.json", "analysis/allocation_optimized.csv"],
-            }]
-
-        def gate_findings(self, rd):
-            return []
-
-        def spec_violations(self, rd):
-            return []
-
-        def registry_violations(self, rd):
-            return []
-
-        def headline(self, rd):
-            return {"point": 10.0}
-
-        def render_tables(self, rd):
-            return ""
-
-    fast_b = _FastBuiltBackend()
-
-    def _dispose_owner_conditions(rd: str) -> None:
-        _t_owner_disposes(rd)
-
-    def _mk_run(name: str, *, signoff: str = "owner", include_trial_oob: bool = False,
-                build_fn=None, critics=None, budget: float | None = None,
-                engine_build_usd: float | None = None, max_rounds: int = 3,
-                with_ref: bool = True):
-        rd = os.path.join(td, name)
-        os.makedirs(rd, exist_ok=True)
-        if with_ref:
-            ref_dir = os.path.join(rd, "engine_build", "reference")
-            os.makedirs(ref_dir, exist_ok=True)
-            open(os.path.join(ref_dir, "reference.py"), "wb").write(_cf_files(tag="ref")["engine.py"])
-        sp = _cf_spec(rd, include_trial_oob=include_trial_oob)
-        sc = {
-            "spec": sp,
-            "settings": {"uncertainty": {"draws": 4, "seed": 1}},
-            "build_engine": build_fn if build_fn is not None else _cf_files(),
-            "critics": critics or {},
-        }
-        st = init_run(rd, "Which package per unit?", max_rounds=max_rounds, signoff=signoff,
-                      budget_usd=budget, derived_inputs=False, engine_unsandboxed=dev_un,
-                      world_model=False, engine_build_usd=engine_build_usd)
-        return rd, StubTasks(sc), st
-
-    # BE28: owner lifecycle (pause awaiting_engine_signoff -> sign -> FINAL + hidden_reveal + owner disclaimer),
-    # lead provisional auto-sign + provisional disclaimer, and post-sign & FINAL snapshot tamper -> artifact_tampered
-    d28, T28, st28 = _mk_run("be28_owner", signoff="owner")
-    s_sign = Machine(d28, T28, st28, backend=fast_b, log=lambda *a: None, cross_engine_check=False).run()
-    _dispose_owner_conditions(d28)
-    fast_b.sign(d28, "owner", "approved spec")
-    s_wait = Machine(d28, StubTasks(T28.s), None, backend=fast_b, log=lambda *a: None, cross_engine_check=False).run()
-    ch_wait = json.load(open(os.path.join(d28, AB.ENGINE_CHOICE)))
-    pending_ok = (s_wait == f"paused:{AWAITING_ENGINE_SIGNOFF}" and RF.exit_code_for(AWAITING_ENGINE_SIGNOFF) == 2
-                  and "engine" not in ch_wait and (ch_wait.get("build") or {}).get("status") == "admitted"
-                  and BSIG.status(d28) == "awaiting")
-    BSIG.sign(d28, "owner", note="approved engine")
-    s_done = Machine(d28, StubTasks(T28.s), None, backend=fast_b, log=lambda *a: None, cross_engine_check=False).run()
-    ch_done = json.load(open(os.path.join(d28, AB.ENGINE_CHOICE)))
-    rev_path = os.path.join(d28, "engine_build", "hidden_reveal.json")
-    rep28 = open(os.path.join(d28, "report.md"), encoding="utf-8").read() if os.path.exists(os.path.join(d28, "report.md")) else ""
-    lead_d, lead_T, lead_st = _mk_run("be28_lead", signoff="lead")
-    s_lead = Machine(lead_d, lead_T, lead_st, backend=fast_b, log=lambda *a: None, cross_engine_check=False).run()
-    rep_lead = open(os.path.join(lead_d, "report.md"), encoding="utf-8").read() if os.path.exists(os.path.join(lead_d, "report.md")) else ""
-    so_lead = json.load(open(os.path.join(lead_d, BSIG.SIGNOFF_REL))) if os.path.exists(os.path.join(lead_d, BSIG.SIGNOFF_REL)) else {}
-    # Tamper snapshot on a completed FINAL copy -> resuming FINAL detects tamper and withholds report
-    tamp_d = os.path.join(td, "be28_tamper")
-    shutil.copytree(lead_d, tamp_d)
-    st_t = load_state(tamp_d)
-    snap_t = st_t.engine_build["snapshot_sha256"]
-    sdir_t = os.path.join(tamp_d, "engine_build", "snapshots", snap_t)
-    os.chmod(sdir_t, 0o755)
-    ep_t = os.path.join(sdir_t, "engine.py")
-    os.chmod(ep_t, 0o644)
-    open(ep_t, "ab").write(b"\n# tampered\n")
-    s_tamp = Machine(tamp_d, StubTasks(lead_T.s), None, backend=fast_b, log=lambda *a: None, cross_engine_check=False).run()
-    ok(s_sign == "paused:awaiting_signoff" and pending_ok
-       and (s_done == "completed" or (dev_un and s_done == "run_failed"))
-       and (ch_done.get("engine") or {}).get("ref") == BUILT_ADAPTER_REF
-       and os.path.isfile(rev_path) and "Agent-built engine (owner-signed)" in rep28[:600]
-       and (s_lead == "completed" or (dev_un and s_lead == "run_failed"))
-       and so_lead.get("by") == "lead" and so_lead.get("provisional") is True
-       and "Agent-built engine (lead-signed, provisional)" in rep_lead[:600]
-       and s_tamp == "artifact_tampered" and not os.path.exists(os.path.join(tamp_d, "report.md")),
-       f"BE28 owner sign-off lifecycle, lead provisional sign-off + disclaimer, hidden_reveal, and FINAL tamper detection "
-       f"(pending={pending_ok}, done={s_done}, lead={s_lead}, tamp={s_tamp})")
-
-    # BE29a: static/admission failure twice -> completed_engine_not_admitted (exit 2) + request_for_owner.md;
-    # missing A11 reference.py also fails closed (A11 unavailable -> not admitted)
-    d29a, T29a, st29a = _mk_run("be29_fail", signoff="lead", build_fn=_cf_files(bad_static=True))
-    s29a = Machine(d29a, T29a, st29a, backend=fast_b, log=lambda *a: None, cross_engine_check=False).run()
-    d29r, T29r, st29r = _mk_run("be29_noref", signoff="lead", with_ref=False)
-    s29r = Machine(d29r, T29r, st29r, backend=fast_b, log=lambda *a: None, cross_engine_check=False).run()
-    # BE29b: A8 out-of-band without departure -> ENGINE_ADMIT -> SPEC -> paused:awaiting_spec_amendment
-    d29b, T29b, st29b = _mk_run("be29_a8", signoff="owner", include_trial_oob=True)
-    Machine(d29b, T29b, st29b, backend=fast_b, log=lambda *a: None, cross_engine_check=False).run()
-    _dispose_owner_conditions(d29b)
-    fast_b.sign(d29b, "owner", "approved spec")
-    s29b = Machine(d29b, StubTasks(T29b.s), None, backend=fast_b, log=lambda *a: None, cross_engine_check=False).run()
-    rq29b = json.load(open(os.path.join(d29b, SPEC_RETHINK_REQUEST))) if os.path.exists(os.path.join(d29b, SPEC_RETHINK_REQUEST)) else {}
-    # BE29c: owner decline on try 1 rebuilds; decline on final try -> completed_engine_declined (exit 2)
-    decl_n = [0]
-
-    def _build_tagged(_rd, _pk, _eid):
-        decl_n[0] += 1
-        return _cf_files(tag=f"try{decl_n[0]}")
-
-    d29c, T29c, st29c = _mk_run("be29_decline", signoff="owner", build_fn=_build_tagged)
-    Machine(d29c, T29c, st29c, backend=fast_b, log=lambda *a: None, cross_engine_check=False).run()
-    _dispose_owner_conditions(d29c)
-    fast_b.sign(d29c, "owner", "approved spec")
-    s29c1 = Machine(d29c, StubTasks(T29c.s), None, backend=fast_b, log=lambda *a: None, cross_engine_check=False).run()
-    BSIG.decline(d29c, "owner", note="need extra detail on try 1")
-    s29c2 = Machine(d29c, StubTasks(T29c.s), None, backend=fast_b, log=lambda *a: None, cross_engine_check=False).run()
-    BSIG.decline(d29c, "owner", note="still unacceptable on try 2")
-    s29c3 = Machine(d29c, StubTasks(T29c.s), None, backend=fast_b, log=lambda *a: None, cross_engine_check=False).run()
-    ok(s29a == ENGINE_NOT_ADMITTED and RF.exit_code_for(s29a) == 2
-       and s29r == ENGINE_NOT_ADMITTED
-       and os.path.isfile(os.path.join(d29a, "engine_build", "request_for_owner.md"))
-       and s29b == f"paused:{AWAITING_SPEC_AMENDMENT}" and rq29b.get("source") == "ENGINE_ADMIT"
-       and s29c1 == f"paused:{AWAITING_ENGINE_SIGNOFF}" and s29c2 == f"paused:{AWAITING_ENGINE_SIGNOFF}"
-       and decl_n[0] == 2 and s29c3 == ENGINE_DECLINED and RF.exit_code_for(s29c3) == 2,
-       f"BE29 not-admitted (exit 2), missing-A11 fail-closed, A8 spec-amendment pause, and decline-rebuild/decline-terminal "
-       f"({s29a}, noref={s29r}, {s29b}, {s29c1}->{s29c2}->{s29c3}, builds={decl_n[0]})")
-
-    # BE30: post-analysis GATE finding with target_stage=ENGINE triggers 1 repair (new hidden seed) and refuses 2nd
-    rep_n = [0]
-    commits_30: list[str] = []
-
-    def _build_30(_rd, _pk, _eid):
-        rep_n[0] += 1
-        return _cf_files(tag=f"rep{rep_n[0]}")
-
-    eng_bl1 = {"id": "D-301", "severity": "HIGH", "target_stage": "ENGINE", "claim": "missing age effect",
-               "done_when": [{"judgement": "engine represents age effect"}]}
-    eng_bl2 = {"id": "D-302", "severity": "HIGH", "target_stage": "ENGINE", "claim": "second engine issue",
-               "done_when": [{"judgement": "second engine issue addressed"}]}
-    d30, T30, st30 = _mk_run("be30_repair", signoff="lead", build_fn=_build_30, max_rounds=2,
-                             critics={1: {"critique-domain": [eng_bl1]}, 2: {"critique-domain": [eng_bl2]}})
-    m30 = Machine(d30, T30, st30, backend=fast_b, log=lambda *a: None, cross_engine_check=False)
-    for _ in range(60):
-        if m30.st.state == "FINAL" or m30.st.paused:
-            break
-        m30.step()
-        if m30.st.state == "ENGINE_REVIEW":
-            c30 = (m30.st.engine_build or {}).get("hidden_commitment")
-            if c30 and c30 not in commits_30:
-                commits_30.append(c30)
-    st30_end = load_state(d30)
-    eb_visits = sum(1 for h in st30_end.history if h.get("to") == "ENGINE_BUILD")
-    refused_30 = any(h.get("engine_repair_refused") for h in st30_end.history)
-    ok(eb_visits == 2 and int((st30_end.engine_build or {}).get("repairs") or 0) == 1
-       and len(commits_30) == 2 and refused_30,
-       f"BE30 single target_stage=ENGINE repair gets new hidden seed; 2nd repair refused "
-       f"(visits={eb_visits}, repairs={(st30_end.engine_build or {}).get('repairs')}, "
-       f"commits={len(commits_30)}, refused={refused_30})")
-
-    # BE31: committed hidden seed reused on resume; missing seed file after commitment fails closed;
-    # _amend_lock held in another thread refuses concurrent owner resume
-    d31, T31, st31 = _mk_run("be31_lock", signoff="owner")
-    st31.state = "ENGINE_ADMIT"
-    st31.engine_build = {"id": "cf_mod", "kind": "closed_form", "status": "building",
-                         "tries": 1, "repairs": 0, "spent_usd": 0.0, "snapshot_sha256": "a" * 64}
-    save_state(d31, st31)
-    m31 = Machine(d31, T31, None, backend=fast_b, log=lambda *a: None, cross_engine_check=False)
-    sb1, cm1 = m31._ensure_hidden_seed("a" * 64)
-    sb2, cm2 = m31._ensure_hidden_seed("a" * 64)
-    os.remove(os.path.join(d31, "engine_build", ".hidden", "seed.json"))
-    missing_seed_refused = False
-    try:
-        m31._ensure_hidden_seed("a" * 64)
-    except RuntimeError:
-        missing_seed_refused = True
-    locked_ok = [False]
-    ready_ev, release_ev = threading.Event(), threading.Event()
-
-    def _hold():
-        with _amend_lock(d31):
-            ready_ev.set()
-            release_ev.wait(5.0)
-
-    th = threading.Thread(target=_hold, daemon=True)
-    th.start()
-    ready_ev.wait(5.0)
-    try:
-        try:
-            Machine(d31, StubTasks(T31.s), None, backend=fast_b, log=lambda *a: None, cross_engine_check=False)
-        except AmendmentLocked:
-            locked_ok[0] = True
-    finally:
-        release_ev.set()
-        th.join(5.0)
-    ok(sb1 == sb2 and cm1 == cm2 and missing_seed_refused and locked_ok[0],
-       f"BE31 committed hidden seed reused on resume, missing seed fails closed, and _amend_lock refuses concurrent owner resume "
-       f"(same_seed={sb1 == sb2}, miss_ref={missing_seed_refused}, locked={locked_ok[0]})")
-
-    # BE33: pre-dispatch compute reservation pauses before BADM.admit; interrupted build task charges lane budget;
-    # engine_build_cap pauses & resumes via run_v2(..., engine_build_usd=40.0)
-    d33, T33, st33 = _mk_run("be33_budget", signoff="lead", budget=20.0)
-    m33_prep = Machine(d33, T33, st33, backend=fast_b, log=lambda *a: None, cross_engine_check=False)
-    for _ in range(10):
-        if m33_prep.st.state == "ENGINE_ADMIT" or m33_prep.st.state == "FINAL" or m33_prep.st.paused:
-            break
-        m33_prep.step()
-    st33_ad = load_state(d33)
-    st33_ad.spent_usd = 10.0       # remaining $10 < ENGINE_ADMIT_COMPUTE_CAP_USD ($15)
-    save_state(d33, st33_ad)
-    admit_calls = [0]
-    orig_admit = BADM.admit
-
-    def _spy_admit(*a, **kw):
-        admit_calls[0] += 1
-        return orig_admit(*a, **kw)
-
-    BADM.admit = _spy_admit
-    try:
-        s33_adm = Machine(d33, StubTasks(T33.s), None, backend=fast_b, log=lambda *a: None, cross_engine_check=False).run()
-    finally:
-        BADM.admit = orig_admit
-    # Build-cap pause (including interrupted build task charging engine_build.spent_usd) & resume via engine_build_usd=40
-    d33b, T33b, st33b = _mk_run("be33_bcap", signoff="lead", budget=100.0, engine_build_usd=1.0)
-    m33b_prep = Machine(d33b, T33b, st33b, backend=fast_b, log=lambda *a: None, cross_engine_check=False)
-    for _ in range(10):
-        if m33b_prep.st.state == "ENGINE_BUILD" or m33b_prep.st.state == "FINAL" or m33b_prep.st.paused:
-            break
-        m33b_prep.step()
-    st33b = load_state(d33b)
-    st33b.journal["ENGINE_BUILD#0:interrupted"] = {
-        "task": "build_engine", "status": "started", "allowance_usd": 0.80, "build_budget": True, "readback_usd": 0.0,
-    }
-    save_state(d33b, st33b)
-    s33_bcap = Machine(d33b, StubTasks(T33b.s), None, backend=fast_b, log=lambda *a: None, cross_engine_check=False).run()
-    lane_charged = abs(float((load_state(d33b).engine_build or {}).get("spent_usd") or 0.0) - 0.80) < 1e-6
-    # Raise build cap via run_v2 -> verify cap raised and build runs
-    s33_res = run_v2("Which package per unit?", d33b, StubTasks(T33b.s), signoff="lead", budget_usd=100.0,
-                     engine_build_usd=40.0, engine_unsandboxed=dev_un, backend=fast_b,
-                     log=lambda *a: None, cross_engine_check=False)
-    st33b_end = load_state(d33b)
-    ok(s33_adm == f"paused:{AWAITING_BUDGET}" and admit_calls[0] == 0
-       and lane_charged and s33_bcap == f"paused:{AWAITING_BUDGET}"
-       and st33b_end.engine_build_cap_usd == 40.0
-       and any(h.get("engine_build_cap_raised") for h in st33b_end.history)
-       and not s33_res.startswith("paused:"),
-       f"BE33 compute reservation pauses before BADM.admit (calls={admit_calls[0]}, {s33_adm}); "
-       f"interrupted build charges lane ({lane_charged}), engine_build_cap pauses ({s33_bcap}) and resumes ({s33_res})")
-
-    # BE17_REF (§4.4, PR epsilon): real `build_reference` task using scipy.integrate creates a content-addressed
-    # reference snapshot, binds admission.json["digests"]["reference_snapshot"], and passes A11
-    ref_ode_py = (
-        "from scipy.integrate import solve_ivp\n"
-        "from toolkit.engines.contract import EngineCard, Outcomes, ParamSpec\n"
-        "class Model:\n"
-        "    def describe(self):\n"
-        "        return EngineCard(\n"
-        "            name='built:cf_mod', version='0.1',\n"
-        "            mechanisms=['custom_coupled_hazard_scaling', 'exponential_survival'],\n"
-        "            components={'comp_a': [0, 1]},\n"
-        "            unit_attributes={'N': 'pop', 'haz': 'hazard'},\n"
-        "            outputs={'per_capita': ['cases'], 'windows': ['surv'], 'cost_drivers': ['units_delivered']},\n"
-        "            age_groups=['all'], valid_ranges={'N': [1000.0, 10000.0], 'haz': [0.1, 0.5]},\n"
-        "        )\n"
-        "    def parameters(self):\n"
-        "        return [ParamSpec('base_scale', 1.0, 'fixed', units='ratio', lo=0.5, hi=1.5, source='dossier:E1')]\n"
-        "    def evaluate(self, params, unit, package, horizon):\n"
-        "        dt = max(float(horizon.stop) - float(horizon.start), 1e-6)\n"
-        "        haz = float(unit.attributes['haz'])\n"
-        "        bs = float(params.get('base_scale', 1.0))\n"
-        "        ca = int(package.components.get('comp_a', 0))\n"
-        "        h_eff = haz * bs * (1.0 - 0.4 * ca)\n"
-        "        sol = solve_ivp(lambda _t, y: [-h_eff * y[0]], [0.0, dt], [1.0], rtol=1e-9, atol=1e-12)\n"
-        "        surv = float(sol.y[0, -1])\n"
-        "        return Outcomes(per_capita={'cases': {'all': 1.0 - surv}},\n"
-        "                        windows={'w0': {'surv': surv}},\n"
-        "                        cost_drivers={'units_delivered': float(ca)})\n"
-    ).encode("utf-8")
-    d_ref, T_ref, st_ref = _mk_run("be17_real_ref", signoff="lead", with_ref=False)
-    T_ref.s["build_reference"] = ref_ode_py
-    s_ref = Machine(d_ref, T_ref, st_ref, backend=fast_b, log=lambda *a: None, cross_engine_check=False).run()
-    st_ref_end = load_state(d_ref)
-    adm_ref = json.load(open(os.path.join(d_ref, "engine_build", "admission.json")))
-    ref_sha = (st_ref_end.engine_build or {}).get("reference_snapshot_sha256")
-    ok((s_ref == "completed" or (dev_un and s_ref == "run_failed"))
-       and isinstance(ref_sha, str) and len(ref_sha) == 64
-       and adm_ref.get("checks", {}).get("A11", {}).get("status") == "pass"
-       and (adm_ref.get("digests") or {}).get("reference_snapshot") == ref_sha
-       and "build_reference:cf_mod" in T_ref.calls,
-       f"BE17_REF build_reference (scipy.integrate) snapshots reference, binds digest, and passes A11 "
-       f"(status={s_ref}, a11={adm_ref.get('checks', {}).get('A11', {}).get('status')}, ref_sha={bool(ref_sha)})")
-
-    # BE17_REF_RESUME + BEG_GATE_WIRE: budget pause during build_reference on the final candidate try
-    # resumes straight into build_reference without losing the snapshot; and manifest size tampering is
-    # caught by Machine.harness_findings() via built_engine_gate.
-    d_rr, T_rr, st_rr = _mk_run("be17_ref_resume", signoff="lead", with_ref=False)
-    T_rr.s["build_reference"] = ref_ode_py
-    m_rr = Machine(d_rr, T_rr, st_rr, backend=fast_b, log=lambda *a: None, cross_engine_check=False)
-    for _ in range(10):
-        if m_rr.st.state == "ENGINE_BUILD" or m_rr.st.state == "FINAL" or m_rr.st.paused:
-            break
-        m_rr.step()
-    m_rr.st.engine_build["tries"] = MAX_ENGINE_BUILD_TRIES - 1
-    m_rr.st.engine_build_cap_usd = 5.0
-    T_rr.s["usd"] = 4.90  # leaves $0.10 < MIN_TASK_ALLOWANCE_USD so build_reference pauses on engine_build_cap
-    save_state(d_rr, m_rr.st)
-    s_rr_p = m_rr.run()
-    st_rr_p = load_state(d_rr)
-    paused_ok = (s_rr_p == f"paused:{AWAITING_BUDGET}" and st_rr_p.state == "ENGINE_BUILD"
-                 and (st_rr_p.engine_build or {}).get("status") == "awaiting_reference"
-                 and int((st_rr_p.engine_build or {}).get("tries") or 0) == MAX_ENGINE_BUILD_TRIES)
-    # Raise cap and resume: must NOT fail with ENGINE_NOT_ADMITTED, must skip build_engine, run build_reference & admit
-    st_rr_p.engine_build_cap_usd = 30.0
-    st_rr_p.paused = None
-    T_rr.s["usd"] = 0.0
-    save_state(d_rr, st_rr_p)
-    s_rr_end = Machine(d_rr, T_rr, st_rr_p, backend=fast_b, log=lambda *a: None, cross_engine_check=False).run()
-    # Now tamper ONLY `size` in the snapshot manifest and check Machine.harness_findings() catches it via built_engine_gate
-    snap_rr = (load_state(d_rr).engine_build or {}).get("snapshot_sha256")
-    man_p = os.path.join(d_rr, "engine_build", "snapshots", f"{snap_rr}.json")
-    man_doc = json.load(open(man_p))
-    man_doc["files"][0]["size"] = int(man_doc["files"][0]["size"]) + 99
-    with open(man_p, "w", encoding="utf-8") as _mf:
-        json.dump(man_doc, _mf)
-    hf_rr = Machine(d_rr, T_rr, load_state(d_rr), backend=fast_b, log=lambda *a: None, cross_engine_check=False).harness_findings()
-    ok(paused_ok and (s_rr_end == "completed" or (dev_un and s_rr_end == "run_failed"))
-       and T_rr.calls.count("build_engine:cf_mod") == 1 and "build_reference:cf_mod" in T_rr.calls
-       and any(f.get("kind") == "built_engine_snapshot_invalid" and "size mismatch" in str(f.get("claim")) for f in hf_rr),
-       f"BE17_REF_RESUME budget pause during build_reference resumes cleanly on final try ({paused_ok}, {s_rr_end}) "
-       f"and harness_findings runs built_engine_gate ({[f.get('kind') for f in hf_rr]})")
-
-    # BE_A10_PRIOR: posterior prior_dominated params with declared calibration.priors are auto-covered by
-    # ANALYZE's prior_range_<p> tests and proceed to ENGINE_REVIEW; non-posterior unidentified params still route to SPEC.
-    import yaml as _yaml
-    a10_res = {}
-    for label, cal_decl, a10_cls in (
-        ("post", {"method": "posterior", "parameters": ["base_scale"],
-                  "priors": {"base_scale": {"dist": "uniform", "range": [0.5, 1.5], "source": "test"}}},
-         "prior_dominated"),
-        ("lik", {"method": "likelihood", "parameters": ["base_scale"]}, "unidentified"),
-    ):
-        d_ap, T_ap, st_ap = _mk_run(f"be_a10_{label}", signoff="lead")
-        m_ap = Machine(d_ap, T_ap, st_ap, backend=fast_b, log=lambda *a: None, cross_engine_check=False)
-        for _ in range(10):
-            if m_ap.st.state == "ENGINE_ADMIT" or m_ap.st.state == "FINAL" or m_ap.st.paused:
-                break
-            m_ap.step()
-        sp_p = os.path.join(d_ap, AB.SPEC_FILE)
-        sp_d = _yaml.safe_load(open(sp_p))
-        sp_d["calibration"] = cal_decl
-        with open(sp_p, "w", encoding="utf-8") as _sf:
-            _yaml.safe_dump(sp_d, _sf, sort_keys=False)
-        orig_adm_ap = BADM.admit
-
-        def _stub_adm(run_dir, snap_sha, *_a, _cls=a10_cls, **_kw):
-            doc = {
-                "status": "admitted",
-                "hidden_commitment": "0" * 64,
-                "snapshot_sha256": snap_sha,
-                "checks": {
-                    "A8": {"id": "A8", "status": "pass", "problems": [], "routing": None},
-                    "A10": {"id": "A10", "status": "pass", "classes": {"base_scale": _cls},
-                            "unidentified": ["base_scale"], "problems": []},
-                },
-            }
-            ap = os.path.join(run_dir, "engine_build", "admission.json")
-            os.makedirs(os.path.dirname(ap), exist_ok=True)
-            with open(ap, "w", encoding="utf-8") as _af:
-                json.dump(doc, _af)
-            return doc
-
-        BADM.admit = _stub_adm
-        try:
-            m_ap.step()
-        finally:
-            BADM.admit = orig_adm_ap
-        a10_res[label] = (m_ap.st.state, os.path.isfile(os.path.join(d_ap, SPEC_RETHINK_REQUEST)))
-    ok(a10_res["post"] == ("ENGINE_REVIEW", False) and a10_res["lik"] == ("SPEC", True),
-       f"BE_A10_PRIOR posterior prior_dominated proceeds to ENGINE_REVIEW while likelihood unidentified routes to SPEC ({a10_res})")
-
-
 def _self_test_acquire(ok, td: str) -> None:
     """All 14 stage-machine ACQUIRE self-tests (docs/design/acquire.md §9.1):
     T_ACQ_OFF, T_ACQ_OFF_GOLDEN, T_ACQ_SUPPLIED, T_ACQ_PROMOTE, T_ACQ_EMPTY, T_ACQ_TOPUP,
@@ -10933,7 +6306,7 @@ def _self_test_acquire(ok, td: str) -> None:
 
     # T_ACQ_OFF: default acquire="off" starts at SPEC and history never names ACQUIRE
     d_off = os.path.join(td, "t_acq_off")
-    st_off = init_run(d_off, "Bare question?", signoff="none", derived_inputs=False, world_model=False)
+    st_off = init_run(d_off, "Bare question?", signoff="none", derived_inputs=False)
     meta_off = json.load(open(os.path.join(d_off, "metadata.json")))
     m_off = Machine(d_off, StubTasks({}), st_off, log=lambda *a: None, cross_engine_check=False)
     m_off.step()
@@ -10945,7 +6318,7 @@ def _self_test_acquire(ok, td: str) -> None:
     # manifest sentence, TOOLS is unchanged, and history never names ACQUIRE
     d_gold = os.path.join(td, "t_acq_gold")
     st_gold = init_run(d_gold, "Use requirements.txt for allocation.", signoff="none",
-                       derived_inputs=False, world_model=False)
+                       derived_inputs=False)
     staged_g = stage_inputs(d_gold, st_gold.question)
     prov_g = json.load(open(os.path.join(d_gold, PROVENANCE)))
     gold_prompts = {}
@@ -10970,7 +6343,7 @@ def _self_test_acquire(ok, td: str) -> None:
     # T_ACQ_SUPPLIED: acquire="auto" with a question naming a repo file skips ACQUIRE at $0 and closes back-edges
     d_sup = os.path.join(td, "t_acq_sup")
     st_sup = init_run(d_sup, "Allocate using requirements.txt.", signoff="none", acquire="auto",
-                      derived_inputs=False, world_model=False)
+                      derived_inputs=False)
     T_sup = StubTasks({"usd": 1.0})
     m_sup = Machine(d_sup, T_sup, st_sup, log=lambda *a: None, cross_engine_check=False)
     nxt_sup = m_sup.step()
@@ -11006,7 +6379,7 @@ def _self_test_acquire(ok, td: str) -> None:
         # T_ACQ_PROMOTE: fixture fetch -> promoted files, manifest, views, SPEC prompt sees manifest
         d_pr = os.path.join(td, "t_acq_promote")
         st_pr = init_run(d_pr, "Bare policy question.", signoff="none", acquire="auto",
-                         derived_inputs=False, world_model=False)
+                         derived_inputs=False)
         T_pr = StubTasks({"acquire": lambda q, rd, pkt: _fetch_keep(rd, "IND1", "csv", ["population"])})
         m_pr = Machine(d_pr, T_pr, st_pr, log=lambda *a: None, cross_engine_check=False)
         m_pr.acquire_allowlist = al_p
@@ -11028,7 +6401,7 @@ def _self_test_acquire(ok, td: str) -> None:
         # T_ACQ_EMPTY: nothing promoted -> paused:awaiting_inputs and acquire/inputs_request.md written
         d_em = os.path.join(td, "t_acq_empty")
         st_em = init_run(d_em, "Bare question.", signoff="owner", acquire="auto",
-                         derived_inputs=False, world_model=False)
+                         derived_inputs=False)
         T_em = StubTasks({"acquire": {"keep": [], "wanted_map": {}}})
         m_em = Machine(d_em, T_em, st_em, log=lambda *a: None, cross_engine_check=False)
         m_em.acquire_allowlist = al_p
@@ -11041,7 +6414,7 @@ def _self_test_acquire(ok, td: str) -> None:
         # T_ACQ_TOPUP: missing_input after 3rd SPEC try goes to ACQUIRE once, grants 4th SPEC try; 2nd gap does not go back
         d_tu = os.path.join(td, "t_acq_topup")
         st_tu = init_run(d_tu, "Bare question.", signoff="none", acquire="auto",
-                         derived_inputs=False, world_model=False)
+                         derived_inputs=False)
         acq_rounds_seen = []
 
         def _acq_tu(q, rd, pkt):
@@ -11073,7 +6446,7 @@ def _self_test_acquire(ok, td: str) -> None:
         # never reaches ACQUIRE; restored state past SIGN without closed flag is treated as closed
         d_cl = os.path.join(td, "t_acq_closed")
         st_cl = init_run(d_cl, "Bare question.", signoff="none", acquire="auto",
-                         derived_inputs=False, world_model=False)
+                         derived_inputs=False)
         T_cl = StubTasks({"acquire": lambda q, rd, pkt: _fetch_keep(rd, "IND1", "csv"), "spec": {"schema_version": 1}})
 
         class _ClosedMachine(Machine):
@@ -11096,7 +6469,7 @@ def _self_test_acquire(ok, td: str) -> None:
         # Part B: restored state past SIGN missing closed flag
         d_cl2 = os.path.join(td, "t_acq_closed_restored")
         st_cl2 = init_run(d_cl2, "Bare question.", signoff="none", acquire="auto",
-                          derived_inputs=False, world_model=False)
+                          derived_inputs=False)
         st_cl2.acquired = {"rounds": 1}  # deliberately omit closed flag
         st_cl2.history.append({"at": _now(), "from": "SIGN", "to": "ENGINE_CHOICE", "why": "sign-off none"})
         st_cl2.state = "ACQUIRE"
@@ -11111,7 +6484,7 @@ def _self_test_acquire(ok, td: str) -> None:
         # T_ACQ_TAMPER_PRESPEC: tampering promoted file between ACQUIRE and SPEC -> artifact_tampered before draft_spec
         d_tp = os.path.join(td, "t_acq_tamper")
         st_tp = init_run(d_tp, "Bare question.", signoff="none", acquire="auto",
-                         derived_inputs=False, world_model=False)
+                         derived_inputs=False)
         T_tp = StubTasks({"acquire": lambda q, rd, pkt: _fetch_keep(rd, "IND1", "csv"), "spec": {"schema_version": 1}})
         m_tp = Machine(d_tp, T_tp, st_tp, log=lambda *a: None, cross_engine_check=False)
         m_tp.acquire_allowlist = al_p
@@ -11130,7 +6503,7 @@ def _self_test_acquire(ok, td: str) -> None:
         # T_ACQ_BALANCE: interrupted call + retry + top-up + read-backs cannot exceed ACQUIRE_CAP_USD ($6)
         d_bal = os.path.join(td, "t_acq_balance")
         st_bal = init_run(d_bal, "Bare question.", signoff="none", acquire="auto", budget_usd=50.0,
-                          derived_inputs=False, world_model=False)
+                          derived_inputs=False)
         st_bal.journal["ACQUIRE#r1:a0"] = {
             "task": "acquire", "status": "started", "allowance_usd": 3.0, "readback_usd": 0.25, "acquire_budget": True,
         }
@@ -11175,7 +6548,7 @@ def _self_test_acquire(ok, td: str) -> None:
         SO.write_sheet(d_sg)
         sheet_txt = open(os.path.join(d_sg, SIGNOFF_SHEET), encoding="utf-8").read()
         rec_sg = SO.sign(d_sg, "owner")
-        st_sg = RunState(question="q", state="CONFIGURE", signoff="owner", acquire="auto",
+        st_sg = RunState(question="q", state="ANALYZE", signoff="owner", acquire="auto",
                          acquired={"rounds": 1, "closed": True, "inventory_sha256": promo_sg["inventory_sha256"]})
         save_state(d_sg, st_sg)
         signed_clean = (
@@ -11217,7 +6590,7 @@ def _self_test_acquire(ok, td: str) -> None:
            f"preconditions, and resume with no dossier (clean={signed_clean}, tampers={tamper_results})")
 
         # T_ACQ_QUOTE: acquired literature quote verification (bad quote -> HIGH observation_quote_not_found;
-        # allowlisted URL without acquired block -> HIGH observation_acquired_unbound; exact quote passes)
+        # exact quote passes)
         d_qt = os.path.join(td, "t_acq_quote")
         os.makedirs(d_qt)
         fk_qt = _fetch_keep(d_qt, "IND1", "xml_ok", ["trial_effect"])
@@ -11229,21 +6602,15 @@ def _self_test_acquire(ok, td: str) -> None:
         doss_bad_q = yaml.safe_dump({"inputs": {"parameter:eff": {
             "observations": [dict(base_obs, acquired={"id": fid_qt, "sha256": sha_qt, "locator": "p1",
                                                       "quote": "not present in xml"})]}}}, sort_keys=False).encode()
-        doss_unb = yaml.safe_dump({"inputs": {"parameter:eff": {
-            "observations": [dict(base_obs, where="https://fixture.local/api/slice/IND1")]}}}, sort_keys=False).encode()
         doss_ok = yaml.safe_dump({"inputs": {"parameter:eff": {
             "observations": [dict(base_obs, acquired={
                 "id": fid_qt, "sha256": sha_qt, "locator": "p1",
                 "quote": "Trial result showed efficacy 0.65 (95% CI 0.50-0.78)"})]}}}, sort_keys=False).encode()
         f_bad = ED.quote_findings({}, d_qt, doss_bad_q)
-        f_unb = ED.quote_findings({}, d_qt, doss_unb)
         f_ok = ED.quote_findings({}, d_qt, doss_ok)
         ok(len(f_bad) == 1 and f_bad[0]["kind"] == "observation_quote_not_found" and f_bad[0]["severity"] == "HIGH"
-           and f_bad[0]["scope_declarable"] is False
-           and len(f_unb) == 1 and f_unb[0]["kind"] == "observation_acquired_unbound" and f_unb[0]["severity"] == "HIGH"
-           and f_unb[0]["scope_declarable"] is False and f_ok == [],
-           f"T_ACQ_QUOTE quote mismatch and unbound allowlisted URL are HIGH non-declarable; exact quote passes "
-           f"({f_bad}, {f_unb}, {f_ok})")
+           and f_bad[0]["scope_declarable"] is False and f_ok == [],
+           f"T_ACQ_QUOTE quote mismatch is HIGH non-declarable; exact quote passes ({f_bad}, {f_ok})")
 
         # T_ACQ_DELIVERABLE: deliverable_file.path under acquire/ is refused
         d_del = os.path.join(td, "t_acq_deliv")

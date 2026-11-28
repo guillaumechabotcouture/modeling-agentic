@@ -337,12 +337,6 @@ def pack_ids(pack: dict, ref: str = "the engine") -> tuple[set, set]:
     return set(ids), set(ids) - fit
 
 
-def _names(text: str, ident: str) -> bool:
-    """Whether `text` names the id `ident` as a word (case-insensitive; B7 is not named by B7b or AB7)."""
-    import re
-    return re.search(rf"(?<![A-Za-z0-9_]){re.escape(ident)}(?![A-Za-z0-9_])", text, re.IGNORECASE) is not None
-
-
 def _pack_of(cls_or_engine, ref: str) -> tuple:
     """(pack, why, error): error is a refusal (the pack exists but cannot be used), whatever the basis."""
     try:
@@ -372,11 +366,6 @@ def _held_out_entry(w: str, e: dict, ref: str, pack, why) -> list[str]:
                 bad.append(f"{w}: REFUSED: fitted_to names {t}, a {HELD_OUT_REFUSED} of {ref} (not one of the "
                            "pack's fit targets). A value chosen with a held-out benchmark cannot be signed by the "
                            "owner or the lead: the benchmark would no longer test the engine")
-    named = sorted(i for i in held if any(_names(str(e.get(k) or ""), i) for k in ("source", "reason")))
-    if named:
-        bad.append(f"{w}: REFUSED: its source or reason names {', '.join(named)}, {HELD_OUT_REFUSED}"
-                   f"{'s' if len(named) > 1 else ''} of {ref}. A value justified by a held-out benchmark cannot be "
-                   "signed by the owner or the lead (if the value does not come from it, say where it does come from)")
     return bad
 
 
@@ -495,14 +484,12 @@ def signoff_refusals(raw, candidates=None, run_dir: str | None = None) -> list[s
             continue
         targets.append((ref, pack, why))
     if not targets and not any("does not load" in b or "cannot be checked" in b for b in bad):
-        packs, errs = _all_packs()
+        _, errs = _all_packs()
         bad += errs
-        targets = [(ref, pk, None) for ref, pk in packs]
         for n, e in ents.items():
             if e.get("basis") == "fitted":
                 bad.append(f"{FIELD}.{n}: fitted_to cannot be resolved before the engine is known (engine: auto, "
                            "no candidate)")
-        ents = {n: dict(e, basis=None) for n, e in ents.items()}    # the text backstop only
     for n, e in ents.items():
         for ref, pack, why in targets:
             bad += _held_out_entry(f"{FIELD}.{n}", e, ref, pack, why)
@@ -1552,13 +1539,6 @@ def _self_test() -> int:
                                ("fitted_to without basis fitted", dict(base, basis="literature", fitted_to=["TF1"]))):
                 e = errs_of(base=ent)
                 ok(any("fitted_to" in x for x in e), f"EP48 {label} is a finding: {e}")
-            # the backstop: a held-out id named in the source or reason, whatever the basis says
-            for k, text in (("reason", "the value that puts TH1 in band"), ("source", "a sweep on th2 (the pack runner)"),
-                            ("reason", "TH1 and TH2 both in band")):
-                e = errs_of(base=dict(base, basis="owner_judgement", **{k: text}))
-                ok(len(e) == 1 and HELD_OUT_REFUSED in e[0], f"EP49 a held-out id in the {k} text is refused: {e}")
-            e = errs_of(base=dict(base, basis="literature", reason="as in TH1b and XTH1; fitted to TF1 elsewhere"))
-            ok(e == [], f"EP49b the text match is by word against the pack's ids (TH1b, XTH1 and a fit target pass): {e}")
             # where it bites: the sheet shows the refusal; the signer refuses it for the owner and the lead
             for by in ("owner", "lead"):
                 with tempfile.TemporaryDirectory() as d2:
@@ -1583,15 +1563,6 @@ def _self_test() -> int:
             ra["engine"] = {"auto": True}
             e = signoff_refusals(ra)
             ok(any("before the engine is known" in x for x in e), f"EP51b no engine known: fitted is refused: {e}")
-            real = [(ref, pk) for ref, pk in _all_packs()[0] if pack_ids(pk)[1]]
-            if real:
-                hid = sorted(pack_ids(real[0][1])[1])[0]
-                ra[FIELD]["base"] = dict(base, basis="literature", reason=f"puts {hid} in band")
-                e = signoff_refusals(ra)
-                ok(any(HELD_OUT_REFUSED in x and hid in x for x in e),
-                   f"EP51c no engine known: a held-out id of any engine pack in the reason is refused: {e}")
-            else:
-                ok(False, "EP51c no engine pack with a held-out benchmark found under toolkit/engines")
             # the pack is the engine's own: never named by the spec or the configuration, and it must name the class
             pk, where = benchmark_pack(TOYS.ToySpecEngine(results_path=os.path.join(d, "elsewhere.yaml")))
             ok(isinstance(pk, dict) and where.endswith("toy_engines_pack.yaml")
@@ -1648,7 +1619,7 @@ def _self_test() -> int:
             ok(all(got.values()), f"EP54 a pack that cannot be used refuses every value, whatever its basis "
                                   f"(owner_judgement, text naming an id): {got}")
             # EP55: auto: true with a ref checks the candidates (as the schema runs them), and the conflict is refused
-            ra = toy_raw(d, base=dict(clean))
+            ra = toy_raw(d, base=dict(clean, basis="fitted", fitted_to=["TH1"]))
             ra["engine"] = {"auto": True, "ref": "toolkit.engines.contract:ToyEngine",
                             "candidates": ["toolkit.spec.toy_engines:ToySpecEngine"]}
             e = signoff_refusals(ra)
@@ -1677,7 +1648,7 @@ def _self_test() -> int:
     def held_out_round2():
         real = [(ref, pk) for ref, pk in _all_packs()[0] if pack_ids(pk)[1]]
         hid = sorted(pack_ids(real[0][1])[1])[0]
-        ent = {"value": 0.55, "source": SRC, "reason": f"puts {hid} in band", "basis": "owner_judgement"}
+        ent = {"value": 0.55, "source": SRC, "reason": "a fitted setting", "basis": "fitted", "fitted_to": [hid]}
         with tempfile.TemporaryDirectory() as d:
             # EP58: an engine choice outside the signed spec never narrows the check (it can change after signing)
             json.dump({"engine": {"ref": "toolkit.engines.contract:ToyEngine"}},
@@ -1685,8 +1656,8 @@ def _self_test() -> int:
             ra = toy_raw(d, base=dict(ent))
             ra["engine"] = {"auto": True}
             e = signoff_refusals(ra, run_dir=d)
-            ok(any(HELD_OUT_REFUSED in x and hid in x for x in e),
-               f"EP58 engine: auto with an engine_choice.json naming a packless engine still checks every pack: {e}")
+            ok(any("before the engine is known" in x for x in e),
+               f"EP58 engine: auto with an engine_choice.json naming a packless engine still checks as unknown: {e}")
             # EP59: a pack that cannot be reached (not absent) refuses; so does an engines directory that cannot be listed
             real_lstat, real_scandir = EPm.os.lstat, EPm.os.scandir
 
@@ -1715,8 +1686,8 @@ def _self_test() -> int:
             # spike backend reads it
             ra["engine"] = {"auto": 1, "ref": "toolkit.engines.contract:ToyEngine"}
             e = signoff_refusals(ra)
-            ok(any("true or false" in x for x in e) and any(HELD_OUT_REFUSED in x and hid in x for x in e),
-               f"EP60 auto: 1 with a ref is refused and the held-out text is still checked: {e}")
+            ok(any("true or false" in x for x in e) and any("before the engine is known" in x for x in e),
+               f"EP60 auto: 1 with a ref is refused and treated as auto: {e}")
     guard("EP58-EP60 held-out checks, round 2", held_out_round2)
 
     if fails:

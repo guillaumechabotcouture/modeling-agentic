@@ -274,11 +274,6 @@ def sign(run_dir: str, by: str, note: str = "", answers: dict | None = None, acc
             or (brel is not None and src.get("burden_references_sha256") != bsha)):
         raise ValueError(f"{SHEET} was generated from another spec, derivation record or reference file (it is "
                          "stale): the sheet is regenerated before the owner signs; read the new one")
-    from toolkit.spec import review_conditions as RC
-    rc_bytes = RC.read_bytes(run_dir)       # W0-G: read once, validated by the precondition and bound in the record
-    rc_sha = RC.sha_of(rc_bytes)
-    if rc_sha != "none":
-        extra[RC.FILE] = rc_sha
     from agents import acquire as ACQ
     acq_inv_sha = None
     if ACQ.has_acquired(run_dir):
@@ -308,7 +303,7 @@ def sign(run_dir: str, by: str, note: str = "", answers: dict | None = None, acc
         from toolkit.spec import preconditions as PC
         errs = [e + (" (only the owner or, provisionally, the lead can sign an engine departure)"
                      if by not in ("owner", "lead") else "")
-                for e in PC.problems(run_dir, data, by, spec=sp, review_bytes=rc_bytes)]
+                for e in PC.problems(run_dir, data, by, spec=sp)]
     if errs:
         raise ValueError("spec not ready: " + "; ".join(errs[:10]))
     _refuse_held_out(data, run_dir)     # also in decision_brief.sign: every entry point, whoever signs
@@ -417,12 +412,6 @@ def write_sheet(run_dir: str, candidates: list | None = None) -> str:
     st_ = ED.state(run_dir, spec_bytes=spec_bytes, signing=True, require_sheet=False)
     closure = ((st_.get("binding") or {}).get("record") or {}).get("closure") or {}
     owners = ((st_.get("binding") or {}).get("record") or {}).get("closure_owners") or {}
-    from toolkit.spec import review_conditions as RC
-    try:                                # W0-G: one read, shown and hashed
-        rbytes = RC.read_bytes(run_dir)
-        rsha = RC.sha_of(rbytes)
-    except ValueError:
-        rbytes, rsha = None, "unreadable"
     from agents import acquire as ACQ
     mbytes, acq_inv_sha = None, None
     if ACQ.has_acquired(run_dir):
@@ -433,15 +422,13 @@ def write_sheet(run_dir: str, candidates: list | None = None) -> str:
         except (ACQ.ArtifactTampered, LinkRefused, OSError):
             acq_inv_sha = "unreadable"
     text = sheet(run_dir, candidates, spec_bytes=spec_bytes, record_bytes=rec_bytes, geometry_section=section,
-                 burden_bytes=bbytes, dossier_bytes=ebytes, closure=closure, review_bytes=rbytes,
-                 manifest_bytes=mbytes)
+                 burden_bytes=bbytes, dossier_bytes=ebytes, closure=closure, manifest_bytes=mbytes)
     src = json.dumps({"spec_sha256": hashlib.sha256(spec_bytes).hexdigest(),
                       "burden_references_sha256": bsha,
                       "evidence_dossier_sha256": esha,
                       "input_closure_sha256": ED.closure_digest(closure),
                       "input_closure": closure, "input_closure_owners": owners,
                       "derivations_sha256": hashlib.sha256(rec_bytes).hexdigest() if rec_bytes is not None else "none",
-                      "review_conditions_sha256": rsha,
                       "geometry_evidence_sha256": section[1],
                       **({"acquired_inventory_sha256": acq_inv_sha} if acq_inv_sha is not None else {})},
                      sort_keys=True)
@@ -452,7 +439,7 @@ def write_sheet(run_dir: str, candidates: list | None = None) -> str:
 def sheet(run_dir: str, candidates: list | None = None, spec_bytes: bytes | None = None,
           record_bytes: bytes | None = None, geometry_section: tuple | None = None,
           burden_bytes: bytes | None = None, dossier_bytes: bytes | None = None, closure: dict | None = None,
-          review_bytes: bytes | None = None, manifest_bytes: bytes | None = None) -> str:
+          manifest_bytes: bytes | None = None) -> str:
     """The sign-off sheet (markdown): what signing accepts beyond the spec's text. Each engine default the spec
     accepts by name, with the card's meaning and the spec's reason; the staged columns and tables the derivations
     do not use, with their reasons; the derivations; each engine parameter value the spec sets, with the card value
@@ -483,8 +470,6 @@ def sheet(run_dir: str, candidates: list | None = None, spec_bytes: bytes | None
             dossier_bytes = None
     from toolkit.spec import spec_critique as SC     # pre-sign spec critique, on the bytes this sheet shows and binds
     out += SC.sheet_lines(raw, run_dir, dossier_bytes=dossier_bytes, burden_data=burden_bytes)
-    from toolkit.spec import review_conditions as RC     # W0-G: each condition raised and its disposition
-    out += RC.sheet_lines(run_dir, data=review_bytes, raw=raw if isinstance(raw, dict) else {})
     eng = raw.get("engine")
     refs = [eng["ref"]] if isinstance(eng, dict) and eng.get("ref") else \
         (list(eng.get("candidates") or []) if isinstance(eng, dict) else [])
@@ -879,8 +864,8 @@ def _self_test() -> int:
         p = schema.toy_spec(d)
         raw = yaml.safe_load(open(p))
         raw["engine"] = {"ref": toy}
-        raw["engine_parameters"] = {"k": {"value": 0.9, "source": "a toy sweep", "basis": "owner_judgement",
-                                          "reason": "the value at which TH2 is in band"}}
+        raw["engine_parameters"] = {"k": {"value": 0.9, "source": "a toy sweep", "basis": "fitted",
+                                          "fitted_to": ["TH2"], "reason": "a fitted setting"}}
         yaml.safe_dump(raw, open(p, "w"), sort_keys=False)
         sec = sheet(d).split("## Engine parameter values set by the spec")[-1].split("\n## ")[0]
         code = ("import sys; sys.path.insert(0, sys.argv[1]); from toolkit.spec import toy_engines as T; "
@@ -891,7 +876,8 @@ def _self_test() -> int:
            and r.returncode != 0 and "held-out benchmark" in r.stderr and status(d) != "signed",
            f"SV9 the sheet shows the refusal and the signoff CLI refuses it with --by owner (exit {r.returncode}): "
            f"{r.stderr[-300:]!r}; {sec[-300:]!r}")
-        raw["engine_parameters"]["k"]["reason"] = "the owner's planning value for this setting"
+        raw["engine_parameters"]["k"] = {"value": 0.9, "source": "a toy sweep", "basis": "owner_judgement",
+                                        "reason": "the owner's planning value for this setting"}
         yaml.safe_dump(raw, open(p, "w"), sort_keys=False)
         sec = sheet(d).split("## Engine parameter values set by the spec")[-1].split("\n## ")[0]
         sign(d, "owner")
@@ -1182,9 +1168,8 @@ def _self_test_run_dir_forms(ok):
         raw_bs["engine"] = {"build": BREQ.example_build()}
         yaml.safe_dump(raw_bs, open(p_bs, "w"), sort_keys=False)
         txt_bs = sheet(d_bs)
-        ok("## Engine to be built" in txt_bs and "Generated check plan" in txt_bs
-           and "`severe`" in txt_bs and "Full-registry eligibility check" in txt_bs,
-           "BE26b build-spec sign-off sheet renders request, check plan, uncovered outputs, and full-registry rows "
+        ok("## Engine to be built" in txt_bs and "severe" in txt_bs and "Full-registry eligibility check" in txt_bs,
+           "BE26b build-spec sign-off sheet renders request, outputs, and full-registry rows "
            "including when regenerated via CLI without pre-computed candidates")
 
 

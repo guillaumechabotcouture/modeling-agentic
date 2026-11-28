@@ -25,9 +25,7 @@ solver through `Analysis.solve`); it runs no engine and has no optimiser of its 
   schedule             per region: the delivery events of the engine's schedule hook (toolkit/engines/hooks.py), or
                        the reason it is not available
 
-`rebuild(run_dir)` reconstructs the Analysis of a finished emulator-path run from its stored batch rows (no engine
-runs), and refuses unless the rows' engine identity matches this code's engine and the rebuilt plan equals the stored
-one. Nothing here names a disease, component or unit.
+Nothing here names a disease, component or unit.
 """
 from __future__ import annotations
 
@@ -49,30 +47,8 @@ STORED_SCHEMA = "analysis.uncertainty_draws/1"
 REPLAY_CHECK_DRAWS = 2      # stored draws re-evaluated by the figure step (the first ones: the draws are sequential)
 
 
-class RebuildRefused(RuntimeError):
-    pass
-
-
 def _fixed(spec) -> dict:
     return {k: float(v) for k, v in ((spec["constraints"].get("fixed_costs_usd") or {}).items())}
-
-
-def plan_within_gap(A, sol, plan, ben, cost) -> bool:
-    """1C-c: a stored plan that differs from the re-solved one is the same result when it meets the constraints at the
-    budget the plan is solved within and its objective is within the solver's stated gap of the re-solved optimum.
-    Both are proven within gap g of the optimum's gain G (over each unit's least-benefit option after pruning: the
-    solver's `gain`), so they differ by at most g / (1 - g) of the re-solved gain. Without that gain in `sol`, no
-    difference is allowed (Codex r2 P1)."""
-    from toolkit.alloc import optimize as aopt
-    budget = A.budget if getattr(A, "plan_budget", None) is None else A.plan_budget
-    try:      # the allocator's own check (Codex r1 P1-8); a plan it cannot read is not within the gap
-        if aopt.check(plan, ben, cost, A.feas, budget, budget_exact=bool(getattr(A, "budget_exact", False))):
-            return False
-        short = float(sol["objective"]) - sum(float(ben[i][plan[i]]) for i in A.ids)
-    except (KeyError, TypeError, ValueError):
-        return False
-    g, gain = float(sol.get("gap_rel") or 0.0), abs(float(sol.get("gain") or 0.0))
-    return short <= (g / (1.0 - g) + 1e-9) * gain      # the rounding allowance scales with the gain (P1-7)
 
 
 def frontier(A, ben0, cost0, out0, fractions=FRACTIONS, events=None) -> dict:
@@ -469,175 +445,11 @@ def compute(A, plan, out0, ben0, cost0, uq: dict | None, z0: dict | None = None,
            else {"reproduced": False, "reason": "no uncertainty draws"},
            "component_increment": component_increment(A, plan, ben0, cost0, events=ev), "burden": burden(A, out0),
            "calibration": calibration_modelled(A, z0 or {}), "schedule": sch}
-    if getattr(A, "rebuild_info", None):
-        out["rebuild"] = A.rebuild_info
     return out
-
-
-def derived_fields(spec_raw: dict, scale: str | None = None) -> list[str]:
-    """The job inputs computed by a transcendental function, so a platform's libm can move their last bits: the
-    calibrated attribute on the log scale (batch.calibrated_value: exp(z)). Every other input is source-bound (copied
-    from the units table, the spec or the design) and must match exactly. `scale`: the spec's resolved scale
-    (Spec.calibration_scale); without it, the mapping's own resolution (schema.resolved_scale, the engine card
-    included)."""
-    from toolkit.spec import schema as _schema
-    cal = (spec_raw or {}).get("calibration") or {}
-    if cal.get("attribute") and (scale or _schema.resolved_scale(spec_raw or {})) == "log":
-        return [f"unit.{cal['attribute']}"]
-    return []
-
-
-ULP_BOUND = 4          # a stored row's job may differ from the rebuilt one by at most this many ulps in one input
-
-
-# --------------------------------------------------------------------------- offline rebuild
-def _canon(x):
-    return json.loads(json.dumps(x, sort_keys=True, default=str))
-
-
-def _float_leaves(x, path=()):
-    if isinstance(x, dict):
-        for k, v in x.items():
-            yield from _float_leaves(v, path + (k,))
-    elif isinstance(x, list):
-        for k, v in enumerate(x):
-            yield from _float_leaves(v, path + (k,))
-    elif isinstance(x, float):
-        yield path, x
-
-
-def ulp_match(job: dict, stored_sha: str, job_sha, bound: int = ULP_BOUND, fields=()):
-    """The single derived input of `job` (a dotted path in `fields`, e.g. unit.<attribute>) that, moved by at most
-    `bound` ulps, reproduces `stored_sha`: (dotted path, ulps), or None. Exactly one candidate must match; inputs not
-    in `fields` are never moved."""
-    hits = []
-    allowed = set(fields or ())
-    for path, v in _float_leaves({k: job[k] for k in ("unit", "params") if k in job}):
-        if ".".join(str(p) for p in path) not in allowed:
-            continue
-        for k in [x for n in range(1, bound + 1) for x in (n, -n)]:
-            w = v
-            for _ in range(abs(k)):
-                w = float(np.nextafter(w, np.inf if k > 0 else -np.inf))
-            jj = json.loads(json.dumps(job))
-            tgt = jj
-            for p in path[:-1]:
-                tgt = tgt[p]
-            tgt[path[-1]] = w
-            if job_sha(jj) == stored_sha:
-                hits.append((".".join(str(p) for p in path), k))
-    return hits[0] if len(hits) == 1 else None
-
-
-def rebuild(run_dir: str, log=print):
-    """(A, plan, out0, ben0, cost0, z0) of a finished emulator-path run, from its stored batch (no engine runs).
-
-    Fail closed: the stored design and every stored batch file must have the hashes batch.yaml recorded; every row
-    must carry this code's engine identity; a row whose job hash differs from the rebuilt job is taken only when one
-    derived input (derived_fields: exp of the calibrated attribute) moved by at most ULP_BOUND ulps reproduces its
-    stored hash, recorded in A.rebuild_info; every source-bound input must match exactly; the rebuilt plan must equal the stored plan. A.point_events
-    holds the point evaluation's model corrections."""
-    import yaml
-    from toolkit.analysis import batch as Bt
-    from toolkit.analysis.artifacts import sha256
-    from toolkit.analysis.core import Analysis
-    from toolkit.analysis.model import EmulatorModel
-    from toolkit.engines.identity import engine_identity
-    from toolkit.spec import schema
-    run_dir = os.path.abspath(run_dir)
-    spec = schema.load(os.path.join(run_dir, "decision_spec.yaml"))
-    if spec["analysis"]["evaluation"] != "emulator":
-        raise RebuildRefused("the run evaluates the engine directly; a rebuild would run the engine")
-    from toolkit.analysis import plan_rule as PR
-    if PR.rule(spec.raw) != "point":     # hb1 fix 11 (Codex r2 of #343 P1-4): a point solve cannot verify that plan
-        raise RebuildRefused("the plan was solved over the uncertainty draws (deliverable.plan: expected_value); a "
-                             "rebuild from the point tables cannot reproduce it")
-    eng = spec.engine()
-    rows = os.path.join(run_dir, "analysis", "batch", "results.jsonl")
-    if not os.path.exists(rows):
-        raise RebuildRefused("no stored batch rows (analysis/batch/results.jsonl)")
-    bdoc = yaml.safe_load(open(os.path.join(run_dir, "analysis", "batch.yaml")))
-    for rel, h in (bdoc.get("inputs") or {}).items():
-        if rel.startswith("analysis/batch/") and sha256(os.path.join(run_dir, rel)) != h:
-            raise RebuildRefused(f"{rel} is not the file batch.yaml recorded (hash differs): the stored batch changed "
-                                 "after the analysis")
-    ident = engine_identity(eng)
-    design, jobs = Bt.design(spec)
-    stored = json.load(open(os.path.join(run_dir, "analysis", "batch", "design.json")))
-    if _canon(stored) != _canon(design):
-        raise RebuildRefused("the stored batch design differs from the spec's design (a shipped batch?)")
-    res, by_ulp, other = {}, [], []
-    dfields = derived_fields(spec.raw, spec.calibration_scale())
-    with open(rows) as f:
-        for line in f:
-            r = json.loads(line)
-            if not r.get("ok") or not isinstance(r.get("i"), int) or r["i"] >= len(jobs):
-                continue
-            body = r.get("result") or {}
-            pv = body.get("provenance") or {}
-            job = jobs[r["i"]]
-            if pv.get("engine") != ident:
-                pe = pv.get("engine") or {}
-                raise RebuildRefused(f"row {r['i']} ({job['id']}) was computed by engine {pe.get('name')} "
-                                     f"v{pe.get('version')} (code {str(pe.get('code_sha256', ''))[:12]}); this code's "
-                                     f"engine is v{ident['version']} (code {ident['code_sha256'][:12]}): re-render with "
-                                     "the run's own code")
-            if pv.get("job_sha") != Bt.job_sha(job):
-                m = ulp_match(job, pv.get("job_sha"), Bt.job_sha, fields=dfields)
-                if m is None:
-                    other.append(job["id"])
-                    continue
-                by_ulp.append({"job": job["id"], "field": m[0], "ulps": m[1]})
-            res[job["id"]] = body["result"]
-    if other:
-        raise RebuildRefused(f"{len(other)} rows' inputs differ from the rebuilt jobs by more than one derived input "
-                             f"({', '.join(dfields) or 'none declared'}) within {ULP_BOUND} ulps (e.g. {other[:3]})")
-    if len(res) != len(jobs):
-        raise RebuildRefused(f"{len(jobs) - len(res)} jobs have no stored row")
-    if by_ulp:
-        log(f"rebuild: {len(by_ulp)} rows match their rebuilt job within {ULP_BOUND} ulps in one input "
-            f"(e.g. {by_ulp[0]})")
-    model = EmulatorModel(spec, design, res, log=log).fit()
-    A = Analysis(spec, model, log=log)
-    from toolkit.analysis import burden as BV
-    BV.restore_anchor(A, run_dir)        # F6 S2-5d review r1 P2-9: the run's anchor, as its evaluations had it
-    A.fit_calibration()
-    cal0 = A.calibrate(A.theta0)
-    z0 = {i: v[0] for i, v in cal0.items()}
-    out0, ben0, cost0 = A.evaluate(A.theta0, z0)
-    A.point_events = list(A.last_events)
-    point = yaml.safe_load(open(os.path.join(run_dir, "analysis", "point.yaml")))["data"]
-    if point.get("plan_rule"):       # hb1 fix 11 (Codex r3 P2-6): the stored plan's rule, whatever the spec says now
-        raise RebuildRefused("point.yaml records a plan solved over the uncertainty draws (plan_rule); a rebuild from "
-                             "the point tables cannot reproduce it")
-    if ((spec["uncertainty"].get("affordability") or {}).get("enforce")):
-        # F6 S1-1b: an enforced run's plan was solved within its reserve; restore it before solving
-        rv = point.get("reserve")
-        f = rv.get("fraction") if isinstance(rv, dict) else None
-        if not (isinstance(f, (int, float)) and not isinstance(f, bool) and 0 < f <= 1
-                and abs(float(rv.get("budget_planned", -1)) - f * A.budget) <= 1e-9 * max(1.0, A.budget)):
-            raise RebuildRefused("the spec enforces the affordability rule but point.yaml has no consistent reserve")
-        A.set_reserve(f)
-    from toolkit.analysis import variants as V
-    if point.get("headline_variant") != V.headline_id(spec.raw):
-        raise RebuildRefused(f"point.yaml's headline_variant {point.get('headline_variant')!r} is not the spec's "
-                             f"plan_variants.headline {V.headline_id(spec.raw)!r}")
-    V.apply_headline(A)          # F6 S1-6: a variant headline's rule, as the run solved it
-    sol = A.solve(ben0, cost0)
-    plan = {str(k): v for k, v in point["plan"].items()}
-    diff = [i for i in A.ids if sol["choice"][i] != plan.get(i)]
-    if diff and not (set(plan) == set(A.ids) and plan_within_gap(A, sol, plan, ben0, cost0)):
-        raise RebuildRefused(f"the rebuilt plan differs from the stored plan in {len(diff)} units, by more than the "
-                             "solver's stated gap")
-    A.rebuild_info = {"rows": len(res), "by_ulp": by_ulp, "ulp_bound": ULP_BOUND,
-                      "fields": sorted({x["field"] for x in by_ulp}), "plan_reproduced": True,
-                      "units_differing_within_gap": len(diff)}
-    return A, plan, out0, ben0, cost0, z0
 
 
 # --------------------------------------------------------------------------- self-test
 def _self_test() -> int:
-    import copy
     import tempfile
     import yaml
     fails = []
@@ -682,78 +494,17 @@ def _self_test() -> int:
         ok(fd["schedule"]["status"] == "not_offered" and "schedule()" in fd["schedule"]["reason"],
            f"FD8 an engine without the schedule hook is recorded as not offered: {fd['schedule']}")
         ok(set(fd["component_increment"]) == {"a", "b"}, "FD9 component increments for every component")
-        # rebuild from the stored batch reproduces the plan
-        A, plan, out0, ben0, cost0, z0 = rebuild(d, log=q)
-        ok(plan == {str(k): v for k, v in R["point"]["plan"].items()}, "FD10 the offline rebuild reproduces the stored plan")
-        fd2 = compute(A, plan, out0, ben0, cost0, R["uncertainty"], z0, log=q)
-        ok(abs(fd2["frontier"]["points"][-1]["objective"] - fr[-1]["objective"]) <= 1e-6 * abs(fr[-1]["objective"]),
-           "FD11 the rebuilt frontier equals the harness's")
-        # ---- Codex r1 P1-2: rows are taken only when their own inputs are proven to match
-        import hashlib
-        import numpy as np
+        from toolkit.analysis.core import Analysis
+        from toolkit.analysis.model import EmulatorModel
         from toolkit.analysis import batch as Bt
-        rows = os.path.join(d, "analysis", "batch", "results.jsonl")
-        bpath = os.path.join(d, "analysis", "batch.yaml")
-        keep_rows, keep_b = open(rows).read(), open(bpath).read()
-
-        def rewrite(fn):
-            out = []
-            for n, line in enumerate(keep_rows.splitlines()):
-                r = json.loads(line)
-                fn(n, r)
-                out.append(json.dumps(r))
-            open(rows, "w").write("\n".join(out) + "\n")
-            b = yaml.safe_load(keep_b)            # as if the batch had been written so on its own platform
-            b["inputs"]["analysis/batch/results.jsonl"] = hashlib.sha256(open(rows, "rb").read()).hexdigest()
-            yaml.safe_dump(b, open(bpath, "w"), sort_keys=False)
-        _d, jobs = Bt.design(A.spec)
-        j5 = json.loads(json.dumps(jobs[5]))
-        leaf = sorted(k for k, v in j5["params"].items() if isinstance(v, float))[0]
-        j5["params"][leaf] = float(np.nextafter(j5["params"][leaf], np.inf))
-        rewrite(lambda n, r: r["result"]["provenance"].update(job_sha=Bt.job_sha(j5)) if n == 5 else None)
-        try:            # Codex r2 P1-2: a parameter is source-bound (the design's own value); 1 ulp off is refused
-            rebuild(d, log=q)
-            ok(False, "FD14 a row whose source-bound parameter differs by 1 ulp is refused")
-        except RebuildRefused as e:
-            ok("within" in str(e), f"FD14 a row whose source-bound parameter differs by 1 ulp is refused: {e}")
-        # the tolerance applies only to the derived field (the calibrated attribute on the log scale: exp(z))
-        jx = json.loads(json.dumps(jobs[5]))
-        jx["unit"]["x"] = float(np.nextafter(float(jx["unit"]["x"]), np.inf))
-        ok(ulp_match(jobs[5], Bt.job_sha(jx), Bt.job_sha, fields=["unit.x"]) == ("unit.x", 1)
-           and ulp_match(jobs[5], Bt.job_sha(j5), Bt.job_sha, fields=["unit.x"]) is None,
-           "FD19 the ulp tolerance covers only the declared derived fields")
-        lg = copy.deepcopy(A.spec.raw)
-        lg["calibration"]["scale"] = "log"
-        try:
-            refused = f"resolved {derived_fields(lg)}"
-        except Exception as e:  # noqa: BLE001 -- the scale check's refusal expected
-            refused = f"refused: {type(e).__name__}"
-        ok(derived_fields(A.spec.raw, "log") == ["unit.x"] and derived_fields(A.spec.raw) == []
-           and refused == "refused: CalibrationScaleError",
-           f"FD19b the derived field is the calibrated attribute on the log scale only, and a log scale the engine "
-           f"card refuses is refused here too ({refused})")
-        rewrite(lambda n, r: r["result"]["provenance"].update(job_sha="0" * 64) if n == 5 else None)
-        try:
-            rebuild(d, log=q)
-            ok(False, "FD14b a row whose inputs cannot be matched within the bound is refused")
-        except RebuildRefused as e:
-            ok("within" in str(e), f"FD14b a row whose inputs cannot be matched within the bound is refused: {e}")
-        rewrite(lambda n, r: r["result"]["provenance"]["engine"].update(version="0") if n == 7 else None)
-        try:
-            rebuild(d, log=q)
-            ok(False, "FD14c a later row from another engine identity is refused")
-        except RebuildRefused as e:
-            ok("engine" in str(e), f"FD14c a later row from another engine identity is refused: {e}")
-        open(rows, "w").write(keep_rows)
-        b = yaml.safe_load(keep_b)
-        b["inputs"]["analysis/batch/results.jsonl"] = "f" * 64
-        yaml.safe_dump(b, open(bpath, "w"), sort_keys=False)
-        try:
-            rebuild(d, log=q)
-            ok(False, "FD14d batch rows that are not the ones the analysis recorded are refused")
-        except RebuildRefused as e:
-            ok("batch.yaml" in str(e), f"FD14d batch rows that are not the ones the analysis recorded are refused: {e}")
-        open(bpath, "w").write(keep_b)
+        _d, jobs = Bt.design(schema.load(os.path.join(d, "decision_spec.yaml")))
+        res, _ = Bt.load_results(os.path.join(d, "analysis", "batch", "results.jsonl"), jobs, schema.load(os.path.join(d, "decision_spec.yaml")).engine())
+        spec_ = schema.load(os.path.join(d, "decision_spec.yaml"))
+        A = Analysis(spec_, EmulatorModel(spec_, _d, res, log=q).fit(), log=q)
+        A.fit_calibration()
+        z0 = {i: v[0] for i, v in A.calibrate(A.theta0).items()}
+        out0, ben0, cost0 = A.evaluate(A.theta0, z0)
+        plan = {str(k): v for k, v in R["point"]["plan"].items()}
         # ---- Codex r1 P1-3: frontier and component plans are guarded against model corrections
         star = [{"unit": A.ids[0], "package": "*", "kind": "clip"}]
         fr_g = frontier(A, ben0, cost0, out0, events=star)
@@ -796,36 +547,6 @@ def _self_test() -> int:
         except RuntimeError as e:
             ok(False, f"FD16b a solver failure other than infeasibility is recorded, not raised ({e})")
         A.solve = orig
-        # 1C-c: a rebuilt plan that differs from the stored one is accepted only when the stored plan is feasible and
-        # within the solver's stated gap of the re-solved optimum
-        pwg = globals().get("plan_within_gap")
-        sol_ = A.solve(ben0, cost0)
-        u_ = next(i for i in A.ids if plan[i] != A.comp)
-        alt = next(k for k in A.pk if k not in (plan[u_], A.comp) and A.feas["feasible"][u_][k])
-        ben_t = {i: dict(v) for i, v in ben0.items()}
-        cost_t = {i: dict(v) for i, v in cost0.items()}
-        ben_t[u_][alt], cost_t[u_][alt] = ben0[u_][plan[u_]], cost0[u_][plan[u_]]      # a tie: either is optimal
-        rich = {i: max(cost0[i], key=cost0[i].get) for i in A.ids}
-        ok(pwg is not None and pwg(A, sol_, dict(plan, **{u_: alt}), ben_t, cost_t) is True
-           and pwg(A, sol_, dict(plan, **{u_: A.comp}), ben0, cost0) is False and pwg(A, sol_, rich, ben0, cost0) is False,
-           "FD10b a stored plan tied with the rebuilt optimum is within the gap; a worse one, or one over the budget, "
-           "is not")
-        # Codex r1 P1-7, P1-8: the allowance scales with the gain, and a plan the allocator's own check rejects (an
-        # unknown package) is not within the gap, without an exception
-        tiny = {i: {k: (1e-13 if k == plan[i] and i == u_ else 0.0) for k in ben0[i]} for i in A.ids}
-        sol_t = dict(sol_, objective=1e-13, baseline=0.0, gain=1e-13)
-        ok(pwg(A, sol_t, dict(plan, **{u_: A.comp}), tiny, cost0) is False
-           and pwg(A, sol_, dict(plan, **{u_: "no_such_package"}), ben0, cost0) is False,
-           "FD10c a plan that loses a tiny gain entirely is not within the gap; an unknown package is refused, not raised")
-        # Codex r2 P1: the allowance is on the gain the solver optimised, not on the objective above the pre-pruning
-        # baseline (a large benefit every plan gets must not widen it)
-        u0 = next(i for i in A.ids if i != u_)
-        big = {i: {k: (1e6 if i == u0 else 1.0 if (i == u_ and k == plan[u_]) else 0.0) for k in ben0[i]} for i in A.ids}
-        sol_b = dict(sol_, objective=1e6 + 1.0, baseline=0.0, gain=1.0)
-        ok(pwg(A, sol_b, dict(plan, **{u_: A.comp}), big, cost0) is False and pwg(A, sol_b, dict(plan), big, cost0) is True
-           and pwg(A, {k: v for k, v in sol_b.items() if k != "gain"}, dict(plan, **{u_: A.comp}), big, cost0) is False,
-           "FD10d a plan that gives up the whole optimised gain is not within the gap, whatever every plan gets anyway; "
-           "without the solver's gain no difference is allowed")
         # ---- Codex r1 P2-8: the frontier reports outcome averted, not the (possibly discounted) objective
         half = {i: {k: 0.5 * v for k, v in ben0[i].items()} for i in A.ids}
         fr_h = frontier(A, half, cost0, out0)
@@ -842,18 +563,6 @@ def _self_test() -> int:
         w = bp[k0].get("interval_withheld") or {}
         ok(bp[k0].get("usd_per_outcome_interval") is None and w.get("share_draws_nonpositive") == 0.25
            and w.get("reason"), f"FD17 a withheld package interval says why and in what share of draws: {w}")
-        # a stale engine identity is refused
-        rows = os.path.join(d, "analysis", "batch", "results.jsonl")
-        txt = open(rows).read().replace('"version": "1"', '"version": "0"', 1)
-        open(rows, "w").write(txt)
-        b = yaml.safe_load(keep_b)            # the batch as its analysis recorded it, so the identity check is reached
-        b["inputs"]["analysis/batch/results.jsonl"] = hashlib.sha256(open(rows, "rb").read()).hexdigest()
-        yaml.safe_dump(b, open(bpath, "w"), sort_keys=False)
-        try:
-            rebuild(d, log=q)
-            ok(False, "FD12 a batch from another engine identity is refused")
-        except RebuildRefused as e:
-            ok("re-render with the run's own code" in str(e), f"FD12 a batch from another engine identity is refused: {e}")
         # schedule hook: a toy engine that offers it
         from toolkit.engines import hooks
         A.eng = hooks.ToyScheduleEngine()

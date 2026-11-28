@@ -72,7 +72,7 @@ FALLBACK_PRICE = {"in": 5.0, "out": 25.0, "cache_write": 6.25, "cache_read": 0.5
 HISTORY_TURNS = 12
 # Character budgets for the run context (each part says when it was cut).
 BUDGET = {"results": 12000, "gate": 3000, "blockers": 6000, "tests": 3000, "timeline": 3000, "owner": 3000}
-OPTIONAL_STATES = ("ACQUIRE", "FIX_LOOP", "OWNER_DECISION", "PRESENTATION")   # the stepper hides them when never entered
+OPTIONAL_STATES = ("ACQUIRE", "FIX_LOOP", "OWNER_DECISION")   # the stepper hides them when never entered
 STALE_S = 1800.0               # a progress record not updated for this long is not live
 CLOUD_MIN_S = 60.0             # each cloud refresh attaches to a cluster: never more often than this
 
@@ -2413,7 +2413,7 @@ def make_server(console: Console, host: str = "127.0.0.1", port: int = 8765):
 
 # ------------------------------------------------------------------ self-test
 def _toy_run(d: str, state: str = "OWNER_DECISION", paused="awaiting_scope_signoff", status=None,
-             path=("SPEC", "SIGN", "EVIDENCE", "ENGINE_CHOICE", "CONFIGURE", "ANALYZE", "CRITIQUE", "GATE", "FIX_LOOP",
+             path=("SPEC", "SIGN", "EVIDENCE", "ENGINE_CHOICE", "ANALYZE", "CRITIQUE", "GATE", "FIX_LOOP",
                    "CRITIQUE", "GATE", "OWNER_DECISION")) -> str:
     """A synthetic run dir: toy numbers, no data from any real source."""
     os.makedirs(os.path.join(d, "figures"), exist_ok=True)
@@ -2422,9 +2422,9 @@ def _toy_run(d: str, state: str = "OWNER_DECISION", paused="awaiting_scope_signo
     hist, prev = [], path[0]
     for i, s in enumerate(path[1:], 1):
         hist.append({"at": f"2026-01-01T00:{i:02d}:00+00:00", "from": prev, "to": s, "why": f"step {i}",
-                     "round": 1 if i < 9 else 2, "spent_usd": 0.1 * i})
+                     "round": 1 if i < 8 else 2, "spent_usd": 0.1 * i})
         prev = s
-    hist.insert(8, {"at": "2026-01-01T00:08:30+00:00", "fix_loop": {"fixed": ["T-001"]}})
+    hist.insert(7, {"at": "2026-01-01T00:07:30+00:00", "fix_loop": {"fixed": ["T-001"]}})
     json.dump({"question": "Toy question: choose one option per unit within a budget.", "state": state,
                "round": 2, "max_rounds": 3, "spent_usd": 1.2, "budget_usd": 5.0, "status": status, "paused": paused,
                "history": hist, "engine": "toy.engine:Toy"}, open(os.path.join(d, "run_state.json"), "w"))
@@ -2494,22 +2494,22 @@ def _self_test() -> int:
         ok(err is None and by["OWNER_DECISION"] == "waiting" and by["GATE"] == "done" and by["FIX_LOOP"] == "done"
            and by["WRITE"] == "todo" and sp["fix_rounds"] == 1 and sp["round"] == 2,
            f"RC1a stepper: done, waiting, todo and one fix-loop round ({by}, {sp['fix_rounds']})")
-        ok([s["state"] for s in sp["stages"]] == [s for s in states() if s not in ("ACQUIRE", "PRESENTATION")]
+        ok([s["state"] for s in sp["stages"]] == [s for s in states() if s != "ACQUIRE"]
            and states()[0] == "ACQUIRE" and states()[-1] == "FINAL",
            "RC1b the stage list is stage_machine.STATES, without optional states never entered")
         rd2 = _toy_run(os.path.join(td, "runs", "proj", "run2"), "WRITE", None,
-                       path=("SPEC", "SIGN", "EVIDENCE", "ENGINE_CHOICE", "CONFIGURE", "ANALYZE", "CRITIQUE", "GATE",
+                       path=("SPEC", "SIGN", "EVIDENCE", "ENGINE_CHOICE", "ANALYZE", "CRITIQUE", "GATE",
                              "WRITE"))
         by2 = {s["state"]: s["status"] for s in stepper(load_run_state(rd2)[0])["stages"]}
-        ok("ACQUIRE" not in by2 and "FIX_LOOP" not in by2 and "OWNER_DECISION" not in by2 and "PRESENTATION" not in by2
+        ok("ACQUIRE" not in by2 and "FIX_LOOP" not in by2 and "OWNER_DECISION" not in by2
            and by2["WRITE"] == "current" and by2["FINAL"] == "todo",
-           f"RC1c ACQUIRE, FIX_LOOP, OWNER_DECISION and PRESENTATION are collapsed when never entered ({by2})")
+           f"RC1c ACQUIRE, FIX_LOOP and OWNER_DECISION are collapsed when never entered ({by2})")
         rd3 = _toy_run(os.path.join(td, "runs", "other", "run3"), "FINAL", None, "run_failed",
-                       path=("SPEC", "SIGN", "EVIDENCE", "ENGINE_CHOICE", "CONFIGURE", "ANALYZE", "FINAL"))
+                       path=("SPEC", "SIGN", "EVIDENCE", "ENGINE_CHOICE", "ANALYZE", "FINAL"))
         sp3 = stepper(load_run_state(rd3)[0])["stages"]
         by3 = {s["state"]: s["status"] for s in sp3}
         ok(by3["ANALYZE"] == "failed" and by3["CRITIQUE"] == "skipped"
-           and [s.get("why") for s in sp3 if s["state"] == "ANALYZE"] == ["step 6"],
+           and [s.get("why") for s in sp3 if s["state"] == "ANALYZE"] == ["step 5"],
            f"RC1d a failed run marks the state it failed in, with the reason ({by3})")
         bad = os.path.join(td, "bad")
         os.makedirs(bad)
@@ -2695,7 +2695,8 @@ def _self_test() -> int:
                 os.environ["ANTHROPIC_API_KEY"] = prev
         # RC8 who may write owner/
         from agents import v2_sdk_tasks as T
-        ok(all(T._allowed("owner/feedback.jsonl", rd, owns) and T._allowed("owner/chat.jsonl", rd, owns)
+        ok(all(T.PathPolicy.write_allowed("owner/feedback.jsonl", rd, owns)
+               and T.PathPolicy.write_allowed("owner/chat.jsonl", rd, owns)
                for owns in T.OWNS.values()), "RC8a no v2 task may write owner/ (file tools only, OWNS allowlist)")
         before = _tree(rd)
         append_feedback(rd, {"kind": "approval", "layer": "process", "text": "fine"})
@@ -2843,7 +2844,7 @@ def _self_test() -> int:
             live = _toy_run(os.path.join(t2, "live"))
             cl = compute_status(live, None, load_run_state(live)[0])
             done = _toy_run(os.path.join(t2, "done"), "FINAL", None, "run_failed",
-                            path=("SPEC", "SIGN", "EVIDENCE", "ENGINE_CHOICE", "CONFIGURE", "ANALYZE", "FINAL"))
+                            path=("SPEC", "SIGN", "EVIDENCE", "ENGINE_CHOICE", "ANALYZE", "FINAL"))
             cd = compute_status(done, None, load_run_state(done)[0])
             stale = compute_status(live, None, load_run_state(live)[0], now=time.time() + STALE_S + 1)
             ok(cl["live"] and cl["calls"][0]["live"] and cl["calls"][0]["eta_s"] is not None
@@ -2862,7 +2863,7 @@ def _self_test() -> int:
         # RC15 lineage: projects, staging copies, relations, the scenario diff, compare
         with tempfile.TemporaryDirectory() as t3:
             ts = "2026-01-01_000000_toy-question"
-            fail_path = ("SPEC", "SIGN", "EVIDENCE", "ENGINE_CHOICE", "CONFIGURE", "ANALYZE", "FINAL")
+            fail_path = ("SPEC", "SIGN", "EVIDENCE", "ENGINE_CHOICE", "ANALYZE", "FINAL")
             spec = {"horizon": {"start": 2016.0, "stop": 2027.0}, "objective": {"horizon": [2024.0, 2027.0]},
                     "decision_units": {"engine_attributes": {"season": {"column": "s"}}},
                     "constraints": {"envelope_usd": 100}, "analysis": {"decision_tests": [{"id": "DT1"}]}}

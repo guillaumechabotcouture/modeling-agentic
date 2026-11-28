@@ -526,8 +526,6 @@ def validate_pending(s) -> list[str]:
                 and all(str(st.get(k) or "").strip() for k in ("yes", "no", "undetermined"))):
             bad.append("deliverable.decision: {kind: threshold, output: <an output name>, threshold, direction: above | "
                        "below, probability in (0.5, 1), statements: {yes, no, undetermined}}")
-        elif any(ch.isdigit() for k in ("yes", "no", "undetermined") for ch in str(st.get(k))):
-            bad.append("deliverable.decision.statements: descriptive text with no numbers (the harness renders them)")
     return bad
 
 
@@ -809,8 +807,6 @@ def _self_test() -> int:
             "ES-AF an estimates spec has no plan to afford: uncertainty.affordability is refused (Codex S1-1 P1)")
         mut(lambda r: r["uncertainty"].update(sources=[{"kind": "calibration"}]), "kind observation",
             "ES8 the observation kind must be covered or excluded with a reason")
-        mut(lambda r: r["deliverable"]["decision"]["statements"].update(yes="above 1.0"), "no numbers",
-            "ES9 threshold statements carry no numbers")
         mut(lambda r: r["calibration"]["targets"].update(source="other"), "observation_source_undeclared",
             "ES10 a target that names no declared source is refused")
         mut(lambda r: r["observations"]["sources"][0].update(delay={"pmf": [0.5, 0.4], "source": "x"}), "delay",

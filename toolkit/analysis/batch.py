@@ -21,12 +21,6 @@ results are kept per input, so a rerun completes a stopped batch.
 For an engine whose packages share a starting state (`batch_shares_state`, e.g. the malaria
 engine's burn-in), the compute tasks are design points: `run_point` runs one point's packages in
 one `run_batch` call, and the per-job rows (with their own provenance) are written as before.
-
-A batch computed elsewhere (VM shards) is shipped with the exact jobs it ran: each shard calls `ship()` where it ran
-(jobs, design, rows and a manifest with their sha256 and the computing platform), `merge_shipped()` joins shards from
-one platform, and `load_shipped()` (run.py `--shipped`) checks the rows against the shipped jobs instead of a design
-regenerated on the merging platform. `adopt()` refuses a stored batch recorded on another platform
-(`adopt_platform_differs`), because its replay check would recompute there what was computed elsewhere.
 """
 from __future__ import annotations
 
@@ -129,8 +123,7 @@ def independent_features(spec) -> tuple[list, dict]:
     """(features, basis) of the signed spec's `analysis.emulator.independent_features: {features, basis, generator}`:
     declared unit features of a synthetic units table that its generator draws independently of the table's other
     columns. A declared fact about the data-generating process, never a statistical claim and never for measured
-    data: the generator (a file beside the spec) is named and fingerprinted. toolkit/analysis/world_model.py reads the
-    design's independent_features to settle conditional claims. A feature that is not a declared design feature, a
+    data: the generator (a file beside the spec) is named and fingerprinted. A feature that is not a declared design feature, a
     missing basis or a missing generator is refused (ValueError)."""
     import hashlib
     from toolkit.analysis import features as FT
@@ -271,21 +264,6 @@ def design(spec) -> tuple[dict, list[dict]]:
 
 
 _E = {}
-CORE = ("point", "package", "components", "unit", "params", "seed")     # a job's own inputs (beside engine, horizon)
-# A re-run on another platform (the spike's batch ran on Linux VMs) differs in the last digits of floating point
-# (observed: about 1e-9 relative); 1e-6 separates that from a model change. Wall-clock timings are not outputs.
-ADOPT_RTOL = 1e-6
-# v0.5 (review P2): an engine that shares a starting state reports where its batch forked and how many members shared
-# it; both depend on how jobs were grouped (a replay runs one job alone), not on the job's outputs.
-TIMING_KEYS = frozenset({"seconds", "fork_year", "burnin_members"})
-# Codex r2 P1-2: an adoption re-runs at least this many stored jobs before it stamps any of them.
-ADOPT_MIN_SAMPLE = 4
-ADOPT_MIN_SHARE = 0.01
-
-
-def min_adopt_sample(n_jobs: int) -> int:
-    import math
-    return min(n_jobs, max(ADOPT_MIN_SAMPLE, math.ceil(ADOPT_MIN_SHARE * n_jobs)))
 
 
 def job_sha(job: dict) -> str:
@@ -427,310 +405,18 @@ def load_results(path: str, jobs: list[dict], engine) -> tuple[dict, list[str]]:
     return verify_rows(rows, jobs, engine)
 
 
-def adopt(run_dir: str, src_results: str, src_jobs: str, src_design: str, jobs: list[dict], design: dict, engine,
-          sample: int = 4, workers: int = 2, rtol: float = ADOPT_RTOL) -> dict:
-    """Adopt a batch computed before results carried provenance (the spike's). Every stored job must equal the
-    current job on its full inputs; the stored design must name the same engine, horizon and windows; and a
-    deterministic sample of jobs is re-run with the current engine and must reproduce the stored results. The adopted
-    rows are then written with harness provenance (`adopted_from`); anything short of that fails closed."""
-    from toolkit.analysis.artifacts import sha256
-    from toolkit.engines.identity import engine_identity
-    sd = json.load(open(src_design))
-    if sd.get("platform") is not None and not same_platform(sd["platform"], platform_info()):
-        # the replay below would recompute here what another platform computed; stochastic simulation amplifies
-        # last-bit differences (the Nigeria re-run: about 1.4%), so the check cannot tell a model change from noise
-        raise BatchRefused("adopt_platform_differs",
-                           f"stored batch not adopted: it was computed on {_plat(sd['platform'])} and this is "
-                           f"{_plat(platform_info())}; adopt it on the computing platform, or ship it with its exact "
-                           "inputs (batch.ship) and load it with load_shipped")
-    want = {j["id"]: j for j in jobs}
-    probs = []
-    ref = design["spec_engine"]
-    if sd.get("spec_engine") not in (ref, ref.get("ref") if isinstance(ref, dict) and not ref.get("config") else None):
-        probs.append(f"stored design engine {sd.get('spec_engine')!r} differs from {ref!r}")
-    for k in ("start", "stop", "window", "delivery"):
-        if (sd.get("horizon") or {}).get(k) != design["horizon"].get(k):
-            probs.append(f"stored design horizon.{k} differs")
-    if sd.get("cal_window") != design["cal_window"]:
-        probs.append("stored design calibration window differs")
-    if sd.get("burden_window") != design.get("burden_window"):         # Codex S2-5b r1 P1-1
-        probs.append("stored design burden window (validation.burden.window) differs")
-    seen = set()
-    with open(src_jobs) as f:
-        for line in f:
-            if not line.strip():
-                continue
-            sj = json.loads(line)
-            j = want.get(sj.get("id"))
-            if j is None:
-                probs.append(f"stored job {sj.get('id')} is not a current job")
-                continue
-            diff = [k for k in CORE if json.dumps(sj.get(k), sort_keys=True) != json.dumps(j.get(k), sort_keys=True)]
-            if diff:
-                probs.append(f"stored job {sj['id']}: inputs differ ({diff})")
-            seen.add(sj["id"])
-    probs += [f"current job {k} is not in the stored batch" for k in sorted(set(want) - seen)[:5]]
-    stored = {}
-    with open(src_results) as f:
-        for line in f:
-            if line.strip():
-                r = json.loads(line)
-                if r.get("ok"):
-                    stored[r["id"]] = r["result"]
-    probs += [f"no stored result for {k}" for k in sorted(set(want) - set(stored))[:5]]
-    if probs:
-        raise ValueError("stored batch not adopted: " + "; ".join(probs[:8]))
-    ids = sorted(want)
-    need = min_adopt_sample(len(ids))
-    if not isinstance(sample, int) or isinstance(sample, bool) or sample < need:
-        raise ValueError(f"stored batch not adopted: the re-run sample must be at least {need} jobs "
-                         f"(max({ADOPT_MIN_SAMPLE}, {ADOPT_MIN_SHARE:.0%} of {len(ids)})); got {sample!r} (Codex r2 P1-2)")
-    n = min(sample, len(ids))
-    pick = sorted({ids[int(round(k * (len(ids) - 1) / max(n - 1, 1)))] for k in range(n)})
-    pick += [i for i in ids if i not in set(pick)][:n - len(pick)]     # spacing collisions: fill to n distinct jobs
-    sys.path.insert(0, os.path.join(ROOT, "scripts"))
-    import compute
-    rows, _ = compute.map_fn(run_dir, os.path.join(ROOT, "toolkit", "analysis", "batch.py") + "::run_job",
-                             [{k: v for k, v in want[i].items() if k != "id"} for i in pick], backend="local",
-                             max_workers=workers, ledger=False)
-    mism, worst = [], [0.0]
-    if len(rows) != len(pick):
-        mism.append(f"{len(rows)} re-run rows for {len(pick)} sampled jobs")
-    for i, r in zip(pick, rows):
-        if not r.get("ok"):
-            mism.append(f"{i}: rerun failed ({r.get('error')})")
-        elif not _same(r["result"]["result"], stored[i], rtol, worst):
-            mism.append(f"{i}: rerun differs from the stored result beyond rtol {rtol:g}")
-    if mism:
-        raise ValueError("stored batch not adopted: the current engine does not reproduce it: " + "; ".join(mism))
-    ident = engine_identity(engine)
-    out = os.path.join(run_dir, "analysis", "batch", "results.jsonl")
-    src = {"path": os.path.abspath(src_results), "sha256": sha256(src_results), "jobs_sha256": sha256(src_jobs)}
-    from toolkit.analysis.artifacts import _safe_io
-    _safe_io().write_nofollow(run_dir, "analysis/batch/results.jsonl", "".join(
-        json.dumps({"i": n, "ok": True, "result": {"result": stored[j["id"]], "provenance": {
-            "job_sha": job_sha(j), "engine": ident, "producer": PRODUCER, "adopted_from": src}}}) + "\n"
-        for n, j in enumerate(jobs)).encode(), atomic=True)
-    return {"path": out, "adopted_from": src, "jobs_matched": len(seen), "rerun_sample": pick,
-            "rerun_reproduced": len(pick), "rtol": rtol, "rerun_max_rel_diff": worst[0],
-            "ignored": sorted(TIMING_KEYS)}
-
-
-# ---------------------------------------------------------------- shipped batches (computed on one platform, merged on another)
-# A batch computed elsewhere (VM shards) ships with the exact jobs it ran, inputs included, its design and its rows,
-# each hashed in a manifest that names the platform. The merge and the analysis then check the rows against the
-# shipped jobs, never against a design regenerated on the merging platform: the Nigeria re-run's shards (Linux)
-# merged on macOS regenerated m0 = exp(z) with last-bit differences at one design point and 32 rows failed.
-SHIP_MANIFEST = "manifest.json"
-SHIP_FILES = {"jobs": "jobs.jsonl", "design": "design.json", "results": "results.jsonl"}
-PLATFORM_KEYS = ("system", "machine", "python", "numpy", "scipy")
-# Across platforms the regenerated design may differ from the shipped one only in the last bits (about 1e-16);
-# anything above this is a changed input, not floating point. On the same platform it must be identical.
-INPUT_RTOL = 1e-12
-
-
 class BatchRefused(ValueError):
-    """A stored or shipped batch that is not used, with a stable code (the message starts with it)."""
+    """A stored batch that is not used, with a stable code (the message starts with it)."""
 
     def __init__(self, code: str, msg: str):
         super().__init__(f"[{code}] {msg}")
         self.code = code
 
 
-def platform_info() -> dict:
-    """What floating-point results depend on: OS, CPU architecture, Python, numpy and scipy versions."""
-    import platform
-    try:
-        import scipy
-        sv = scipy.__version__
-    except ImportError:
-        sv = None
-    return {"system": platform.system(), "machine": platform.machine(), "python": platform.python_version(),
-            "numpy": np.__version__, "scipy": sv}
-
-
-def same_platform(a, b) -> bool:
-    return isinstance(a, dict) and isinstance(b, dict) and all(a.get(k) == b.get(k) for k in PLATFORM_KEYS)
-
-
-def _plat(p) -> str:
-    return "/".join(str((p or {}).get(k)) for k in PLATFORM_KEYS)
-
-
-def _file_sha(path: str) -> str | None:
-    from toolkit.analysis.artifacts import sha256
-    return sha256(path)
-
-
-def _write_bundle(out_dir: str, man: dict, design_: dict, jobs: list[dict], rows: list[dict], root: str) -> dict:
-    """Publish the bundle with no link followed under the trusted `root` the caller names (the run dir when `out_dir`
-    lies in one, else the dir the caller made for its bundles); no root is refused, never taken from `out_dir`. The
-    manifest hashes the bytes published."""
-    import hashlib
-    from toolkit.analysis.artifacts import _safe_io
-    sio = _safe_io()
-    body = {"jobs": "".join(json.dumps(j, sort_keys=True) + "\n" for j in jobs),
-            "design": json.dumps(design_, indent=1, sort_keys=True),
-            "results": "".join(json.dumps({"id": r["id"], "ok": True, "result": r["result"]}, sort_keys=True) + "\n"
-                               for r in rows)}
-    for k, name in SHIP_FILES.items():
-        sio.publish(os.path.join(out_dir, name), body[k], root)
-    man = dict(man, producer=PRODUCER, n_jobs=len(jobs), n_rows=len(rows),
-               **{f"{k}_sha256": hashlib.sha256(body[k].encode("utf-8")).hexdigest() for k in SHIP_FILES})
-    sio.publish(os.path.join(out_dir, SHIP_MANIFEST), json.dumps(man, indent=1, sort_keys=True), root)
-    return man
-
-
-def ship(out_dir: str, spec, design_: dict, jobs: list[dict], rows: list[dict], platform: dict | None = None,
-         root: str | None = None) -> dict:
-    """Write a shipped batch (or one shard of it) where it was computed: the exact jobs, the design, the ok rows
-    ({"id", "ok", "result": run_job output}) and a manifest with each file's sha256, the decision spec's sha256 and
-    the computing platform. `root` (required): the trusted dir the bundle is written under, the run dir when
-    `out_dir` lies in one; without it the write is refused. Returns the manifest."""
-    ids = {j["id"] for j in jobs}
-    ok_rows = [r for r in rows if r.get("ok") and r.get("id") in ids]
-    return _write_bundle(out_dir, {"platform": platform or platform_info(), "spec_sha256": spec.sha256,
-                                   "settings_sha256": getattr(spec, "settings_sha256", None)}, design_, jobs, ok_rows,
-                         root)
-
-
-def _read_bundle(d: str) -> tuple[dict, dict, list[dict], list[dict]]:
-    mp = os.path.join(d, SHIP_MANIFEST)
-    try:
-        man = json.load(open(mp))
-    except (OSError, ValueError) as e:
-        raise BatchRefused("shipped_unreadable", f"{mp}: {type(e).__name__}: {e}")
-    if not isinstance(man, dict) or not isinstance(man.get("platform"), dict):
-        raise BatchRefused("shipped_no_platform", f"{mp} does not record the platform that computed the batch")
-    for k, name in SHIP_FILES.items():
-        got = _file_sha(os.path.join(d, name))
-        if got is None or got != man.get(f"{k}_sha256"):
-            raise BatchRefused("shipped_hash_mismatch", f"{os.path.join(d, name)}: sha256 {got} differs from the "
-                                                         f"manifest's {man.get(f'{k}_sha256')}")
-    try:
-        des = json.load(open(os.path.join(d, SHIP_FILES["design"])))
-        jobs = [json.loads(x) for x in open(os.path.join(d, SHIP_FILES["jobs"])) if x.strip()]
-        rows = [json.loads(x) for x in open(os.path.join(d, SHIP_FILES["results"])) if x.strip()]
-    except (OSError, ValueError) as e:
-        raise BatchRefused("shipped_unreadable", f"{d}: {type(e).__name__}: {e}")
-    return man, des, jobs, rows
-
-
-def merge_shipped(out_dir: str, parts: list[str], root: str | None = None) -> dict:
-    """Merge shipped shards into one shipped batch. They must come from one platform, one decision spec and one
-    design, with no job in two shards; each shard's hashes are checked. The merged jobs are the shards' own."""
-    if not parts:
-        raise BatchRefused("shipped_incomplete", "no shards to merge")
-    mans, jobs, rows, des = [], [], [], None
-    for p in parts:
-        man, d_, j_, r_ = _read_bundle(p)
-        if mans and not same_platform(man["platform"], mans[0]["platform"]):
-            raise BatchRefused("shipped_platform_mixed", f"{p} was computed on {_plat(man['platform'])}, "
-                                                         f"{parts[0]} on {_plat(mans[0]['platform'])}")
-        if mans and (man.get("spec_sha256"), man.get("design_sha256")) != (mans[0].get("spec_sha256"),
-                                                                           mans[0].get("design_sha256")):
-            raise BatchRefused("shipped_spec_differs", f"{p} was shipped for another decision spec or design than "
-                                                       f"{parts[0]}")
-        mans.append(man)
-        des = d_
-        jobs += j_
-        rows += r_
-    ids = [j.get("id") for j in jobs]
-    if len(set(ids)) != len(ids):
-        raise BatchRefused("shipped_duplicate_job", "a job appears in more than one shard")
-    pk = list(des.get("packages") or [])
-    jobs.sort(key=lambda j: (j.get("point", 0), pk.index(j["package"]) if j.get("package") in pk else len(pk)))
-    return _write_bundle(out_dir, {"platform": mans[0]["platform"], "spec_sha256": mans[0].get("spec_sha256"),
-                                   "settings_sha256": mans[0].get("settings_sha256"),
-                                   "merged_from": [{"path": os.path.basename(os.path.normpath(p)),
-                                                    "results_sha256": m.get("results_sha256")}
-                                                   for p, m in zip(parts, mans)]}, des, jobs, rows, root)
-
-
-def _input_diff(a, b, worst) -> bool:
-    """True when a and b have the same structure and non-numeric leaves; records the largest relative numeric
-    difference in worst[0]."""
-    if isinstance(a, dict) and isinstance(b, dict):
-        return set(a) == set(b) and all([_input_diff(a[k], b[k], worst) for k in a])
-    if isinstance(a, (list, tuple)) and isinstance(b, (list, tuple)):
-        return len(a) == len(b) and all([_input_diff(x, y, worst) for x, y in zip(a, b)])
-    num = lambda x: isinstance(x, (int, float)) and not isinstance(x, bool)  # noqa: E731
-    if num(a) and num(b):
-        if a != b:
-            worst[0] = max(worst[0], abs(a - b) / max(abs(a), abs(b)))
-        return True
-    return a == b
-
-
-def load_shipped(bundle: str, spec, design_: dict, jobs: list[dict], engine) -> tuple[dict, list[dict], dict, dict]:
-    """(design, jobs, results, info) of a shipped batch, checked: file hashes; the decision spec; the shipped jobs
-    against the design regenerated here (identical on the computing platform; elsewhere equal up to last-bit
-    floating-point differences, INPUT_RTOL); every row's provenance against the shipped job it ran; every job
-    present. The shipped design and jobs are returned, so the analysis uses the inputs that were actually run.
-    Anything short of that raises BatchRefused (fail closed)."""
-    man, sdes, sjobs, rows = _read_bundle(bundle)
-    if man.get("spec_sha256") != spec.sha256:
-        raise BatchRefused("shipped_spec_differs", f"shipped for decision spec {man.get('spec_sha256')}, the current "
-                                                   f"one is {spec.sha256}")
-    want = [j["id"] for j in jobs]
-    got = [j.get("id") for j in sjobs]
-    if sorted(got) != sorted(want):
-        miss, extra = sorted(set(want) - set(got)), sorted(set(got) - set(want))
-        raise BatchRefused("shipped_incomplete", f"{len(miss)} current jobs not shipped (e.g. {miss[:3]}), "
-                                                 f"{len(extra)} shipped jobs not current (e.g. {extra[:3]})")
-    by = {j["id"]: j for j in sjobs}
-    sjobs = [by[i] for i in want]
-    cross = not same_platform(man["platform"], platform_info())
-    worst = [0.0]
-    for cur, sh in zip(jobs, sjobs):
-        if job_sha(cur) == job_sha(sh):
-            continue
-        if not cross:
-            raise BatchRefused("shipped_inputs_differ", f"{cur['id']}: the shipped inputs differ from the design "
-                                                        f"regenerated on the computing platform")
-        if not _input_diff(cur, sh, worst) or worst[0] > INPUT_RTOL:
-            raise BatchRefused("shipped_inputs_differ", f"{cur['id']}: the shipped inputs differ from the regenerated "
-                                                        f"design beyond floating point (max rel {worst[0]:.3g} > "
-                                                        f"{INPUT_RTOL:g})")
-    if not _input_diff(design_, sdes, worst) or worst[0] > (INPUT_RTOL if cross else 0.0):
-        raise BatchRefused("shipped_inputs_differ", f"the shipped design differs from the regenerated one "
-                                                    f"(max rel {worst[0]:.3g})")
-    res, probs = verify_rows([r for r in rows if r.get("ok")], sjobs, engine)
-    if probs:
-        raise BatchRefused("shipped_provenance", f"{len(probs)} shipped rows lack matching provenance "
-                                                 f"(e.g. {probs[:3]})")
-    miss = [i for i in want if i not in res]
-    if miss:
-        raise BatchRefused("shipped_incomplete", f"no shipped result for {len(miss)} jobs (e.g. {miss[:3]})")
-    info = {"inputs": "shipped", "cross_platform": cross, "computed_on": man["platform"], "merged_on": platform_info(),
-            "input_max_rel_diff": worst[0], "input_rtol": INPUT_RTOL if cross else 0.0,
-            "manifest_sha256": _file_sha(os.path.join(bundle, SHIP_MANIFEST)),
-            **{f"{k}_sha256": man.get(f"{k}_sha256") for k in SHIP_FILES}}
-    return sdes, sjobs, res, info
-
-
-def _same(a, b, rtol, worst=None) -> bool:
-    if isinstance(a, dict) and isinstance(b, dict):
-        ka, kb = set(a) - TIMING_KEYS, set(b) - TIMING_KEYS
-        return ka == kb and all([_same(a[k], b[k], rtol, worst) for k in ka])
-    if isinstance(a, (list, tuple)) and isinstance(b, (list, tuple)):
-        return len(a) == len(b) and all([_same(x, y, rtol, worst) for x, y in zip(a, b)])
-    if isinstance(a, (int, float)) and isinstance(b, (int, float)) and not isinstance(a, bool):
-        rel = 0.0 if a == b else abs(a - b) / max(abs(a), abs(b))
-        if worst is not None:
-            worst[0] = max(worst[0], rel)
-        return rel <= rtol
-    return a == b
-
-
 # --------------------------------------------------------------------------- self-test
 def _self_test() -> int:
-    """python3 toolkit/analysis/batch.py --self-test: shipping a batch with its exact inputs, and adoption across
-    platforms, on the toy engine. The cases replay the Nigeria re-run: shards computed on Linux VMs and merged on
-    macOS, where one design point's inputs (m0 = exp(z)) regenerated with last-bit differences (32 rows' input
-    hashes mismatched, one row per package), and one adoption re-run reproduced only to about 1.4%."""
+    """python3 toolkit/analysis/batch.py --self-test."""
     import copy
-    import shutil
     import tempfile
     fails = []
 
@@ -745,17 +431,9 @@ def _self_test() -> int:
         except Exception as e:      # noqa: BLE001 -- a missing function is a failing case, not a crash of the test
             ok(False, f"{label} ({type(e).__name__}: {e})")
 
-    def refused(fn, code):
-        try:
-            fn()
-        except ValueError as e:
-            return getattr(e, "code", None) == code, f"{getattr(e, 'code', None)}: {e}"
-        return False, "not refused"
-
     from toolkit.spec import schema
     sys.path.insert(0, os.path.join(ROOT, "scripts"))
     g = globals()
-    linux = {"system": "Linux", "machine": "x86_64", "python": "3.12.3", "numpy": "2.1.3", "scipy": "1.14.1"}
     with tempfile.TemporaryDirectory() as d:
         spec = schema.load(schema.toy_spec(d, n=12))
         spec["analysis"]["emulator"]["points"] = 8
@@ -767,11 +445,8 @@ def _self_test() -> int:
         for j in vm_jobs:
             if j["point"] == 3:
                 j["unit"][attr] = float(np.nextafter(j["unit"][attr], np.inf))
-        vm_design = copy.deepcopy(design0)
-        vm_design["points"][3]["z"] = float(np.nextafter(vm_design["points"][3]["z"], np.inf))
         n3 = sum(j["point"] == 3 for j in vm_jobs)
         rows = [{"id": j["id"], "ok": True, "result": run_job(j)} for j in vm_jobs]
-        made = [0]
 
         def b0():
             # the observed failure, kept as evidence: regenerating the design at merge time loses the shipped rows
@@ -780,119 +455,6 @@ def _self_test() -> int:
                f"BA0 regenerating the design at merge time rejects the {n3} rows of the point with last-bit "
                f"differences (the re-run's 32 rows, one per package): {len(probs)}")
         case("BA0", b0)
-
-        def shard_dirs(plat_a, plat_b=None, jobs=None, rws=None):
-            jobs, rws, out = jobs or vm_jobs, rws or rows, []
-            made[0] += 1
-            for k in (0, 1):
-                sd = os.path.join(d, f"run{made[0]}_shard{k}")
-                mine = [j for j in jobs if j["point"] % 2 == k]
-                ids = {j["id"] for j in mine}
-                g["ship"](sd, spec, vm_design, mine, [r for r in rws if r["id"] in ids],
-                          platform=plat_a if k == 0 or plat_b is None else plat_b, root=d)
-                out.append(sd)
-            return out
-
-        def merged(sds):
-            m = os.path.join(d, f"merged{made[0]}")
-            g["merge_shipped"](m, sds, root=d)
-            return m
-
-        def b1():
-            m = merged(shard_dirs(linux))
-            man = json.load(open(os.path.join(m, SHIP_MANIFEST)))
-            ok(man.get("platform") == linux and man.get("jobs_sha256") and man.get("results_sha256")
-               and man.get("design_sha256"),
-               "BA1 a shipped batch carries its exact jobs file, design and results, each hashed, and the platform "
-               "that computed them")
-            des, jbs, res, info = g["load_shipped"](m, spec, design0, jobs0, eng)
-            ok(len(res) == len(jobs0) and jbs == vm_jobs and des["points"][3]["z"] == vm_design["points"][3]["z"]
-               and info.get("inputs") == "shipped" and info.get("cross_platform") is True
-               and 0 < info.get("input_max_rel_diff", 0) <= INPUT_RTOL,
-               f"BA1 merged on another platform, every row is accepted against the shipped inputs, not a design "
-               f"regenerated at merge time: {len(res)}/{len(jobs0)}, {info}")
-        case("BA1", b1)
-
-        def b2():
-            m = merged(shard_dirs(platform_info()))
-            r, why = refused(lambda: g["load_shipped"](m, spec, design0, jobs0, eng), "shipped_inputs_differ")
-            ok(r, f"BA2 on the computing platform the design must regenerate exactly; a difference fails closed: {why}")
-        case("BA2", b2)
-
-        def b3():
-            big = copy.deepcopy(vm_jobs)
-            for j in big:
-                if j["point"] == 3:
-                    j["unit"][attr] *= 1 + 1e-6
-            m = merged(shard_dirs(linux, jobs=big, rws=[{"id": j["id"], "ok": True, "result": run_job(j)}
-                                                         for j in big]))
-            r, why = refused(lambda: g["load_shipped"](m, spec, design0, jobs0, eng), "shipped_inputs_differ")
-            ok(r, f"BA3 across platforms only last-bit input differences are accepted (1e-6 is a changed input): {why}")
-        case("BA3", b3)
-
-        def b4():
-            m = merged(shard_dirs(linux))
-            p = os.path.join(m, "results.jsonl")
-            lines = open(p).read().splitlines()
-            r0 = json.loads(lines[0])
-            r0["result"]["result"]["per_capita"] = {}
-            lines[0] = json.dumps(r0)
-            open(p, "w").write("\n".join(lines) + "\n")
-            r, why = refused(lambda: g["load_shipped"](m, spec, design0, jobs0, eng), "shipped_hash_mismatch")
-            ok(r, f"BA4 a shipped file edited after hashing fails closed: {why}")
-        case("BA4", b4)
-
-        def b5():
-            sds = shard_dirs(linux, dict(linux, system="Darwin", machine="arm64"))
-            r, why = refused(lambda: merged(sds), "shipped_platform_mixed")
-            ok(r, f"BA5 shards computed on different platforms are not merged into one batch: {why}")
-        case("BA5", b5)
-
-        def b6():
-            sds = shard_dirs(linux)
-            r, why = refused(lambda: g["load_shipped"](sds[0], spec, design0, jobs0, eng), "shipped_incomplete")
-            ok(r, f"BA6 a batch missing jobs of the current design fails closed: {why}")
-        case("BA6", b6)
-
-        def b7():
-            m = merged(shard_dirs(linux))
-            d2 = os.path.join(d, "other_spec")
-            os.makedirs(d2)
-            shutil.copy(spec.path, d2)
-            shutil.copy(os.path.join(d, "units.csv"), d2)
-            with open(os.path.join(d2, os.path.basename(spec.path)), "a") as f:
-                f.write("# edited\n")
-            spec2 = schema.load(os.path.join(d2, os.path.basename(spec.path)))
-            r, why = refused(lambda: g["load_shipped"](m, spec2, design0, jobs0, eng), "shipped_spec_differs")
-            ok(r, f"BA7 a batch shipped for another decision spec fails closed: {why}")
-        case("BA7", b7)
-
-        def b8():
-            sj, sr, sdz = (os.path.join(d, x) for x in ("a_jobs.jsonl", "a_res.jsonl", "a_design.json"))
-            with open(sj, "w") as f:
-                f.write("".join(json.dumps({k: j[k] for k in ("id",) + CORE}) + "\n" for j in jobs0))
-            with open(sr, "w") as f:
-                f.write("".join(json.dumps({"id": j["id"], "ok": True, "result": run_job(j)["result"]}) + "\n"
-                                for j in jobs0))
-            json.dump({"spec_engine": design0["spec_engine"], "horizon": design0["horizon"],
-                       "cal_window": design0["cal_window"], "platform": linux}, open(sdz, "w"))
-            import compute
-            called = []
-            orig = compute.map_fn
-            compute.map_fn = lambda *a, **k: called.append(1) or orig(*a, **k)
-            try:
-                r, why = refused(lambda: adopt(d, sr, sj, sdz, jobs0, design0, eng, sample=len(jobs0)),
-                                 "adopt_platform_differs")
-            finally:
-                compute.map_fn = orig
-            ok(r and not called, f"BA8 an adoption recorded on another platform is refused before its replay "
-                                 f"recomputes anything (the re-run's 1.4% sample): {why}; replays run {len(called)}")
-            ok(ADOPT_RTOL == 1e-6, "BA9 the adoption tolerance is unchanged (1e-6)")
-            m = {"per_capita": {"x": 1.0}, "meta": {"seconds": 1, "fork_year": 2020.0, "burnin_members": 4}}
-            ok(_same(m, {"per_capita": {"x": 1.0}, "meta": {"seconds": 2, "fork_year": 2024.0, "burnin_members": 1}},
-                     ADOPT_RTOL) and not _same(m, {"per_capita": {"x": 1.1}, "meta": m["meta"]}, ADOPT_RTOL),
-               "BA13 (review P2) a replay run alone matches a grouped row: fork point and group size are not outputs")
-        case("BA8", b8)
 
         def b10():
             from toolkit.engines.benchmark import SharedStateToy

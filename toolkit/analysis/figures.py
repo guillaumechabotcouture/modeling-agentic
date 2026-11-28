@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """The harness figures, drawn from a run's saved artifacts only (design: docs/design/v2-figures.md).
 
-    python -m toolkit.analysis.figures render <run_dir> --out <dir> [--recompute] [--labels <yaml>] [--theme dark]
+    python -m toolkit.analysis.figures render <run_dir> --out <dir> [--labels <yaml>] [--theme dark]
     python -m toolkit.analysis.figures compare <run_dir> <run_dir> ... --out <dir> [--names A,B]
     python3 toolkit/analysis/figures.py --self-test
 
@@ -9,8 +9,7 @@
 `.csv` table view, and the `scripts/figure_validator.py` provenance sidecar (sources relative to the run dir,
 `produced_by: harness`). With `out_dir` it writes there instead and never touches the run dir. Each figure is
 produced only when its inputs exist; otherwise its `not_produced` entry gives the reason (fail closed, never a silent
-skip). `--recompute` rebuilds the decision numbers of `analysis/figure_data.yaml` from the run's stored batch
-(toolkit/analysis/figure_data.py: no engine runs) for runs written before that artifact existed.
+skip).
 
 Every axis uses figure_style.fmt (no offset notation); labels come from the spec's presentation.labels (or --labels),
 else a readable fallback with a definition line. Nothing here names a disease, component or unit.
@@ -2768,11 +2767,10 @@ def main(argv=None) -> int:
     r = sub.add_parser("render", help="re-render a run's figures from its saved artifacts into --out")
     r.add_argument("run_dir")
     r.add_argument("--out", required=True)
-    r.add_argument("--recompute", action="store_true", help="rebuild figure_data from the stored batch (no engine runs)")
     r.add_argument("--labels", help="an unsigned presentation file: labels and/or boundaries (overrides the run "
                                     "dir's presentation.yaml id by id)")
     r.add_argument("--only", help="comma-separated figure names")
-    r.add_argument("--figure-data", help="a figure_data YAML written by an earlier --recompute (its data block)")
+    r.add_argument("--figure-data", help="a figure_data YAML (its data block)")
     r.add_argument("--trajectories", help="a trajectories YAML (analysis/trajectories.yaml format)")
     r.add_argument("--theme", default="light", choices=sorted(FS.THEMES))
     c = sub.add_parser("compare", help="headline and counts side by side across runs")
@@ -2788,23 +2786,9 @@ def main(argv=None) -> int:
         e = compare(a.run_dirs, a.out, a.names.split(",") if a.names else None, ov, a.theme)
         print(json.dumps({"comparison": e["path"]}))
         return 0
-    _check_out_outside(a.run_dir, a.out)         # before --out is created or --recompute publishes into it
+    _check_out_outside(a.run_dir, a.out)         # before --out is created or published into
     fd = yaml.safe_load(open(a.figure_data))["data"] if a.figure_data else None
     tj = yaml.safe_load(open(a.trajectories))["data"] if a.trajectories else None
-    if fd is None and a.recompute and not os.path.exists(os.path.join(a.run_dir, "analysis", "figure_data.yaml")):
-        from toolkit.analysis import figure_data as FD
-        os.makedirs(a.out, exist_ok=True)
-        try:
-            A, plan, out0, ben0, cost0, z0 = FD.rebuild(a.run_dir)
-            uq = yaml.safe_load(open(os.path.join(a.run_dir, "analysis", "uncertainty.yaml")))["data"]
-            from toolkit.analysis.artifacts import plain
-            fd = plain(FD.compute(A, plan, out0, ben0, cost0, uq, z0))
-            _publish(os.path.join(a.out, "figure_data.yaml"),
-                     yaml.safe_dump({"producer": FD.PRODUCER, "recomputed_from": os.path.abspath(a.run_dir), "data": fd},
-                                    sort_keys=False, width=120), a.out)   # the operator's --out
-        except FD.RebuildRefused as e:
-            print(f"recompute refused: {e}", file=sys.stderr)
-            fd = None
     res = render(a.run_dir, a.out, ov, fd, tj, theme=a.theme, only=a.only.split(",") if a.only else None)
     print(json.dumps({"produced": [f["figure"] for f in res["figures"]], "not_produced": res["not_produced"]}, indent=1))
     return 0

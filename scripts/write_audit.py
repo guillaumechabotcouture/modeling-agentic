@@ -526,12 +526,11 @@ def g(p, d):
 
 
 def _self_test_round6(ok) -> None:
-    """WA13-WA20: Codex's review of #134, each reproduced: the detached launch, root-less publications, the detached
-    log's reopen, the --no-ledger outputs, the rename source race, the audit bypasses and the mandatory run root."""
+    """WA13-WA14, WA16-WA20: Codex's review of #134, each reproduced: the detached launch, the detached log's reopen,
+    linked figures provenance, the --no-ledger outputs, the rename source race, the audit bypasses and the mandatory run root."""
     import json
     import subprocess as sp
     import tempfile
-    import types
     for p in (REPO, os.path.join(REPO, "scripts"), os.path.join(REPO, "agents")):
         if p not in sys.path:
             sys.path.insert(0, p)
@@ -592,15 +591,6 @@ def _self_test_round6(ok) -> None:
                "WA14 the detached log is not reopened by name: a hard-link swap after it is created is refused")
     finally:
         sp.Popen = real_popen
-    with tempfile.TemporaryDirectory() as d, tempfile.TemporaryDirectory() as out:
-        run_dir(d)
-        from toolkit.analysis import batch as Bt
-        os.symlink(out, os.path.join(d, "analysis"))
-        spec = types.SimpleNamespace(sha256="s", settings_sha256=None)
-        call(Bt.ship, os.path.join(d, "analysis", "shipped"), spec, {"points": 1}, [{"id": "a"}],
-             [{"id": "a", "ok": True, "result": {}}], platform={"system": "x"}, root=d)
-        ok(os.listdir(out) == [], f"WA15 a shipped bundle is not published through a planted parent link "
-                                  f"({os.listdir(out)})")
     with tempfile.TemporaryDirectory() as d, tempfile.TemporaryDirectory() as out:
         run_dir(d)
         from toolkit.analysis import figures as FG
@@ -829,13 +819,13 @@ def _self_test_merge_v2(ok) -> None:
 
 
 def _self_test_render_out(ok) -> None:
-    """WA28: `figures render RUN --out RUN[/sub] --recompute` on a run without analysis/figure_data.yaml is refused
+    """WA28: `figures render RUN --out RUN[/sub]` on a run without analysis/figure_data.yaml is refused
     before anything is created or published (the outside-the-run check comes first)."""
     import tempfile
     for p in (REPO, os.path.join(REPO, "scripts")):
         if p not in sys.path:
             sys.path.insert(0, p)
-    from toolkit.analysis import figures as FG, figure_data as FD
+    from toolkit.analysis import figures as FG
 
     def tree(d):
         return sorted((os.path.relpath(os.path.join(r, n), d), os.lstat(os.path.join(r, n)).st_mtime_ns)
@@ -847,21 +837,16 @@ def _self_test_render_out(ok) -> None:
             os.makedirs(os.path.join(d, "analysis"))
             open(os.path.join(d, "analysis", "uncertainty.yaml"), "w").write("data: {}\n")
             before = tree(d)
-            real = FD.rebuild, FD.compute
-            FD.rebuild = lambda run_dir: ({}, {}, {}, {}, {}, 0)       # a rebuild that succeeds (an older run)
-            FD.compute = lambda *a, **k: {"x": 1}
             refused = False
             try:
-                FG.main(["render", d, "--out", os.path.join(d, sub) if sub else d, "--recompute"])
+                FG.main(["render", d, "--out", os.path.join(d, sub) if sub else d])
             except ValueError:
                 refused = True
             except Exception:  # noqa: BLE001 -- any other failure is not the refusal
                 pass
-            finally:
-                FD.rebuild, FD.compute = real
             res.append((refused, tree(d) == before))
     ok(all(r == (True, True) for r in res),
-       f"WA28 render --out inside the run with --recompute is refused before it creates or publishes anything "
+       f"WA28 render --out inside the run is refused before it creates or publishes anything "
        f"(--out RUN, --out RUN/out: {res})")
 
 

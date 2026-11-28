@@ -99,8 +99,6 @@ class StubTasks:
       plan:        callable(packet) -> plan (default: the harness default plan)
       usd:         spend charged per task (default 0)
       crash:       {call name: n}  the call raises (an interrupted session) the first n times
-      checklist:   callable(reviewer, round, answers) -> answers (None: no checklist) for a domain or red-team
-                   critique (default: every item, `pass`)
     """
 
     def __init__(self, script: dict | None = None):
@@ -111,10 +109,6 @@ class StubTasks:
 
     def set_allowance(self, usd, readback_usd=None):
         self.allowances.append(usd)
-
-    def for_run_dir(self, run_dir):
-        """The scripted tasks take the run dir on each call: the same object serves a child run (lead-gaps β)."""
-        return self
 
     def _r(self, name, ok=True, output=None, note=""):
         self.calls.append(name)
@@ -242,13 +236,6 @@ class StubTasks:
         doc = {"reviewer": reviewer, "round": round_n,
                "verdict": "REVISE" if any(not b["resolved"] for b in blockers) else "PASS",
                "structural_mismatch": sm, "carried_forward": carried, "blockers": blockers}
-        from toolkit.spec import critique_checklist as CL
-        if reviewer in CL.CHECKLIST_REVIEWERS:      # owner 2026-11-23: every item of the structural checklist
-            ck = {i: {"answer": "pass", "reason": "stub: checked"} for i in CL.ITEMS}
-            edit = self.s.get("checklist")
-            ck = edit(reviewer, round_n, ck) if callable(edit) else ck
-            if ck is not None:
-                doc["checklist"] = ck
         _yaml_dump(doc, path, run_dir)
         return self._r(f"critique:{reviewer}:{round_n}")
 
@@ -270,7 +257,7 @@ class StubTasks:
                 done.append(fid)
         return self._r(f"fix:{task['id']}", note=f"edited for {done}" if done else "no scripted edit")
 
-    def write(self, run_dir, mode, feedback=None, findings=None):
+    def write(self, run_dir, mode, findings=None):
         self.write_findings = list(findings or [])       # the write-up findings the machine passed (F6 run 3)
         A = {}
         try:
@@ -284,13 +271,6 @@ class StubTasks:
         text = f"# Report\n\n{head}The plan is the harness's optimisation; the harness renders every number.{ref}\n"
         if self.s.get("manuscript"):
             text = f"# Report\n\n{head}{self.s['manuscript']}"
-        if feedback and self.s.get("manuscript_repair"):     # a repair of the write-up (F6 S1-7)
-            text = f"# Report\n\n{head}{self.s['manuscript_repair']}"
-        claims_fix = bool(findings) and all(f.get("repair") == "claims" for f in findings)
-        if claims_fix:      # a claim-reference repair inside WRITE (hb2): scripted, or a writer that leaves the draft
-            if not self.s.get("manuscript_claim_repair"):
-                return self._r(f"write:{mode}:claims")
-            text = f"# Report\n\n{head}{self.s['manuscript_claim_repair']}"
         del A
         _sio().write_nofollow(run_dir, "manuscript.md", text.encode("utf-8"), atomic=True)
-        return self._r(f"write:{mode}" + (":repair" if feedback else ":claims" if claims_fix else ""))
+        return self._r(f"write:{mode}")

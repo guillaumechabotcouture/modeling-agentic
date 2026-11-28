@@ -40,8 +40,7 @@ after signing is stale on every path. It never refuses a value: the sheet shows 
 with execution's own functions) next to each choice and lists where they differ, for the owner to decide. A stored
 record is only compared, never trusted. It is registered in toolkit/spec/preconditions.py, which
 every path calls: the three signers, signoff.status, the launch and relaunch checks (cloud/run_cluster.py), and the
-stage machine at ENGINE_CHOICE and on resume. toolkit/spec/evidence_regressions.py drives every bypass the reviews
-found through every path. Nothing here names a disease; the inputs come from the engine's card.
+stage machine at ENGINE_CHOICE and on resume. Nothing here names a disease; the inputs come from the engine's card.
 """
 from __future__ import annotations
 
@@ -608,28 +607,19 @@ def _acquired_context(run_dir: str | None, memo: dict) -> dict:
     key = ("_acq_ctx", run_dir)
     if key in memo:
         return memo[key]
-    ctx: dict = {"manifest": None, "by_id": {}, "manifest_hosts": set(), "manifest_sources": set(), "allow_hosts": set()}
+    ctx: dict = {"manifest": None, "by_id": {}}
     if run_dir:
         try:
             from agents import acquire as ACQ
             man, _ = ACQ.read_manifest(run_dir)
             if isinstance(man, dict):
                 ctx["manifest"] = man
-                import urllib.parse as _up
                 for path, entry in (man.get("files") or {}).items():
                     if not isinstance(entry, dict):
                         continue
                     fid = str(entry.get("fetch_id") or "")
                     if fid:
                         ctx["by_id"][fid] = (path, entry)
-                    url = str(entry.get("url") or "")
-                    host = (_up.urlsplit(url).hostname or "").lower()
-                    if host:
-                        ctx["manifest_hosts"].add(host)
-                    sid = str(entry.get("source_id") or "").lower()
-                    if sid:
-                        ctx["manifest_sources"].add(sid)
-                ctx["allow_hosts"] = ACQ.allowlisted_hosts()
         except Exception:  # noqa: BLE001
             pass
     memo[key] = ctx
@@ -637,54 +627,38 @@ def _acquired_context(run_dir: str | None, memo: dict) -> dict:
 
 
 def _acquired_obs_problems(key: str, j: int, o: dict, run_dir: str | None, memo: dict) -> list[str]:
-    """Enforce §5 quoted-span verification for observations citing acquired files or allowlisted sources."""
-    ctx = _acquired_context(run_dir, memo)
+    """Enforce §5 quoted-span verification for observations carrying an `acquired` block."""
     acq = o.get("acquired")
-    if acq is not None:
-        if not isinstance(acq, dict):
-            return [f"observation_quote_not_found: entry {key} observations[{j}].acquired must be a mapping"]
-        for req_f in ("id", "sha256", "locator", "quote"):
-            if not _text(acq.get(req_f)):
-                return [f"observation_quote_not_found: entry {key} observations[{j}].acquired.{req_f} is blank"]
-        quote = str(acq["quote"]).strip()
-        if len(quote) > 300:
-            return [f"observation_quote_not_found: entry {key} observations[{j}].acquired.quote exceeds 300 chars"]
-        hit = ctx["by_id"].get(str(acq["id"]).strip())
-        if hit is None:
-            return [f"observation_quote_not_found: entry {key} observations[{j}]: acquired id {acq['id']!r} not in manifest"]
-        rel_path, entry = hit
-        if str(entry.get("sha256") or "") != str(acq["sha256"]).strip():
-            return [f"observation_quote_not_found: entry {key} observations[{j}]: acquired sha256 does not match manifest"]
-        try:
-            from agents import acquire as ACQ
-            from lib.safe_io import read_nofollow
-            raw_b, _ = read_nofollow(run_dir, rel_path)
-            if hashlib.sha256(raw_b).hexdigest() != str(acq["sha256"]).strip():
-                return [f"observation_quote_not_found: entry {key} observations[{j}]: file sha256 mismatch"]
-            plain = ACQ.extract_plain_text(raw_b, str(entry.get("content_type") or "text/plain"))
-        except Exception as e:  # noqa: BLE001
-            return [f"observation_quote_not_found: entry {key} observations[{j}]: unreadable acquired file ({e})"]
-        if " ".join(quote.split()) not in " ".join(plain.split()):
-            return [f"observation_quote_not_found: entry {key} observations[{j}]: quote not found in {rel_path}"]
-        if not _value_in_quote(o.get("value"), quote):
-            return [f"observation_quote_not_found: entry {key} observations[{j}]: value {o.get('value')!r} does not appear in quote"]
+    if acq is None:
         return []
-    # No `acquired` block: check if `where` cites an acquired path or an allowlisted/manifest host while the manifest holds files
-    if not ctx["by_id"]:
-        return []
-    import re as _re
-    import urllib.parse as _up
-    where_s = str(o.get("where") or "")
-    where_l = where_s.lower()
-    if "data/inputs/acquired/" in where_l:
-        return [f"observation_acquired_unbound: entry {key} observations[{j}]: cites acquired path without `acquired` block"]
-    for url_m in _re.findall(r"https?://[^\s,;)>\"]+", where_s):
-        host = (_up.urlsplit(url_m).hostname or "").lower()
-        if host and (host in ctx["manifest_hosts"] or host in ctx["allow_hosts"]):
-            return [f"observation_acquired_unbound: entry {key} observations[{j}]: `where` names allowlisted host {host} without `acquired` block"]
-    if _re.search(r"\b(?:table|figure|fig\.|section|abstract)\s*\d*", where_l):
-        if any(s in where_l or s in str(o.get("source") or "").lower() for s in ctx["manifest_sources"]):
-            return [f"observation_acquired_unbound: entry {key} observations[{j}]: cites acquired source table/section without `acquired` block"]
+    ctx = _acquired_context(run_dir, memo)
+    if not isinstance(acq, dict):
+        return [f"observation_quote_not_found: entry {key} observations[{j}].acquired must be a mapping"]
+    for req_f in ("id", "sha256", "locator", "quote"):
+        if not _text(acq.get(req_f)):
+            return [f"observation_quote_not_found: entry {key} observations[{j}].acquired.{req_f} is blank"]
+    quote = str(acq["quote"]).strip()
+    if len(quote) > 300:
+        return [f"observation_quote_not_found: entry {key} observations[{j}].acquired.quote exceeds 300 chars"]
+    hit = ctx["by_id"].get(str(acq["id"]).strip())
+    if hit is None:
+        return [f"observation_quote_not_found: entry {key} observations[{j}]: acquired id {acq['id']!r} not in manifest"]
+    rel_path, entry = hit
+    if str(entry.get("sha256") or "") != str(acq["sha256"]).strip():
+        return [f"observation_quote_not_found: entry {key} observations[{j}]: acquired sha256 does not match manifest"]
+    try:
+        from agents import acquire as ACQ
+        from lib.safe_io import read_nofollow
+        raw_b, _ = read_nofollow(run_dir, rel_path)
+        if hashlib.sha256(raw_b).hexdigest() != str(acq["sha256"]).strip():
+            return [f"observation_quote_not_found: entry {key} observations[{j}]: file sha256 mismatch"]
+        plain = ACQ.extract_plain_text(raw_b, str(entry.get("content_type") or "text/plain"))
+    except Exception as e:  # noqa: BLE001
+        return [f"observation_quote_not_found: entry {key} observations[{j}]: unreadable acquired file ({e})"]
+    if " ".join(quote.split()) not in " ".join(plain.split()):
+        return [f"observation_quote_not_found: entry {key} observations[{j}]: quote not found in {rel_path}"]
+    if not _value_in_quote(o.get("value"), quote):
+        return [f"observation_quote_not_found: entry {key} observations[{j}]: value {o.get('value')!r} does not appear in quote"]
     return []
 
 

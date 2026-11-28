@@ -29,9 +29,7 @@ PARTIAL_STATUSES = {"completed_scope_declared", "completed_gate_not_accepted",
                     # (resumable), and the owner declined one with no rounds left.
                     "awaiting_scope_signoff", "completed_scope_declined",
                     # Agent-built engines (#363): owner engine sign-off wait and non-admitted/declined terminals.
-                    "awaiting_engine_signoff", "completed_engine_not_admitted", "completed_engine_declined",
-                    # lead-gaps β: a --signoff lead run that continued in the child run its provisional amendment made
-                    "amended_provisional"}
+                    "awaiting_engine_signoff", "completed_engine_not_admitted", "completed_engine_declined"}
 
 
 def exit_code_for(status: str) -> int:

@@ -839,7 +839,7 @@ def _built_engine_bundle_extras(run_dir: str) -> list[str]:
 
 def make_bundle(run_dir: str, max_file_mb: float = DEFAULT_MAX_FILE_MB) -> tuple[bytes, dict]:
     """tar.gz of the run's models/ and data/, the repo's scripts/ and toolkit/, and the declared data set
-    (FP_DATA_SET: repo data/ excluding eval/trial dirs, and non-Python files of toolkit/), with
+    (FP_DATA_SET: repo data/ excluding eval dirs, and non-Python files of toolkit/), with
     ABSOLUTE member paths so workers recreate the same layout. The data set is exactly the files the reuse key's
     data_set part hashes (_data_set_files), shipped whatever their size: a worker that reads one computes with
     the launcher's copy, the one the key names (BD1-BD4). Logs and the records this module keeps beside a batch
@@ -2882,7 +2882,7 @@ FP_KEY_VERSION = 3
 # W0-A: the repo data a batch can read by path, hashed whole into every key (the one list). "all": every file;
 # "data": every file but code and docs (.py, .pyc, .md); the Python a job imports is its observed closure.
 FP_DATA_SET = {"data": "all", "toolkit": "data"}
-_FP_DATA_EXCLUDES = ("data/evals", "data/world_model_trials")
+_FP_DATA_EXCLUDES = ("data/evals",)
 _FP_CODE_EXT = (".py", ".pyc", ".md")
 
 
@@ -4955,7 +4955,7 @@ def _self_test_bundle_data_set(ok) -> None:
             os.makedirs(os.path.dirname(f), exist_ok=True)
             open(f, "w").write(txt)
         for rel in ("data/pop.csv", "data/sub/costs.yaml", "data/_truth/key.csv",
-                    "data/evals/q1.yaml", "data/world_model_trials/t1.yaml",
+                    "data/evals/q1.yaml",
                     ".claude/orchestration/priors.yaml",
                     "scripts/compute.py", "scripts/table.json", "scripts/README.md", "toolkit/eng/card.yaml",
                     "toolkit/eng/model.py", "scripts/lib/code_commit.txt", "docs/notes.md"):
@@ -4987,8 +4987,7 @@ def _self_test_bundle_data_set(ok) -> None:
            f"BD2 the bundle's repo data/ is exactly the data set ({sorted(data_like)})")
         ok(os.path.join(repo, "data/big.csv") in names and not any("/_truth/" in n for n in names)
            and os.path.join(repo, "docs/notes.md") not in names
-           and os.path.join(repo, "data/evals/q1.yaml") not in names
-           and os.path.join(repo, "data/world_model_trials/t1.yaml") not in names,
+           and os.path.join(repo, "data/evals/q1.yaml") not in names,
            f"BD3 a large data-set file ships (the key hashes it), _truth, excludes and undeclared dirs do not ({info})")
         ok(info.get("data_set_files") == len(want) == 4,
            f"BD4 the bundle reports the data-set files it ships ({info})")

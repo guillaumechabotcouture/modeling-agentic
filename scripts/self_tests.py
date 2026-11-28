@@ -30,8 +30,9 @@ from concurrent.futures import ThreadPoolExecutor
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SCOPE_DIRS = ("scripts/", "toolkit/", "cloud/", "tools/")   # tools/: outside compute.code_fingerprint
 AGENT_MODULES = (
-    "agents/stage_machine.py", "agents/findings_ledger.py", "agents/fix_loop.py",
-    "agents/analysis_backend.py", "agents/v2_sdk_tasks.py", "agents/world_model_stage.py",
+    "agents/stage_machine.py", "agents/engine_build_stage.py", "agents/report_render.py",
+    "agents/v2_gate.py", "agents/findings_ledger.py", "agents/fix_loop.py",
+    "agents/analysis_backend.py", "agents/v2_sdk_tasks.py",
     "agents/acquire.py",
 )
 # Files (or directory prefixes ending in "/") in scope that have no --self-test, and why.
@@ -135,6 +136,12 @@ WEIGHTS_S = {
     "toolkit/analysis/figures.py": 25, "scripts/pipeline.py": 25, "scripts/validate_critique_yaml.py": 5,
     "agents/analysis_backend.py": 21, "toolkit/analysis/trajectories.py": 19, "toolkit/analysis/model.py": 15,
 }
+WEIGHTS_S.update({
+    "agents/stage_machine.py": 300,
+    "agents/engine_build_stage.py": 150,
+    "agents/report_render.py": 30,
+    "agents/v2_gate.py": 30,
+})
 DEFAULT_WEIGHT_S = 5
 
 
