@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
 """The analysis engine (architecture-v2 §3.4): every number from the spec, the engine and the run's data.
 
-    python3 toolkit/analysis/run.py <run_dir> [--spec decision_spec.yaml] [--results <batch results.jsonl>]
-                                    [--shipped <shipped batch dir>] [--draws N] [--unsigned]
+    python3 toolkit/analysis/run.py <run_dir> [--spec decision_spec.yaml] [--draws N] [--unsigned]
     python3 toolkit/analysis/run.py --self-test         # every step on the toy engine, both paths
 
 Steps (design: docs/design/v2-spec-and-analysis.md §2): validate the spec and check it is
@@ -134,14 +133,14 @@ def _stop_where(e) -> str | None:
     return None
 
 
-def run(run_dir: str, spec_rel: str = "decision_spec.yaml", adopt: dict | None = None, draws=None,
+def run(run_dir: str, spec_rel: str = "decision_spec.yaml", draws=None,
         unsigned: bool = False, log=print, compute_kw: dict | None = None) -> dict:
     """The analysis. A step whose model corrections bear on a plan stops it: analysis/blocked.yaml records where and
     which, and the manifest is published with status blocked (never complete). A stop the toolkit declares by its
     own exception (`_stop_where`) is recorded the same way, with the exception's name and code, and raised again."""
     holder = {}
     try:
-        return _run(run_dir, spec_rel, adopt, draws, unsigned, log, compute_kw, holder)
+        return _run(run_dir, spec_rel, draws, unsigned, log, compute_kw, holder)
     except AnalysisBlocked as e:
         S = holder.get("S")
         if S is not None:
@@ -171,7 +170,7 @@ def run(run_dir: str, spec_rel: str = "decision_spec.yaml", adopt: dict | None =
         raise
 
 
-def _run(run_dir, spec_rel, adopt, draws, unsigned, log, compute_kw, holder) -> dict:
+def _run(run_dir, spec_rel, draws, unsigned, log, compute_kw, holder) -> dict:
     t0 = time.time()
     compute_kw = dict(compute_kw or {})
     fan_out = compute_kw.pop("draw_fanout", None) is True       # only the draw fan-out reads it, never compute.py
@@ -251,37 +250,10 @@ def _run(run_dir, spec_rel, adopt, draws, unsigned, log, compute_kw, holder) -> 
         kw = dict(compute_kw or {})
         if spec["analysis"].get("workers"):
             kw.setdefault("max_workers", int(spec["analysis"]["workers"]))
-        shipped = (adopt or {}).get("shipped")
-        adopt_in = []
-        if shipped:
-            # a batch computed elsewhere (VM shards) with its exact inputs: rows are checked against the shipped
-            # jobs, and the analysis uses the shipped design (batch.load_shipped)
-            from toolkit.engines.identity import engine_identity
-            design, jobs, res, info = Bt.load_shipped(shipped, spec, design, jobs, eng)
-            _safe_io().write_nofollow(run_dir, "analysis/batch/design.json", json.dumps(design, indent=1).encode(),
-                                      atomic=True)
-            _safe_io().write_nofollow(run_dir, "analysis/batch/results.jsonl", "".join(
-                json.dumps({"i": n, "ok": True, "result": {"result": res[j["id"]], "provenance": {
-                    "job_sha": Bt.job_sha(j), "engine": engine_identity(eng), "producer": Bt.PRODUCER,
-                    "shipped_from": info}}}) + "\n" for n, j in enumerate(jobs)).encode(), atomic=True)
-            res, probs = Bt.load_results(os.path.join(run_dir, "analysis", "batch", "results.jsonl"), jobs, eng)
-            bsum = {"source": "shipped batch", "shipped": info, "n": len(res), "rejected_rows": len(probs)}
-            adopt_in = [os.path.join(os.path.abspath(shipped), n) for n in
-                        [Bt.SHIP_MANIFEST] + list(Bt.SHIP_FILES.values())]
-        elif adopt:
-            adopt_in = [adopt["results"], adopt["jobs"], adopt["design"]]
-            # a batch computed before results carried provenance: adopted only after a full-input match and a re-run
-            # sample that reproduces it (Codex P1-3)
-            ad = Bt.adopt(run_dir, adopt["results"], adopt["jobs"], adopt["design"], jobs, design, eng,
-                          sample=int(adopt.get("sample") or Bt.min_adopt_sample(len(jobs))),
-                          workers=int(kw.get("max_workers", 2)))
-            res, probs = Bt.load_results(ad["path"], jobs, eng)
-            bsum = {"source": "adopted stored batch", "adoption": ad, "n": len(res), "rejected_rows": len(probs)}
-        else:
-            from toolkit.analysis import row_reuse as RR     # F6 run 2: stored rows by job_sha, engine, adapter
-            b = RR.run(run_dir, jobs, eng, "analysis/batch/results.jsonl", log=log, **kw)
-            res, probs = b["results"], b["problems"]
-            bsum = dict(b["summary"], path=os.path.relpath(b["path"], run_dir), rejected_rows=len(probs))
+        from toolkit.analysis import row_reuse as RR     # F6 run 2: stored rows by job_sha, engine, adapter
+        b = RR.run(run_dir, jobs, eng, "analysis/batch/results.jsonl", log=log, **kw)
+        res, probs = b["results"], b["problems"]
+        bsum = dict(b["summary"], path=os.path.relpath(b["path"], run_dir), rejected_rows=len(probs))
         batch_rows = os.path.join(run_dir, "analysis", "batch", "results.jsonl")
         if probs:
             raise ValueError(f"{len(probs)} batch results lack matching provenance (e.g. {probs[:3]}): the analysis fails "
@@ -290,8 +262,7 @@ def _run(run_dir, spec_rel, adopt, draws, unsigned, log, compute_kw, holder) -> 
                                           "packages": design["packages"], "fitted_names": design["fitted_names"],
                                           "prior_names": design.get("prior_names", []),
                                           "summary": bsum}, Bt.PRODUCER,
-                                [os.path.join(run_dir, "analysis", "batch", "design.json"), batch_rows] + data_in
-                                + adopt_in)
+                                [os.path.join(run_dir, "analysis", "batch", "design.json"), batch_rows] + data_in)
         model = EmulatorModel(spec, design, res, log=log).fit()
         arts["emulator"] = S.write("emulator", {"accuracy": model.accuracy, "fit_seconds": model.fit_seconds,
                                                 "features": model.features, "training_corrections":
@@ -486,20 +457,10 @@ def _run(run_dir, spec_rel, adopt, draws, unsigned, log, compute_kw, holder) -> 
     if pv is not None:
         arts["plan_variants"] = S.write("plan_variants", pv, V.PRODUCER, [arts["point"]])
     # ---- sensitivity
-    from toolkit.analysis import wiring as WR      # the sensitivity ends and test evaluations, kept for the wiring check
-    rec = WR.start(A, out0, cost0)        # advisory: None when it cannot start; the analysis goes on
-    try:
-        sens = SE.run(A, z0, ben0, cost0, plan_pt, sol["objective"])
-        arts["sensitivity"] = S.write("sensitivity", sens, SE.PRODUCER, [arts["point"]])
-        # ---- decision tests
-        dts = DT.run_all(A, z0, out0, ben0, cost0, plan_pt, u["data"], run_dir)
-        # ---- wiring: every declared input reaches a declared output (owner, 2026-11-23)
-        ev_, fl_ = A.last_events, A.last_cost_floors      # as the decision tests left them: the check only measures
-        wr = WR.finish(A, rec, dts, z0, ben0)      # never raises: a failure is recorded in the artifact
-        A.last_events, A.last_cost_floors = ev_, fl_
-    finally:
-        if rec is not None:
-            rec.close()
+    sens = SE.run(A, z0, ben0, cost0, plan_pt, sol["objective"])
+    arts["sensitivity"] = S.write("sensitivity", sens, SE.PRODUCER, [arts["point"]])
+    # ---- decision tests
+    dts = DT.run_all(A, z0, out0, ben0, cost0, plan_pt, u["data"], run_dir)
     if jc is not None:      # owner decision R1 (F6 run 1): a declared calibration miss stands only with its test run
         from toolkit.analysis import joint_calibration as JC
         dp = JC.declared_test_problems(jc["unmatched_decision"], dts)
@@ -537,9 +498,6 @@ def _run(run_dir, spec_rel, adopt, draws, unsigned, log, compute_kw, holder) -> 
     for x in dts:
         if x["path"]:
             S.deliverable(os.path.join(run_dir, x["path"]), DT.PRODUCER, "decision_test")
-    arts["wiring"] = S.write("wiring", wr, WR.PRODUCER, [arts["sensitivity"], arts["decision_tests"]])
-    log(f"wiring (advisory): {wr.get('error') or wr['summary']}; {len(wr['not_wired'])} input(s) not shown to reach "
-        f"a declared output; {wr['evaluations'].get('extra', 0)} extra evaluation(s)")
     conf = (jc or {}).get("unmatched_decision", {}).get("conflicts") if jc is not None else None
     if conf is not None:      # W0-F: each held-out target, why, its tests' verdicts; who decides (empty: none)
         from toolkit.analysis import conflicts as CF
@@ -610,7 +568,7 @@ def _run(run_dir, spec_rel, adopt, draws, unsigned, log, compute_kw, holder) -> 
     # ---- claims and results.md
     c = CL.write(A, run_dir, arts, point, u["data"], stab, sens, dts, cal,
                  dict(model.accuracy, **({"boundary_ranking": bnd} if bnd else {})), pv=pv, burden=bvd, anchor=anc,
-                 voi=voi, wiring=wr, cea=cea_res)
+                 voi=voi, cea=cea_res)
     arts["claims"] = S.write("claims", c, CL.PRODUCER, [arts[k] for k in ("point", "uncertainty", "stability",
                                                                           "decision_tests", "calibration")]
                              + ([arts["plan_variants"]] if pv is not None else [])
@@ -626,7 +584,7 @@ def _run(run_dir, spec_rel, adopt, draws, unsigned, log, compute_kw, holder) -> 
                               + (["emulator", "emulator_boundary"] if model.kind == "emulator" else [])
                               + (["burden_validation"] if bvd else []) + (["burden_anchor"] if anc else [])
                               + (["value_of_information"] if voi is not None else [])
-                              + (["cost_effectiveness"] if cea_res is not None else []) + ["wiring"],
+                              + (["cost_effectiveness"] if cea_res is not None else []),
                               "roles": list(EXPECTED_ROLES),
                               "decision_tests": {x["test_id"]: x["path"] for x in dts}}
     S.finalize("complete")
@@ -890,65 +848,17 @@ def _self_test() -> int:
         ok(any(e["kind"] == "extrapolation" and e["unit"] == i0 for e in ev)
            and A.plan_corrections(ev, R["point"]["plan"]),
            "R16 a unit outside the design domain is recorded as extrapolation and bears on the plan (Codex P1-6)")
-        # Codex P1-3: stored results without provenance are refused; an adopted batch must match and reproduce
+        # Codex P1-3: stored results without provenance are refused
         design, jobs = Bt.design(spec)
         stored = os.path.join(d, "stored.jsonl")
-        sj = os.path.join(d, "stored_jobs.jsonl")
-        sd = os.path.join(d, "stored_design.json")
         with open(os.path.join(d, "analysis", "batch", "results.jsonl")) as f:
             rows_c = [json.loads(x) for x in f if x.strip()]
         res_by = {jobs[r["i"]]["id"]: r["result"]["result"] for r in rows_c if r.get("ok")}
         with open(stored, "w") as f:
             for j in jobs:
                 f.write(json.dumps({"id": j["id"], "ok": True, "result": res_by[j["id"]]}) + "\n")
-        with open(sj, "w") as f:
-            for j in jobs:
-                f.write(json.dumps({k: j[k] for k in ("id",) + Bt.CORE}) + "\n")
-        json.dump({"spec_engine": design["spec_engine"], "horizon": design["horizon"], "cal_window": design["cal_window"]},
-                  open(sd, "w"))
         got, probs = Bt.load_results(stored, jobs, spec.engine())
         ok(not got and probs and "no provenance" in probs[0], "R17 stored results without provenance are refused (P1-3)")
-        ad = Bt.adopt(d, stored, sj, sd, jobs, design, spec.engine(), sample=4, workers=2)
-        got, probs = Bt.load_results(ad["path"], jobs, spec.engine())
-        ok(len(got) == len(jobs) and not probs and ad["rerun_reproduced"] == 4,
-           "R18 a stored batch is adopted after a full-input match and a re-run sample that reproduces it")
-        bad_jobs = [json.loads(x) for x in open(sj)]
-        bad_jobs[1]["seed"] += 1
-        with open(sj, "w") as f:
-            f.write("".join(json.dumps(x) + "\n" for x in bad_jobs))
-        try:
-            Bt.adopt(d, stored, sj, sd, jobs, design, spec.engine(), sample=4, workers=2)
-            ok(False, "R19 a stored job whose inputs differ is not adopted")
-        except ValueError as e:
-            ok("inputs differ" in str(e), "R19 a stored job whose inputs differ is not adopted")
-        bad_jobs[1]["seed"] -= 1
-        with open(sj, "w") as f:
-            f.write("".join(json.dumps(x) + "\n" for x in bad_jobs))
-        lines = open(stored).read().splitlines()
-        first = json.loads(lines[0])
-        first["result"]["per_capita"]["cases"]["all"] *= 1.5
-        lines[0] = json.dumps(first)
-        open(stored, "w").write("\n".join(lines) + "\n")
-        try:
-            Bt.adopt(d, stored, sj, sd, jobs, design, spec.engine(), sample=len(jobs), workers=2)
-            ok(False, "R20 a stored result the current engine does not reproduce is not adopted")
-        except ValueError as e:
-            ok("does not reproduce" in str(e), "R20 a stored result the current engine does not reproduce is not adopted")
-        # a batch shipped from another platform with its exact inputs (the Nigeria re-run's shards): the analysis
-        # uses the shipped jobs and design, and records where they were computed
-        try:
-            sh = os.path.join(d, "shipped")
-            Bt.ship(sh, spec, design, jobs, [{"id": j["id"], "ok": True, "result": Bt.run_job(j)} for j in jobs],
-                    platform=dict(Bt.platform_info(), system="OtherOS"), root=d)
-            run(d, log=q, adopt={"shipped": sh}, compute_kw={"max_workers": 2}, draws=2)
-            bdoc = yaml.safe_load(open(os.path.join(d, "analysis", "batch.yaml")))
-            sm = bdoc["data"]["summary"]
-            ok(sm.get("source") == "shipped batch" and sm["shipped"]["cross_platform"] is True
-               and sm["n"] == len(jobs) and contract.gate_findings(d) == []
-               and any(k.endswith("shipped/jobs.jsonl") for k in bdoc["inputs"]),
-               f"R20b a batch shipped from another platform runs the analysis on its own inputs: {sm.get('source')}")
-        except Exception as e:      # noqa: BLE001 -- a failing case, not a crash of the self-test
-            ok(False, f"R20b a batch shipped from another platform runs the analysis ({type(e).__name__}: {e})")
         from toolkit.analysis.model import _driver
         try:
             _driver({"cost_drivers": {"x": 1.0}}, "treated", "t")
@@ -1052,7 +962,6 @@ def _self_test() -> int:
                 pass
         ok(open(os.path.join(out, "v")).read() == "untouched",
            "AR-RW1 an analysis artifact and the manifest are not written through a link or a planted .tmp")
-    _self_test_wiring(ok, q)
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1
@@ -1314,17 +1223,11 @@ def _self_test_variants(ok, q):
         ok(st["components"]["by_component"] and all(x["units_changed"] >= 0 for x in st["folds"])
            and contract.gate_findings(d) == [],
            f"PV-R7 the contract checks pass with a variant headline: {contract.gate_findings(d)}")
-        # Codex S1-6 r1 P2-4: the spec's headline and point.yaml's marker must agree, in the contract and in rebuild
+        # Codex S1-6 r1 P2-4: the spec's headline and point.yaml's marker must agree in the contract
         _resign(d, lambda x: x["analysis"]["plan_variants"].pop("headline"))
         kinds = {f["kind"] for f in contract.gate_findings(d)}
-        try:
-            FD.rebuild(d, log=q)
-            why = ""
-        except FD.RebuildRefused as e:
-            why = str(e)
-        ok("analysis_contract_plan_variants" in kinds and "headline" in why,
-           f"PV-R8 a point plan marked as a variant headline the spec no longer names is refused ({sorted(kinds)}; "
-           f"rebuild: {why[:120]})")
+        ok("analysis_contract_plan_variants" in kinds,
+           f"PV-R8 a point plan marked as a variant headline the spec no longer names is refused ({sorted(kinds)})")
 
 
 def _self_test_voi(ok, q):
@@ -1507,19 +1410,13 @@ def _self_test_plan_rule_runs(ok, q):
            and yaml.safe_load(open(os.path.join(d, "analysis", "decision_tests.yaml")))["data"].get("reference_plan")
            == "point_plan", f"EV-R8 the decision tests name their reference plan, and each owner finding says it is "
                             f"the point-value plan ({len(dtf)} findings; P1-3)")
-        from toolkit.analysis import figure_data as FDm
-        try:
-            FDm.rebuild(d, log=q)
-            rb = "rebuilt"
-        except FDm.RebuildRefused as e:
-            rb = "expected_value" in str(e)
         figs = yaml.safe_load(open(os.path.join(d, "analysis", "figures.yaml")))["data"]
         fr_np = [x for x in figs.get("not_produced") or [] if x.get("figure") == "frontier"]
         stale = [e for e in (".png", ".svg", ".csv") if os.path.exists(os.path.join(d, "figures", "frontier" + e))]
-        ok(rb is True and fr_np and "expected-value" in str(fr_np[0].get("reason")) and not fr_np[0].get("render_failed")
+        ok(fr_np and "expected-value" in str(fr_np[0].get("reason")) and not fr_np[0].get("render_failed")
            and not stale and R0_frontier and os.path.exists(keep_p),
-           f"EV-R9 a rebuild from the point tables is refused (it cannot verify the plan; r2 P1-4); the frontier is not "
-           f"drawn, with the reason, and no earlier run's frontier file is left, while a file no render published is kept (P1-8, r2 P1-5, r3 P1-1) ({rb}, {fr_np}, {stale})")
+           f"EV-R9 the frontier is not drawn, with the reason, and no earlier run's frontier file is left, while a "
+           f"file no render published is kept (P1-8, r2 P1-5, r3 P1-1) ({fr_np}, {stale})")
         pp = os.path.join(d, "analysis", "point.yaml")
         keep = open(pp).read()
         try:
@@ -3191,17 +3088,6 @@ def _self_test_anchor_e2e(ok, d, q):
            {k: x.get(k) for k in ("kind", "status")} for x in ud["draw_plan"]["sources"]],
        f"BA9 (review r1 P2-3) a draw samples each anchor's external value from its own seeded stream; the draw's "
        f"window burden is that value ({lvl:.6g} vs {smp.get('anchor:N0')}); the interval covers burden_anchor")
-    # review r1 P2-9: a rebuild restores the anchor, so its benefits are the published ones
-    from toolkit.analysis import figure_data as FD
-    try:
-        Ar, plan_r, _o, ben_r, *_ = FD.rebuild(d, log=q)
-        pu = R["point"]["per_unit"]
-        ok(Ar.anchor is not None and plan_r == R["point"]["plan"]
-           and all(tol(ben_r[i][plan_r[i]], pu[i]["benefit"]) for i in A.ids),
-           "BA14 (review r1 P2-9) figure_data.rebuild() restores the anchor from analysis/burden_anchor.yaml: its "
-           "benefits equal the published ones")
-    except Exception as e:  # noqa: BLE001
-        ok(False, f"BA14 (review r1 P2-9) rebuild() of an anchored run: {type(e).__name__}: {e}")
     _self_test_anchor_r2(ok, R, A, z0, anchored, reg, tol)
 
 
@@ -3449,13 +3335,6 @@ def _self_test_reserve_e2e(ok, d, q):
                 ("the reserve plan breaks the rule", dict(pt, reserve=dict(rv, affordable=dict(rv["affordable"], share_over_budget=0.5,
                                                                                           draws_over_budget=4))), unc)):
             ok(bool(rf(rule, p_, u_)), f"R38 reserve contract, {label}: a finding")
-    # Codex S1-1b P2: a rebuild of an enforced run restores the reserved budget before it solves
-    try:
-        Ar, plan_r, *_ = FD.rebuild(d, log=q)
-        ok(plan_r == pt["plan"] and abs((Ar.plan_budget or 0) - rv["budget_planned"]) < 1e-9,
-           f"R36 rebuild() restores the reserve and reproduces the enforced plan (plan budget {Ar.plan_budget})")
-    except Exception as e:  # noqa: BLE001
-        ok(False, f"R36 rebuild() of an enforced run: {type(e).__name__}: {e}")
 
 
 def _resign(d, mutate):
@@ -3505,24 +3384,6 @@ def _self_test_round2(ok, d, q):
     open(bench, "w").write(bkeep)
     ok(stale and stale_b and contract.gate_findings(d) == [],
        "R25 replacing the batch results or the benchmark results invalidates the certificate (r2 P1-7)")
-    # r2 P1-2: adoption needs a real re-run sample
-    design, jobs = Bt.design(spec)
-    stored, sj, sd = (os.path.join(d, n) for n in ("r2_stored.jsonl", "r2_jobs.jsonl", "r2_design.json"))
-    rows_c = [json.loads(x) for x in open(rp) if x.strip()]
-    by = {jobs[r["i"]]["id"]: r["result"]["result"] for r in rows_c if r.get("ok")}
-    with open(stored, "w") as f:
-        f.write("".join(json.dumps({"id": j["id"], "ok": True, "result": by[j["id"]]}) + "\n" for j in jobs))
-    with open(sj, "w") as f:
-        f.write("".join(json.dumps({k: j[k] for k in ("id",) + Bt.CORE}) + "\n" for j in jobs))
-    json.dump({"spec_engine": design["spec_engine"], "horizon": design["horizon"], "cal_window": design["cal_window"]},
-              open(sd, "w"))
-    refused = []
-    for n in (0, 1):
-        try:
-            Bt.adopt(d, stored, sj, sd, jobs, design, spec.engine(), sample=n, workers=2)
-        except ValueError as e:
-            refused.append("sample" in str(e))
-    ok(refused == [True, True], f"R26 adoption with no or too small a re-run sample is refused (r2 P1-2): {refused}")
     # r2 P1-5: the interaction is rescaled on one scale for the benchmark target and the allocation outcomes
     out0, ben0, cost0 = A.evaluate(A.theta0, {i: v[0] for i, v in A.calibrate(A.theta0).items()})
     plan = R["point"]["plan"]
@@ -3619,48 +3480,6 @@ def _self_test_round2(ok, d, q):
     ok(clean and st, f"R32 engine: auto runs on the harness's engine choice, and a changed choice makes the analysis "
                      f"stale ({len(st)} findings)")
     del math
-
-
-def _self_test_wiring(ok, q):
-    """Sensitivity wiring (owner, 2026-11-23; advisory) end to end on the toy engine, direct path: a wired run passes
-    reusing the sensitivity ends; an engine that ignores a declared parameter gives an advisory input_not_wired; an
-    exemption removes it and is listed in results.md."""
-    import tempfile
-    import yaml
-    from toolkit.analysis import contract
-    from toolkit.engines import contract as EC
-    with tempfile.TemporaryDirectory() as d:
-        r = schema.direct_toy(yaml.safe_load(open(schema.toy_spec(d, n=12))))
-        yaml.safe_dump(r, open(os.path.join(d, "decision_spec.yaml"), "w"), sort_keys=False)
-
-        def go():
-            run(d, log=q, unsigned=True)
-            w = yaml.safe_load(open(os.path.join(d, "analysis", "wiring.yaml")))["data"]
-            man = json.load(open(os.path.join(d, "analysis", "manifest.json")))
-            return ({x["name"]: x for x in w["rows"]}, w,
-                    [f for f in contract.gate_findings(d) if f["kind"] == "input_not_wired"], man)
-        rows, w, f, man = go()
-        ok(rows["eff_a"]["verdict"] == rows["eff_b"]["verdict"] == "wired" and not f
-           and w["evaluations"]["extra"] == 0 and w["evaluations"]["noise_probe"] == 1
-           and rows["synergy"]["verdict"] == "held_fixed" and "wiring" in man["expected"]["kinds"],
-           f"R-WR1 a wired toy run passes, the sensitivity ends reused (only the noise probe runs): {w['evaluations']}")
-        orig = EC.ToyEngine.run
-        try:
-            EC.ToyEngine.run = lambda self, params, unit, package, horizon, seed: orig(  # noqa: E731
-                self, dict(params, eff_b=0.3), unit, package, horizon, seed)       # eff_b hard-coded: never read
-            rows, w, f, _m = go()
-            ok(rows["eff_b"]["verdict"] == "not_wired" and rows["eff_a"]["verdict"] == "wired"
-               and [(x["key"], x["severity"], x["scope_declarable"], x["would_block"]) for x in f]
-               == [("parameter:eff_b", "MEDIUM", True, True)],
-               f"R-WR2 a declared parameter the engine ignores gives an advisory input_not_wired: {[x['key'] for x in f]}")
-            r["analysis"]["wiring_exempt"] = {"parameters": {"eff_b": "toy: the engine holds it at its trial value"}}
-            yaml.safe_dump(r, open(os.path.join(d, "decision_spec.yaml"), "w"), sort_keys=False)
-            rows, w, f, _m = go()
-            res = open(os.path.join(d, "results.md")).read()
-            ok(not f and rows["eff_b"]["exempt"] and "`eff_b`" in res and "trial value" in res,
-               "R-WR3 an exempt input gives no finding and results.md lists it with its reason")
-        finally:
-            EC.ToyEngine.run = orig
 
 
 def _self_test_unit_attr(ok, q):
@@ -4014,19 +3833,10 @@ def main(argv=None) -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("run_dir")
     ap.add_argument("--spec", default="decision_spec.yaml")
-    ap.add_argument("--adopt", nargs=3, metavar=("RESULTS", "JOBS", "DESIGN"), default=None,
-                    help="adopt a stored batch computed before results carried provenance (verified, then re-run sample)")
-    ap.add_argument("--shipped", metavar="DIR", default=None,
-                    help="use a batch shipped from where it was computed (toolkit/analysis/batch.py ship/merge_shipped)")
     ap.add_argument("--draws", type=int, default=None)
     ap.add_argument("--unsigned", action="store_true", help="test runs only: every artifact records spec_signed false")
     a = ap.parse_args(argv)
-    ad = dict(zip(("results", "jobs", "design"), a.adopt)) if a.adopt else None
-    if a.shipped:
-        if ad:
-            ap.error("--shipped and --adopt are alternatives")
-        ad = {"shipped": a.shipped}
-    R = run(a.run_dir, a.spec, ad, a.draws, a.unsigned)
+    R = run(a.run_dir, a.spec, a.draws, a.unsigned)
     if "estimates" in R:                  # deliverable kind estimates: its outputs (toolkit/analysis/estimates.py)
         print(json.dumps({"outputs": R["estimates"]["outputs"], "decision": R["estimates"]["decision"],
                           "label": R["uncertainty"]["label"], "wall_s": R["wall_s"]}, indent=1, default=float))

@@ -130,29 +130,11 @@ draft with `python3 toolkit/spec/schema.py <run_dir>/decision_spec.yaml` until i
     `finding:` id when it answers a gate finding. A new test is one `type: perturb` with a
     `set:` of targets (what is moved, how, to what; format and targets in
     `toolkit/spec/perturb.py`); the older type names still work and compile to it.
-    **Wiring.** The analysis moves every input the spec declares as varying (sensitivity
-    ranges and cost items, drawn priors and scenario values, fitted and calibrated
-    parameters, decision-test inputs) to each end of its range and checks that it moves at
-    least one declared outcome or cost (`toolkit/analysis/wiring.py`, `analysis/wiring.yaml`).
-    An input that moves nothing, moves less than the engine's own noise, or (on the emulator
-    path) moves the emulator too little to show the engine reads it, gets an
-    `input_not_wired` finding. The check is advisory for now: the finding is MEDIUM and
-    never fails a run, and it is marked `would_block` so that false positives can be counted.
-    Only when the input is deliberately inert in this run, declare
-    `analysis.wiring_exempt: {parameters | cost_items | burden_anchors | decision_tests:
-    {<name>: <reason>}}`, using the name wiring.yaml gives it under its own kind. The results
-    list every exemption with its reason, including unused ones. Fix a dead input; do not
-    exempt it.
 11. **Deliverable.** The allocation file and its column names, and the headline output name
     the question asks for. When the question asks for the options that maximise an *expected*
     outcome over an uncertain input, write `deliverable.plan: expected_value`: the plan with the
     best mean over the uncertainty draws, per-unit means in the file and a mean claim
-    (`toolkit/analysis/plan_rule.py`). Without it the plan is solved at the point values. The
-    pre-sign spec critique reads the question's wording: an objective stated in expectation
-    ("minimise expected ...") with the point plan is a MEDIUM on the sign-off sheet
-    (`expected_value_plan`, principle 1). When the spec cannot carry the expected-value plan
-    (the schema lists what it excludes, such as `plan_variants` or `uncertainty.affordability.enforce`), declare that check in
-    `principle_departures` with the reason.
+    (`toolkit/analysis/plan_rule.py`). Without it the plan is solved at the point values.
 12. **Evidence dossier.** Each engine card declares, per component, the unit attributes,
     parameters and card tables its effect depends on (`decision_inputs`, read by
     `toolkit/engines/decision_inputs.py`). When the options use such a component, name the

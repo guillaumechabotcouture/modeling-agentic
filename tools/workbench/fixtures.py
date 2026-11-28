@@ -162,10 +162,9 @@ STAGE_OF = {"decision_spec.yaml": "launch", "data/derived/units.csv": "launch", 
             SHEET: "sign-off", DOSSIER: "sign-off", CHOICE: "sign-off",
             LEDGER: "final", SCOPE: "final", OLD_DECLARED: "final", OLD_GATE: "final", GATES[0]: "final", GATES[1]: "final"}
 HISTORY = [("SPEC", "SIGN", 30, 1.0), ("SIGN", "EVIDENCE", 60, 1.0), ("EVIDENCE", "ENGINE_CHOICE", 70, 1.4),
-           ("ENGINE_CHOICE", "CONFIGURE", 80, 1.8), ("CONFIGURE", "ANALYZE", 90, 2.0), ("ANALYZE", "CRITIQUE", 240, 2.0),
-           ("CRITIQUE", "GATE", 260, 3.0), ("GATE", "WRITE", 270, 3.0), ("WRITE", "PRESENTATION", 290, 3.6),
-           ("PRESENTATION", "FINAL", 300, 3.8)]
-REACHED = {"launch": 1, "sign-off": 4, "calibration": 5, "analysis": 6, "final": 10}   # transitions made by each stage
+           ("ENGINE_CHOICE", "ANALYZE", 90, 2.0), ("ANALYZE", "CRITIQUE", 240, 2.0),
+           ("CRITIQUE", "GATE", 260, 3.0), ("GATE", "WRITE", 270, 3.0), ("WRITE", "FINAL", 300, 3.8)]
+REACHED = {"launch": 1, "sign-off": 3, "calibration": 4, "analysis": 5, "final": 8}   # transitions made by each stage
 # What the Outcomes view (§5.7) reads beside those, and the producers' own words and numbers (X41 holds each to the
 # producer's source): toolkit/analysis/value_of_information.py STATUSES, stability.py's verdicts, burden.py STATUSES and
 # roles, variants.py's statuses, boundary.py's status, red_flag.py SHARE and MIN_UNITS, thresholds.yaml.
@@ -3123,13 +3122,13 @@ def _outcome_words():
         return next(ast.literal_eval(n.value) for n in ast.parse(text).body if isinstance(n, ast.Assign)
                     and any(getattr(t, "id", None) == name for t in n.targets))
     th = yaml.safe_load(source("toolkit", "analysis", "thresholds.yaml"))
-    flag, stab, run = source("toolkit", "analysis", "red_flag.py"), source("toolkit", "analysis", "stability.py"), source("toolkit", "analysis", "run.py")
+    stab, run = source("toolkit", "analysis", "stability.py"), source("toolkit", "analysis", "run.py")
     return {"voi": constant(source("toolkit", "analysis", "value_of_information.py"), "STATUSES"),
             "burden": constant(source("toolkit", "analysis", "burden.py"), "STATUSES"),
             "roles": constant(source("toolkit", "analysis", "burden.py"), "OPTIONAL")["role"],
             "kinds": constant(source("toolkit", "spec", "schema.py"), "DELIVERABLE_KINDS"),
             "criteria": constant(source("toolkit", "analysis", "moves.py"), "CRITERIA"),
-            "dearest": (constant(flag, "SHARE"), constant(flag, "MIN_UNITS")), "th": th,
+            "th": th,
             "quoted": all(f'"{w}"' in stab for w in STABILITY_VERDICTS) and all(f'"{w}"' in source("toolkit", "analysis", "variants.py") for w in VARIANT_STATUSES)
             and '"judged" if n else "not_judged"' in source("toolkit", "analysis", "boundary.py")
             and '"NOT_RUN" if x["status"] == "not_run" else "CHANGES_PLAN" if x["decision_changes"] else "NO_CHANGE"' in run
@@ -3149,7 +3148,7 @@ def _outcomes_cases(tmp, ok):
     w = _outcome_words()
     ok("X41 the status words, verdicts, kinds, criteria and thresholds of the Outcomes files are the producers' own",
        tuple(w["voi"]) == VOI_STATUSES and tuple(w["burden"]) == BURDEN_STATUSES and tuple(w["roles"]) == BURDEN_ROLES
-       and tuple(w["kinds"]) == KINDS and list(w["criteria"]) == list(TEST_THRESHOLDS) and w["dearest"] == (DEAREST_SHARE, DEAREST_MIN_UNITS)
+       and tuple(w["kinds"]) == KINDS and list(w["criteria"]) == list(TEST_THRESHOLDS)
        and w["th"]["stability"] == VALUE_LOSS and w["th"]["burden"]["default_ratio_band"] == BURDEN_BAND
        and (w["th"]["value_of_information"]["min_draws"], w["th"]["value_of_information"]["informative_draws"]) == (VOI_MIN_DRAWS, VOI_INFORMATIVE_DRAWS)
        and w["th"]["emulator"]["boundary_rank_agreement_min"] == BOUNDARY_MIN

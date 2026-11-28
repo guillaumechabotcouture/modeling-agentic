@@ -18,8 +18,7 @@ PRODUCER = "toolkit/analysis/sensitivity.py"
 
 
 def _ranges(A, select: bool = True) -> dict:
-    """{parameter: (lo, hi, basis)}. `select=False`: every range, before the spec's `parameters` list selects
-    (toolkit/analysis/wiring.py checks them all)."""
+    """{parameter: (lo, hi, basis)}. `select=False`: every range, before the spec's `parameters` list selects."""
     sens = A.spec["analysis"].get("sensitivity") or {}
     sel = sens.get("parameters", "fitted")
     out = {}

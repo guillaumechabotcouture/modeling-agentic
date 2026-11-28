@@ -8,7 +8,7 @@
 The parent is never written. The child (`<parent>.amend<k>`, or --out, outside the parent) holds: metadata.json
 with `parent_run` ({run_dir, run_state_sha256}, #311's form), `parent_spec_sha256` and `code_pin`; the patched
 spec and dossier, the parent's inputs and stored batches (never its state, sign-off records, sheet, findings,
-dispositions, critiques, report, figures or analysis outputs); review conditions (W0-G) imported; a regenerated
+dispositions, critiques, report, figures or analysis outputs); a regenerated
 sheet; amendment_record.json (changes by path, spec critique, dry-sign of a scratch copy, reuse report per batch,
 code pin, the owner sign command with the sha256 values in full, the launch and smoke commands); and, written last,
 run_state.json at SIGN, awaiting_signoff. Refused, with no child: a patch that does not apply or changes nothing,
@@ -459,18 +459,6 @@ def reuse(child: str, spec_path: str) -> dict:
     return out
 
 
-def _review_conditions(child: str, parent: str) -> dict:
-    """W0-G (#308): import the spec critique's and the parent's open conditions when its module is on this branch."""
-    mod = os.path.join(ROOT, "toolkit", "spec", "review_conditions.py")
-    if not os.path.isfile(mod):
-        return {"status": "not on this branch (W0-G)"}
-    led = os.path.lexists(os.path.join(parent, "findings.jsonl"))     # a parent stopped before CRITIQUE has none
-    r = subprocess.run([sys.executable, mod, "import", child, "--critique", *(["--parent", parent] if led else [])],
-                       capture_output=True, text=True, timeout=600)
-    return {"status": "imported" if r.returncode == 0 else "failed", "rc": r.returncode,
-            "output": (r.stdout + r.stderr)[-1500:]}
-
-
 def dry_sign(child: str, by: str, expect: dict) -> dict:
     """Sign a scratch copy with the hashes the owner will be shown; the child itself stays unsigned."""
     from toolkit.spec import signoff as SO
@@ -510,11 +498,9 @@ def _pre_sign(rd: str, derived) -> tuple:
     return errs, getattr(b, "candidates", None)
 
 
-def _ready(ds: dict, rc: dict, child: str, mode: str) -> dict:
-    """The dry-sign, failed when the condition import failed or a lead would wait for the owner at SIGN."""
+def _ready(ds: dict, child: str, mode: str) -> dict:
+    """The dry-sign, failed when a lead would wait for the owner at SIGN."""
     from toolkit.spec import geometry as GEO
-    if rc.get("status") == "failed":
-        return dict(ds, ok=False, error=f"review conditions not imported: {rc.get('output', '')[-500:]}")
     pend = GEO.owner_pending(GEO.run(child)) if mode == "lead" else []
     return dict(ds, ok=False, error=f"geometry exceptions wait for the owner: {pend[:5]}") if pend else ds
 
@@ -629,7 +615,7 @@ def amend(parent, patch=None, from_request=False, out=None, signoff=None, repo=R
     write_nofollow(child, "metadata.json", json.dumps(meta, indent=2).encode(), atomic=True)
     rounds = st.get("max_rounds") if type(st.get("max_rounds")) is int and st["max_rounds"] > 0 else 3
     keep = ("question", "gate_mode", "budget_usd", "task_cap_usd", "v2_rules", "derived_inputs",
-            "derive_unsandboxed", "world_model_stages", "acquire", "engine_build_cap_usd", "engine_unsandboxed")
+            "derive_unsandboxed", "acquire", "engine_build_cap_usd", "engine_unsandboxed")
     acq_child = dict(st["acquired"]) if isinstance(st.get("acquired"), dict) and st.get("acquired") else None
     if acq_child is not None:
         acq_child["closed"] = True    # amended child reuses parent's acquired bytes and never re-fetches (§2.4)
@@ -639,7 +625,6 @@ def amend(parent, patch=None, from_request=False, out=None, signoff=None, repo=R
            "paused": "awaiting_signoff", "status": None, "tries": {}, "journal": {},
            "history": [{"at": meta["created"], "from": None, "to": "SIGN",
                         "why": f"amendment {label} of {parent} ({len(changes)} change(s)): {reason1}"[:500]}]}
-    rc = _review_conditions(child, parent)
     _, cands = _pre_sign(child, st.get("derived_inputs"))   # the geometry record and candidates, at the final path
     SO.write_sheet(child, cands)
     expect = {"expect_sha256": _file_sha(child, SPEC), "expect_sheet_sha256": _file_sha(child, SO.SHEET),
@@ -665,7 +650,7 @@ def amend(parent, patch=None, from_request=False, out=None, signoff=None, repo=R
                        if request is not None else None),
            "changes": changes, "spec_sha256": expect["expect_sha256"], "sheet_sha256": expect["expect_sheet_sha256"],
            "derivations_sha256": expect["expect_derivations_sha256"], "spec_critique": _critique(child, spec1),
-           "review_conditions": rc, "dry_sign": _ready(dry_sign(child, mode, expect), rc, child, mode),
+           "dry_sign": _ready(dry_sign(child, mode, expect), child, mode),
            "reuse": reuse(child, os.path.join(child, SPEC)), "code_pin": pin, "signoff": mode, "commands": commands,
            "motivated_by": why}
     rec["run_state"] = cst
@@ -677,7 +662,7 @@ def amend(parent, patch=None, from_request=False, out=None, signoff=None, repo=R
 
 
 def finish(child: str, log=print) -> dict:
-    """A kept child whose dry-sign failed (open review conditions, say): the sheet regenerated with the candidates,
+    """A kept child whose dry-sign failed: the sheet regenerated with the candidates,
     the dry-sign and commands redone, and the run state written once it would sign."""
     from lib.safe_io import read_nofollow, write_nofollow
     from toolkit.spec import signoff as SO
@@ -689,15 +674,13 @@ def finish(child: str, log=print) -> dict:
         raise AmendError(f"{child}: no amendment record to finish ({e})") from None
     if os.path.lexists(os.path.join(child, STATE)):
         raise AmendError(f"{child} already has its run state")
-    rc = _review_conditions(child, rec["parent_run"]["run_dir"])
     errs, cands = _pre_sign(child, cst.get("derived_inputs"))
     if errs:
         raise AmendError("the child fails the pre-sign checks: " + "; ".join(errs[:10]))
     SO.write_sheet(child, cands)
     expect = {"expect_sha256": _file_sha(child, SPEC), "expect_sheet_sha256": _file_sha(child, SO.SHEET),
               "expect_derivations_sha256": _file_sha(child, SO.DERIVATIONS_RECORD)}
-    rec.update(review_conditions=rc, dry_sign=_ready(dry_sign(child, rec["signoff"], expect), rc, child,
-                                                     rec["signoff"]),
+    rec.update(dry_sign=_ready(dry_sign(child, rec["signoff"], expect), child, rec["signoff"]),
                spec_sha256=expect["expect_sha256"], sheet_sha256=expect["expect_sheet_sha256"],
                derivations_sha256=expect["expect_derivations_sha256"])
     rec["commands"]["owner_sign"] = (f"python3 agents/stage_machine.py sign {shlex.quote(child)} --by owner "
@@ -716,7 +699,7 @@ def _print(rec: dict, log) -> None:
         log(f"  {c['op']} {c['file']}:{c['path']}: {short(c['before'])} -> {short(c['after'])}")
     sc, r = rec["spec_critique"], rec["reuse"]
     log(f"Spec critique: {sc.get('high')} HIGH, {sc.get('medium')} MEDIUM, {sc.get('declared')} declared "
-        f"{sc.get('error') or ''}; review conditions: {rec['review_conditions']['status']}")
+        f"{sc.get('error') or ''}")
     log(f"Reuse: {r.get('reusable')} of {r.get('stored')} stored rows reusable {r.get('error') or ''}")
     for b in r.get("batches", []):
         log(f"  {b['out']}: {b['reusable']} reusable, {b['to_compute']} to compute; {b['rule']}: {b['why']}")
@@ -724,7 +707,7 @@ def _print(rec: dict, log) -> None:
     log(f"Code pin: {pin.get('commit')} (clean: {pin.get('clean')}, on a remote: {pin.get('on_remote')})")
     if not ds["ok"]:
         log(f"Dry-sign as {ds['by']} FAILED on a scratch copy: {ds.get('error') or ds.get('status')}\nNo sign command "
-            "and no run state. Open review conditions: dispose of them, then python3 -m toolkit.spec.amend --finish "
+            "and no run state. Resolve the condition, then python3 -m toolkit.spec.amend --finish "
             f"{shlex.quote(rec['child'])}. Otherwise fix the patch and amend again.")
         return
     log(f"Dry-sign as {ds['by']}: a scratch copy signed and verified.")
@@ -785,7 +768,7 @@ def _self_test() -> int:
         for rel in ("report.md", "critique_domain.yaml", "findings.jsonl", "analysis/manifest.json",
                     "analysis/point.yaml", "figures/a.png", "engine_choice.json"):
             w(par, rel, "stale\n")
-        w(par, "findings.jsonl", "")       # a readable ledger with no open finding (review_conditions --parent)
+        w(par, "findings.jsonl", "")       # a readable ledger with no open finding
         w(par, "data/derived.csv", "u,v\n1,2\n")
         os.chmod(os.path.join(par, "data", "derived.csv"), 0o600)
 
@@ -1026,23 +1009,24 @@ def _self_test() -> int:
         os.makedirs(os.path.join(par, "data", "private"))
         w(par, "data/private/x.csv", "a\n")
         os.chmod(os.path.join(par, "data", "private"), 0o700)
-        # a patch that withdraws a declaration: an open review condition, no run state, then --finish
-        yaml.safe_dump({"reason": "r", "spec": [{"remove": "principle_departures[check=baseline_burden]"}]}, open(pf, "w"))
-        rec4 = amend(par, pf, log=lambda *a: None)
+        # a patch whose dry-sign waits for the owner: no run state, then --finish once resolved
+        from toolkit.spec import geometry as _GEO
+        _orig_pend = _GEO.owner_pending
+        _GEO.owner_pending = lambda _rep: ["swap:0+1"]
+        try:
+            yaml.safe_dump({"reason": "r", "spec": [{"set": "constraints.envelope_usd", "value": 9300}]}, open(pf, "w"))
+            rec4 = amend(par, pf, signoff="lead", log=lambda *a: None)
+        finally:
+            _GEO.owner_pending = _orig_pend
         c4 = rec4["child"]
         ok(os.stat(os.path.join(c4, "data", "private")).st_mode & 0o777 == 0o700,
            "AM_DIR_MODE_KEPT a private directory stays private")
         ok(rec4["dry_sign"]["ok"] is False and not os.path.exists(os.path.join(c4, "run_state.json")),
-           f"AM_FAILED_DRY_SIGN_NO_STATE an open condition: no run state, nothing resumes ({rec4['dry_sign']})")
-        rcf = os.path.join(c4, "review_conditions.yaml")
-        rows = yaml.safe_load(open(rcf))
-        for r_ in rows["conditions"]:
-            r_.update(disposition="deferred", owner="owner", due="2099-01-01")
-        yaml.safe_dump(rows, open(rcf, "w"))
+           f"AM_FAILED_DRY_SIGN_NO_STATE an unresolved condition: no run state, nothing resumes ({rec4['dry_sign']})")
         rec5 = finish(c4, log=lambda *a: None)
         ok(rec5["dry_sign"]["ok"] is True and json.load(open(os.path.join(c4, "run_state.json")))["state"] == "SIGN"
            and f"--expect-sheet-sha256 {sha(os.path.join(c4, SO.SHEET))}" in rec5["commands"]["owner_sign"],
-           f"AM_FINISH after the dispositions the child gets its sheet, sign command and run state ({rec5['dry_sign']})")
+           f"AM_FINISH after resolving the condition the child gets its sheet, sign command and run state ({rec5['dry_sign']})")
         shutil.rmtree(c4)
         shutil.rmtree(c2)
     if fails:

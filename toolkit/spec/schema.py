@@ -1281,8 +1281,6 @@ def _validate_pending(s: Spec) -> list[str]:
             dt = PT.view(dt)
         if dt.get("type") not in DECISION_TEST_TYPES:
             bad.append(f"decision test {dt.get('id')}: type {dt.get('type')!r} not in {DECISION_TEST_TYPES}")
-        if any(ch.isdigit() for ch in str(dt.get("text") or "")):
-            bad.append(f"decision test {dt.get('id')}: text must be descriptive, with no numbers")
         if "with" in dt and dt.get("type") != "parameter_value":       # as after the engine choice (Codex r2)
             bad.append(f"decision test {dt.get('id')}: with (companion parameters) is only for a parameter_value "
                        "test")
@@ -1830,7 +1828,7 @@ def _validate_uncertainty(s, pnames) -> list[str]:
 # unsupported signed field cannot silently do nothing
 ANALYSIS_KEYS = {"evaluation", "emulator", "direct", "cost_outputs", "diagnostics", "stability", "sensitivity",
                  "share_threshold", "regret_threshold", "dollars_threshold", "decision_tests", "plan_variants",
-                 "value_of_information", "workers", "outcome_adjustments", "wiring_exempt"}
+                 "value_of_information", "workers", "outcome_adjustments"}
 
 
 def _validate_analysis(s, card, pnames, cols, pk) -> list[str]:
@@ -1848,8 +1846,6 @@ def _validate_analysis(s, card, pnames, cols, pk) -> list[str]:
     bad += _V.validate(s.raw, cols, s.units(), pk, s.uid)
     from toolkit.analysis import value_of_information as _VOI      # F6: analysis.value_of_information
     bad += _VOI.validate(s.raw)
-    from toolkit.analysis import wiring as _WR      # sensitivity wiring: analysis.wiring_exempt {input: reason}
-    bad += _WR.validate(s.raw)
     for name, d in (an.get("diagnostics") or {}).items():
         if (d or {}).get("metric") not in card.outputs.get("windows", []):
             bad.append(f"analysis.diagnostics.{name}: {d!r} is not an engine window metric")
@@ -1902,9 +1898,6 @@ def _validate_analysis(s, card, pnames, cols, pk) -> list[str]:
             continue
         if not str(dt.get("text") or "").strip():
             bad.append(f"decision test {i}: text (the question it answers) is empty")
-        elif any(ch.isdigit() for ch in str(dt["text"])):
-            bad.append(f"decision test {i}: text must be descriptive, with no numbers (Codex P1-4): the values tested "
-                       "and the results are rendered from computed claims")
         if "engine_arm_or" in dt:
             bad.append(f"decision test {i}: engine_arm_or cannot be supplied; arm ratios come from the engine's "
                        "verified benchmark results (Codex P1-13)")
@@ -2943,10 +2936,6 @@ def _self_test() -> int:
            "SP22 a max_units cap and a coverage share: the binding (smaller) limit is kept (Codex P1-2)")
         r["constraints"]["caps"] = {"b": {"max_units": 9}}
         ok(Spec(r, d).alloc_spec()["caps"]["b"]["max_units"] == 6, "SP22b ... whichever is smaller")
-        r = copy.deepcopy(s.raw)
-        r["analysis"]["decision_tests"][0]["text"] = "Does the plan change at an interaction of 2.43?"
-        ok(any("no numbers" in e for e in validate(Spec(r, d))), "SP23 a decision-test text with numbers is refused "
-                                                                 "(Codex P1-4)")
         r = copy.deepcopy(s.raw)
         r["analysis"]["decision_tests"][0]["engine_arm_or"] = {"a11": 0.4, "a10": 0.5, "a01": 0.7}
         ok(any("cannot be supplied" in e for e in validate(Spec(r, d))),

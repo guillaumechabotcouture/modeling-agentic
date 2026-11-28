@@ -41,7 +41,7 @@ HARNESS_FILES = ("run_state.json", "findings.jsonl", "impact_ledger.jsonl", "met
                  "data/input_checks.json", "data/geometry_signoff.json")
 # data/derived/ (v2-derived-inputs): the tables the spec reads are written only by the harness's derivation runner.
 HARNESS_PREFIXES = ("analysis/", "models/pipeline", "gate_r", "fix_plan_r", "evidence/", "data/inputs/", "data/derived/",
-                    "world_model/", "engine_build/", "acquire/")
+                    "engine_build/", "acquire/")
 
 # The owner's decision design principles (2026-11-12): one file, the source of truth, in every task's system prompt.
 PRINCIPLES_FILE = os.path.join(_REPO, ".claude", "orchestration", "decision_design_principles.md")
@@ -49,9 +49,8 @@ PRINCIPLES = open(PRINCIPLES_FILE).read().strip()
 
 def owner_held_note(run_dir: str, reviewer: str) -> str:
     """hb2 fix 3: the critic's own findings the owner (or, under --signoff lead, the lead provisionally) has answered,
-    so it carries each forward under its id instead of re-raising it (malaria R2: D-002 and R-003 were re-raised,
-    reworded, in every round, and asked again each time). The answer binds the finding's id, kind and remedy class
-    (agents/findings_ledger.py answer_fingerprint): rewording keeps it; another remedy class is asked again."""
+    so it carries each forward under its id instead of re-raising it: rewording keeps it; another remedy class is
+    asked again."""
     try:
         from agents import findings_ledger as FL
         # never block on what sits at the ledger's name (a FIFO: CS12); not a regular file: nothing is listed
@@ -146,14 +145,10 @@ to the run directory. When the options use a component whose effect depends on d
 (each engine's decision_inputs.yaml), name the evidence dossier: `evidence: {{dossier:
 evidence_dossier.yaml}}`; do not write the dossier: the harness drafts it after the spec. When the
 question asks to minimise or maximise an expected quantity (an objective stated in expectation), set
-`deliverable.plan: expected_value`; when the spec cannot carry it (the schema says which fields it
-excludes), declare `{{principle: 1, check: expected_value_plan, reason: ...}}` in principle_departures
-with the reason; the sign-off sheet flags the point plan otherwise. When the question specifies a fixed
+`deliverable.plan: expected_value`. When the question specifies a fixed
 already-held supply that must be allocated in full with no unspent remainder, set
-`constraints.envelope_exact: true` (with fixed unit costs, `costs` excluded from uncertainty sources). Three
-rules the check refuses often: a decision test's `text` has no digits (it says in words what the
-test asks; the values tested are rendered from computed claims); nor have the yes, no and
-undetermined texts of deliverable.decision.statements (the harness renders the values); and `engine_parameters` gives no
+`constraints.envelope_exact: true` (with fixed unit costs, `costs` excluded from uncertainty sources).
+A rule the check refuses often: `engine_parameters` gives no
 value for a parameter the engine card lists as calibrated or fitted (calibrate a calibrated one
 under `calibration`, or leave it to the engine; a fitted one is set by the engine's own fit: leave
 it out). A rate measured per unit from counts carries sampling error unit by unit: when the engine
@@ -286,15 +281,10 @@ Output: `critique_engine.yaml` and {out} = {{"ok": true}}.""",
 Task: {reviewer} review, round {round}. Review the computed facts: the analysis artifacts in
 analysis/ (manifest.json and the *.yaml artifacts it lists), results.md, uncertainty_report.yaml,
 the deliverable file the spec names, engine_choice.json, decision_spec.yaml, impact_ledger.jsonl
-and the draft (manuscript.md) if it exists. Read world_model/world_model.md first when it exists: the beliefs written
-before the analysis, which ones its outputs refuted, and where to look. For each refuted decision-relevant belief,
-say whether the engine, an input or the belief is wrong. The presentation review also reads findings.jsonl:
-its LOW report_number_typed rows (advisory) name numbers the writer typed instead of [CLAIM:id];
-raise one only if it misleads the reader. Judge what code cannot: plausibility against the domain, whether the
+and the draft (manuscript.md) if it exists. Judge what code cannot: plausibility against the domain, whether the
 comparator and the objective match the question, hidden assumptions, overclaims. Write
 {file} in the critique-blockers schema: reviewer: {reviewer} (this literal value), round: {round}, verdict (PASS | REVISE),
-structural_mismatch {{detected: bool}}, carried_forward (round 1: []), checklist (the domain and red-team
-reviews only: the checklist below), blockers (ids {prefix}-NNN, this prefix;
+structural_mismatch {{detected: bool}}, carried_forward (round 1: []), blockers (ids {prefix}-NNN, this prefix;
 each with id, severity ({severities}), category ({categories}), target_stage ({stages}),
 first_seen_round, claim, evidence, fix_requires (when the fix needs the signed decision_spec.yaml changed, start it
 with "Owner amendment:": the owner decides it, no task can), resolved (true/false), and done_when (required for
@@ -336,458 +326,423 @@ Output: {out} = {{"ok": true, "changed": "<one line>"}}.""",
 Task: write manuscript.md ({mode}). Read results.md and the analysis artifacts in analysis/
 (manifest.json lists them), engine_choice.json, decision_spec.yaml and scope_declaration.yaml if
 present. Write the narrative, the methods and the
-interpretation. The harness appends the world-model section (world_model/world_model.md) to the report: refer to
-it in words where it helps, never copy its numbers. Write every number as a reference [CLAIM:<id>] to models/claims_ledger.yaml
+interpretation. Write every number as a reference [CLAIM:<id>] to models/claims_ledger.yaml
 (the ids are listed there): the harness substitutes the value. Never type a number, and never write
 a bare id such as `mix.itn`: the gate refuses a report that shows one. Mode `not_accepted`: the first section is "Status: not accepted by the final
 gate", listing the open blocking findings from findings.jsonl in plain words. Mode `declared`: a
-Limitations section that repeats each declaration in full with its required remedy. In both modes the
-report was not accepted: never call it accepted, validated or conclusive (the terms are listed in
-.claude/orchestration/acceptance_language.yaml; the gate flags them). Output: manuscript.md and {out} = {{"ok": true}}.""",
+Limitations section that repeats each declaration in full with its required remedy. Output: manuscript.md and {out} = {{"ok": true}}.""",
 }
-from toolkit.analysis import belief_table as _BT  # noqa: E402 -- the decision-run seed format, documented there
-SEED_FILE = "world_model_seed.yaml"       # the harness validates it and copies it to analysis/world_model_seed.yaml
-WORLD_MODEL_PY = os.path.join(_REPO, "toolkit", "analysis", "world_model.py")
-
-
-def seed_prompt_text() -> str:
-    """The world model's own documentation of its seed format and tests, read from toolkit/analysis/world_model.py's
-    docstring (from "Seed (YAML)" up to the paragraph on analysis/point.yaml), so the prompt never restates the
-    format. Missing markers fail closed."""
-    import ast
-    doc = ast.get_docstring(ast.parse(open(WORLD_MODEL_PY).read())) or ""
-    a, b = doc.find("Seed (YAML)"), doc.find("analysis/point.yaml is used only")
-    if a < 0 or b <= a:
-        raise RuntimeError(f"{WORLD_MODEL_PY}: its docstring no longer documents the seed format where expected")
-    common = COMMON.replace("{{", "{").replace("}}", "}")          # COMMON is a .format template: as delivered
-    return (common + """
-
-Task: write the world model's version 0 for this question, before any simulation: the modeller's working
-understanding of how the decision works, meant to be mostly right, not precise. {out_in} holds the question, the
-decision spec's options (each package and its components, the comparator, the primary outcome), the engine's card
-(mechanisms, components, notes) and the sweep the harness runs after you finish: its design features (the only
-names your tests may use), their ranges, the number of design points, which features the design samples
-independently of the others, and whether a shadow price and an optimised plan will exist. No results exist yet,
-and the harness refuses any read of analysis/ or of other runs: nothing you write can depend on a simulation
-output. The spec's values, the engine's effect values and priors and the input data values are withheld on
-purpose: the world model is built from literature and reasoning, then confronted with the simulation, never with its
-own inputs. In the run directory only {out_in} and your own seed file are readable; the repository's code and
-documentation (toolkit/, docs/, .claude/) are readable, its data/ and scripts/ are not.
-
-Write """ + SEED_FILE + """ in the world model's format, documented below by toolkit/analysis/world_model.py itself:
-- beliefs: the mechanisms that drive this decision, each with its direction, a rough magnitude band on a stated
-  scale (a band, never a point value), the conditions or branching points where the answer changes, roughly
-  located, its basis (literature: the citation and its table or page; data: a dataset of the run listed in
-  {out_in}, its file and column, never a file the harness writes such as {out_in}) and your confidence. Mark decision_relevant: true on the beliefs the choice turns on. Cite only
-  sources you know, with authors, journal and year; when unsure of a value or a location say so and set confidence
-  low; never invent a citation or a table.
-- open_questions: what is unknown and would change the choice if known.
-- hypotheses: 5 to 8, each tied to one belief and with a machine-checkable refutation test of one of the kinds
-  below, with explicit thresholds, naming only the packages and features listed in {out_in}. Each states what you
-  expect the sweep to show and what would refute it. Choose each threshold from the belief, never to make the
-  test easy to pass. Give every band as tight as the cited evidence supports: a band wider than the plausible
-  range makes its test lenient (it passes whatever the simulation shows), and a lenient test tests nothing.
-  Every literature citation is looked up after you finish (title, first author and year), so cite the paper's
-  title, first author and year exactly.
-- p: every hypothesis also states p, your probability between 0.02 and 0.98 that its claim holds in this sweep.
-  Be calibrated: of claims you give p 0.7, about 7 in 10 should hold. Each outcome is scored against its p.
-  Each claim competes with its alternatives: an effect_direction claim with the other direction and "no material
-  effect", any other claim with "does not hold". An effect_direction hypothesis may also state weights, e.g.
-  {increases: 0.2, decreases: 0.5, no material effect: 0.3}: all three, summing to 1, its own claim's weight equal
-  to p. Without weights the remainder 1 - p is split equally.
-- A feature the sweep does not sample independently (not in independent_features) needs an adjusted test: an
-  effect_direction test on it states adjust_for (the independent features to adjust for); a flip_in test uses an
-  independent feature. Refused otherwise.
-- When {out_in} carries prior_world_model (earlier questions' belief tables), start from it. Each claim set lists
-  its competing claims, their prior, engine and world weights, and its evidence log: one row per simulation result,
-  with the claim it favours, a likelihood ratio (10 for a decided test, at most 2 for an undecided one leaning toward
-  the sign of its estimate) and the observed rho, interval and p, including inconclusive results. check_items name
-  where our simulations and the literature disagree. Carry forward what held, weigh what leaned, revise what was
-  refuted (never repeat a refuted claim unless this question's setting differs, and then say how), and turn open
-  questions and check items into claims this sweep can test. The harness registers the
-  hypotheses before the sweep runs (you do not write registered_at).
-
-""" + doc[a:b].strip() + """
-
-Then write {out} = {"ok": true, "notes": "<one line: what drives the choice, in your view>"}.
-
-A decision run instead of a sweep: when {out_in} carries decision_run, the harness will not run a sweep; it runs a
-full decision analysis (named in decision_run: its options, comparator, plan variants, decision tests and the
-outputs it writes) and scores your beliefs against those outputs. Then ignore the sweep, the tests and the 5 to 8
-hypotheses above and write """ + SEED_FILE + """ in the belief table's decision-run format (toolkit/analysis/
-belief_table.py), with as many beliefs as decision_run.beliefs states and at least one per topic in
-decision_run.topics. Each belief is your forecast of what that analysis will show, as competing claims with
-weights: be calibrated, reason from the literature and from how the engine works (its card and code are readable),
-and set the weights from that reasoning, never to hedge every belief toward an even split. When
-decision_run.claims lists each topic's claims (a v2 run), write exactly one belief per topic whose claims are exactly
-those sentences, and set their weights: never add, drop or reword a claim (the harness scores them by code).
-
-""" + _BT.DECISION_SEED_FORMAT + """""")
-
-
-# as a .format template: every brace literal except the two fields the task method fills
-PROMPTS["seed_world_model"] = seed_prompt_text().replace("{", "{{").replace("}", "}}") \
-    .replace("{{out_in}}", "{out_in}").replace("{{out}}", "{out}")
 OWNS = {"acquire": (),
         "draft_spec": ("decision_spec.yaml", "analysis_settings.yaml", "data/derive/", "data/derivations.yaml",
                        "data/README.md"), "pick_engine": (), "plan_fixes": (),
         "critique": (), "critique_engine": ("critique_engine.yaml",),
         "build_reference": ("engine_build/reference/reference.py",),
         "fix": FIX_EDITABLE, "write": ("manuscript.md",),
-        "seed_world_model": (SEED_FILE,),
         # v2 autonomy 1B-ii: the dossier the spec names (draft_evidence(rel=...)); this is the default name
         "draft_evidence": ("evidence_dossier.yaml",)}
 
 
-SEED_RUN_READABLE = ("_task_input.json", SEED_FILE)
-SEED_REPO_READABLE = ("toolkit", "docs", ".claude")
+ENGINE_SECRET_PARTS = ("engine_build/.hidden", "engine_build/hidden_reveal.json", "engine_build/reference")
 
 
-def _seed_read_denied(tool: str, ti: dict, run_dir: str) -> str | None:
-    """Why the world-model seed task may not run this Read, Grep or Glob: the seed exists before any result, so
-    nothing under the run's analysis/ (the batch, the world model, the hypotheses) and nothing in another run is
-    readable, and a search that would reach analysis/ is refused. The repository's code and docs are readable (after
-    the evaluation answer-key rules)."""
-    import glob as _glob
-    why = _search_denied(tool, ti, run_dir)
-    if why:
-        return why
-    root = os.path.realpath(run_dir)
-    target = str(ti.get("file_path") or ti.get("path") or "")
-    base = os.path.realpath(os.path.join(run_dir, os.path.expanduser(target))) if target else root
-    if tool == "Glob" and ti.get("pattern"):
-        pat = str(ti["pattern"]).replace("\\", "/")
-        lit = []
-        for part in pat.split("/"):
-            if _glob.has_magic(part):
-                break
-            lit.append(part)
-        if lit:
-            base = os.path.realpath(os.path.join(base, "/".join(lit)) if not pat.startswith("/") else
-                                    "/" + "/".join(lit).lstrip("/"))
-        if ".." in pat.split("/"):
-            return "the seed task may not search outside its run directory"
-    analysis = os.path.join(root, "analysis")
-    if _within(base, analysis):
-        return "the world-model seed is written before any result: analysis/ is not readable"
-    if not _within(base, root) and _in_or_reaches_run(base, tool):     # v2 runs' seeds sit in world_model/seed/
-        return "the seed task may not read any run directory: runs' inputs and outputs are withheld"
-    repo = os.path.realpath(_REPO)
-    if not _within(base, root) and _within(base, repo) and not _within(root, base):
-        # the repository's code and documentation only: no run, no template, no input data, no driver files
-        rel = os.path.relpath(base, repo).replace(os.sep, "/")
-        if rel.split("/")[0] not in SEED_REPO_READABLE:
-            return (f"the seed task may read the repository's {', '.join(SEED_REPO_READABLE)} only: inputs, "
-                    "templates and runs are withheld")
-        return None
-    if not _within(base, root):
-        return "the seed task may read only its run directory's input and the repository's code"
-    rel = os.path.relpath(base, root).replace(os.sep, "/")
-    if rel not in SEED_RUN_READABLE:
-        return (f"in the run directory the seed task reads only {', '.join(SEED_RUN_READABLE)}: the spec's values and "
-                "the input data are withheld (the world model is confronted with the simulation, never its inputs)")
-    return None
+class PathPolicy:
+    """Unified read/write path confinement for every v2 SDK task (T1-B2-5, T2-E4):
+    - read isolation for evals/_truth answer keys, engine_build secrets/reference, other runs/trees,
+      and acquire/ and raw acquired data;
+    - write isolation to task-owned paths within run_dir (refusing harness files and cross-task artifacts)."""
 
+    ENGINE_SECRET_PARTS = ENGINE_SECRET_PARTS
+    _ENGINE_OWN_RE = re.compile(r"^models/ext/engine_([a-z0-9_]{3,24})/?$")
+    _ACQ_CARD_RE = re.compile(r"^toolkit/engines/[A-Za-z0-9_.-]+/card\.yaml$")
 
-def _in_or_reaches_run(base: str, tool: str, limit: int = 20000) -> bool:
-    """Is `base` inside a run (an ancestor holds run_state.json), or does a search from it reach one? Fail closed
-    past `limit` entries (Codex review: another run under the repository's docs/ or .claude/ was readable)."""
-    RUN_MARKERS = _sio().RUN_MARKERS               # v1 runs carry only metadata.json (Codex re-review)
-    marks = ("run_state.json",) + tuple(RUN_MARKERS)
-    up = base
-    while up != os.path.dirname(up):
-        if any(os.path.lexists(os.path.join(up, x)) for x in marks):
+    @staticmethod
+    def within(p: str, root: str) -> bool:
+        p, root = os.path.normcase(p).lower(), os.path.normcase(root).lower()
+        return p == root or p.startswith(root.rstrip(os.sep) + os.sep)
+
+    @classmethod
+    def has_symlink_component(cls, raw_path: str, anchor: str) -> bool:
+        """True when `raw_path` itself or any path component between `anchor` and `raw_path` is a symlink."""
+        cur = os.path.normpath(os.path.abspath(raw_path))
+        anc = os.path.normpath(os.path.abspath(anchor))
+        if os.path.islink(cur):
             return True
-        up = os.path.dirname(up)
-    n = 0
-    for _r, dirs, files in (os.walk(base) if tool in ("Grep", "Glob") and os.path.isdir(base) else ()):
-        n += len(dirs) + len(files)
-        if any(x in files for x in marks) or n > limit:
-            return True
-    return False
-
-
-def _answer_key(target: str, run_dir: str) -> bool:
-    """A path into the repository's evals/ tree or any _truth directory. data/evals/<q>/ (the
-    questions' public inputs) is readable."""
-    low = target.replace("\\", "/").lower()
-    if "_truth" in low.split("/"):
-        return True
-    p = os.path.realpath(os.path.join(run_dir, os.path.expanduser(target)))
-    if "_truth" in p.replace(os.sep, "/").lower().split("/"):
-        return True                                    # a link resolving into an answer-key tree
-    rel = os.path.relpath(p, enforcement.REPO_ROOT).replace(os.sep, "/").lower()   # case-insensitive filesystems
-    return rel == "evals" or rel.startswith("evals/") or low.lstrip("./").startswith("evals/")
-
-
-def _reaches_answer_keys(base: str, limit: int = 20000) -> bool:
-    """Does a recursive search from `base` reach an answer key: a _truth directory or file, an evals/
-    tree, or a symlink resolving into one? Fail closed past `limit` entries."""
-    n = 0
-    for root, dirs, files in os.walk(base, followlinks=False):
-        for name in dirs + files:
-            n += 1
-            if n > limit:
+        if not cls.within(cur, anc):
+            return False
+        rel = os.path.relpath(cur, anc)
+        if rel in (".", ""):
+            return False
+        walk = anc
+        for part in rel.split(os.sep):
+            walk = os.path.join(walk, part)
+            if os.path.islink(walk):
                 return True
-            full = os.path.join(root, name)
-            if name.lower() == "_truth" or _answer_key(full, base):
-                return True
-            if os.path.islink(full) and _answer_key(os.path.realpath(full), base):
-                return True
-    return False
+        return False
 
-
-def _within(p: str, root: str) -> bool:
-    p, root = os.path.normcase(p).lower(), os.path.normcase(root).lower()   # case-insensitive filesystems
-    return p == root or p.startswith(root.rstrip(os.sep) + os.sep)
-
-
-def _search_denied(tool: str, ti: dict, run_dir: str) -> str | None:
-    """Why a Read, Grep or Glob may not run. A path or pattern naming the evaluation tree is refused;
-    so is any search whose root contains the repository's evals/ tree (a Grep at the repository root
-    reaches evals/**/_truth whatever its pattern), unless the search is confined to the run directory
-    or data/."""
-    import glob as _glob
-    target = str(ti.get("file_path") or ti.get("path") or "")
-    pattern = str(ti.get("pattern") or "") if tool == "Glob" else ""
-    filters = [str(ti.get(k) or "") for k in ("glob", "type")] + ([pattern] if pattern else [])
-    if (target and _answer_key(target, run_dir)) or any(f and ("_truth" in f.lower() or _answer_key(f, run_dir))
-                                                          for f in filters):
-        return "evaluation answer keys are not readable"
-    if tool == "Read":
-        return None
-    base = os.path.realpath(os.path.join(run_dir, os.path.expanduser(target))) if target else os.path.realpath(run_dir)
-    if tool == "Glob" and pattern:
-        # A pattern can climb or be absolute: its literal prefix is part of the search root.
+    @staticmethod
+    def _glob_resolve(base: str, pattern: str) -> str:
+        import glob as _glob
         lit = []
         for part in pattern.replace("\\", "/").split("/"):
             if _glob.has_magic(part):
                 break
             lit.append(part)
         prefix = "/".join(lit)
-        if prefix:
-            base = os.path.realpath(os.path.join(base, prefix) if not pattern.startswith("/") else "/" + prefix.lstrip("/"))
-    repo = os.path.realpath(enforcement.REPO_ROOT)
-    evals = os.path.join(repo, "evals")
-    confined = _within(base, os.path.realpath(run_dir)) or _within(base, os.path.join(repo, "data"))
-    if not confined and _within(evals, base):
-        return (f"{tool} from {base} would search the evaluation tree (evals/); confine it to the run directory "
-                "or data/")
-    if os.path.isdir(base) and _reaches_answer_keys(base):
-        return f"{tool} from {base} can reach an answer-key file (a _truth tree or a link to one)"
-    return None
+        if not prefix:
+            return base
+        return os.path.realpath(os.path.join(base, prefix) if not pattern.startswith("/") else "/" + prefix.lstrip("/"))
 
+    @classmethod
+    def _extract_inputs(cls, tool: str, ti: dict, run_dir: str) -> tuple[str, str, str, list[str], str, str]:
+        root = os.path.realpath(run_dir)
+        target = str(ti.get("file_path") or ti.get("path") or "")
+        pattern = str(ti.get("pattern") or "") if tool == "Glob" else ""
+        filters = [str(ti.get(k) or "") for k in ("glob", "type")] + ([pattern] if pattern else [])
+        raw_target = os.path.join(run_dir, os.path.expanduser(target)) if target else run_dir
+        base = os.path.realpath(raw_target) if target else root
+        if tool == "Glob" and pattern:
+            base = cls._glob_resolve(base, pattern)
+        return root, target, pattern, filters, raw_target, base
 
-ENGINE_SECRET_PARTS = ("engine_build/.hidden", "engine_build/hidden_reveal.json", "engine_build/reference")
-
-
-def _engine_secret_path(path_str: str) -> bool:
-    low = path_str.replace("\\", "/").lower()
-    return any(seg in low for seg in ENGINE_SECRET_PARTS) or "/.hidden/" in low or low.endswith("/.hidden")
-
-
-def _outside_runs_tree(base: str, root: str, tool: str = "Read", limit: int = 20000) -> bool:
-    """True when `base` lies outside `root` (the current run dir) and inside or able to reach ANY
-    other run directory or `runs/` tree (docs/design/agent-built-engines.md §3.1, BE21)."""
-    if _within(base, root):
-        return False
-    parts = [p.lower() for p in base.replace("\\", "/").split("/") if p]
-    if "runs" in parts:
-        return True
-    RUN_MARKERS = _sio().RUN_MARKERS
-    marks = ("run_state.json",) + tuple(RUN_MARKERS)
-    up = base
-    while up != os.path.dirname(up):
-        if any(os.path.lexists(os.path.join(up, x)) for x in marks):
+    @staticmethod
+    def answer_key(target: str, run_dir: str) -> bool:
+        """A path into the repository's evals/ tree or any _truth directory. data/evals/<q>/ (public inputs) is readable."""
+        low = target.replace("\\", "/").lower()
+        if "_truth" in low.split("/"):
             return True
-        up = os.path.dirname(up)
-    if tool in ("Grep", "Glob") and os.path.isdir(base):
+        p = os.path.realpath(os.path.join(run_dir, os.path.expanduser(target)))
+        if "_truth" in p.replace(os.sep, "/").lower().split("/"):
+            return True
+        rel = os.path.relpath(p, enforcement.REPO_ROOT).replace(os.sep, "/").lower()
+        return rel == "evals" or rel.startswith("evals/") or low.lstrip("./").startswith("evals/")
+
+    @classmethod
+    def reaches_answer_keys(cls, base: str, limit: int = 20000) -> bool:
+        """Does a recursive search from `base` reach a _truth directory/file, evals/ tree, or symlink to one?"""
         n = 0
-        for cur, dirs, files in os.walk(base, followlinks=False):
-            cur_real = os.path.realpath(cur)
-            if _within(cur_real, root):
-                dirs[:] = []
-                continue
+        for root, dirs, files in os.walk(base, followlinks=False):
+            for name in dirs + files:
+                n += 1
+                if n > limit:
+                    return True
+                full = os.path.join(root, name)
+                if name.lower() == "_truth" or cls.answer_key(full, base):
+                    return True
+                if os.path.islink(full) and cls.answer_key(os.path.realpath(full), base):
+                    return True
+        return False
+
+    @staticmethod
+    def in_or_reaches_run(base: str, tool: str, limit: int = 20000) -> bool:
+        """Is `base` inside a run (an ancestor holds run_state.json or RUN_MARKERS), or does a search reach one?"""
+        marks = ("run_state.json",) + tuple(_sio().RUN_MARKERS)
+        up = base
+        while up != os.path.dirname(up):
+            if any(os.path.lexists(os.path.join(up, x)) for x in marks):
+                return True
+            up = os.path.dirname(up)
+        n = 0
+        for _r, dirs, files in (os.walk(base) if tool in ("Grep", "Glob") and os.path.isdir(base) else ()):
             n += len(dirs) + len(files)
             if any(x in files for x in marks) or n > limit:
                 return True
-            for d in list(dirs):
-                full = os.path.join(cur, d)
-                if os.path.islink(full):
-                    target_real = os.path.realpath(full)
-                    if not _within(target_real, root) and _in_or_reaches_run(target_real, "Read"):
-                        return True
-    return False
+        return False
 
+    @classmethod
+    def outside_runs_tree(cls, base: str, root: str, tool: str = "Read", limit: int = 20000) -> bool:
+        """True when `base` lies outside `root` and inside or able to reach ANY other run directory or `runs/` tree."""
+        if cls.within(base, root):
+            return False
+        parts = [p.lower() for p in base.replace("\\", "/").split("/") if p]
+        if "runs" in parts:
+            return True
+        marks = ("run_state.json",) + tuple(_sio().RUN_MARKERS)
+        up = base
+        while up != os.path.dirname(up):
+            if any(os.path.lexists(os.path.join(up, x)) for x in marks):
+                return True
+            up = os.path.dirname(up)
+        if tool in ("Grep", "Glob") and os.path.isdir(base):
+            n = 0
+            for cur, dirs, files in os.walk(base, followlinks=False):
+                cur_real = os.path.realpath(cur)
+                if cls.within(cur_real, root):
+                    dirs[:] = []
+                    continue
+                n += len(dirs) + len(files)
+                if any(x in files for x in marks) or n > limit:
+                    return True
+                for d in list(dirs):
+                    full = os.path.join(cur, d)
+                    if os.path.islink(full):
+                        target_real = os.path.realpath(full)
+                        if not cls.within(target_real, root) and cls.in_or_reaches_run(target_real, "Read"):
+                            return True
+        return False
 
-_ENGINE_OWN_RE = re.compile(r"^models/ext/engine_([a-z0-9_]{3,24})/?$")
+    @classmethod
+    def engine_secret_path(cls, path_str: str) -> bool:
+        low = path_str.replace("\\", "/").lower()
+        return any(seg in low for seg in cls.ENGINE_SECRET_PARTS) or "/.hidden/" in low or low.endswith("/.hidden")
 
+    @classmethod
+    def engine_id_from_owns(cls, owns: tuple) -> str | None:
+        """Extract the sole built-engine id owned by a `build_engine` task from its `owns` tuple (else None)."""
+        found = {m.group(1) for o in (owns or ()) for m in (cls._ENGINE_OWN_RE.match(str(o)),) if m}
+        return next(iter(found)) if len(found) == 1 else None
 
-def _engine_id_from_owns(owns: tuple) -> str | None:
-    """Extract the sole built-engine id owned by a `build_engine` task from its `owns` tuple (else None)."""
-    found = {m.group(1) for o in (owns or ()) for m in (_ENGINE_OWN_RE.match(str(o)),) if m}
-    return next(iter(found)) if len(found) == 1 else None
-
-
-def _declared_dossier_rel(run_dir: str) -> str:
-    """Resolve `evidence.dossier` from `decision_spec.yaml` when strictly inside `run_dir` (and never a secret path);
-    fall back to `'evidence_dossier.yaml'`."""
-    import yaml as _yaml
-    default = "evidence_dossier.yaml"
-    try:
-        raw, st = _sio().read_nofollow(run_dir, "decision_spec.yaml")
-        if st.st_nlink > 1:
-            return default
-        spec = _yaml.safe_load(raw.decode("utf-8"))
-    except Exception:  # noqa: BLE001
-        return default
-    if not isinstance(spec, dict):
-        return default
-    ev = spec.get("evidence")
-    doss = ev.get("dossier") if isinstance(ev, dict) else None
-    if not isinstance(doss, str) or not doss.strip() or os.path.isabs(doss):
-        return default
-    root = os.path.realpath(run_dir)
-    cand = os.path.realpath(os.path.join(root, doss.strip()))
-    if not _within(cand, root) or cand == root:
-        return default
-    rel = os.path.relpath(cand, root).replace(os.sep, "/")
-    if _engine_secret_path(rel) or _engine_secret_path(cand):
-        return default
-    return rel
-
-
-def _engine_read_denied(tool: str, ti: dict, run_dir: str, kind: str | None = None,
-                        engine_id: str | None = None) -> str | None:
-    """Read/search isolation rule for EVERY v2 task kind (docs/design/agent-built-engines.md §3.1, BE21):
-    - applies _search_denied first (answer keys & evals/);
-    - refuses engine_build/.hidden/, engine_build/hidden_reveal.json, and engine_build/reference/ (and symlinks/globs);
-    - refuses reading/searching outside the current run dir into any other run directory or `runs/` tree;
-    - for `build_engine`, restricts reads to its explicit allowlist."""
-    import glob as _glob
-    why = _search_denied(tool, ti, run_dir)
-    if why:
-        return why
-    root = os.path.realpath(run_dir)
-    target = str(ti.get("file_path") or ti.get("path") or "")
-    pattern = str(ti.get("pattern") or "") if tool == "Glob" else ""
-    filters = [str(ti.get(k) or "") for k in ("glob", "type")] + ([pattern] if pattern else [])
-    ref_self = False
-    if kind == "build_reference":
-        # Allow build_reference to read ONLY its own engine_build/reference/reference.py; keep .hidden/ and
-        # hidden_reveal.json refused for every task.
-        cand_p = os.path.realpath(os.path.join(run_dir, os.path.expanduser(target))) if target else root
-        ref_file = os.path.realpath(os.path.join(root, "engine_build", "reference", "reference.py"))
-        ref_self = (tool == "Read" and bool(target) and cand_p == ref_file)
-    if not ref_self and ((target and _engine_secret_path(target)) or any(f and _engine_secret_path(f) for f in filters)):
-        return "engine_build/.hidden, hidden_reveal.json, and reference/ are not readable by any task"
-    base = os.path.realpath(os.path.join(run_dir, os.path.expanduser(target))) if target else root
-    if tool == "Glob" and pattern:
-        lit = []
-        for part in pattern.replace("\\", "/").split("/"):
-            if _glob.has_magic(part):
-                break
-            lit.append(part)
-        if lit:
-            base = os.path.realpath(os.path.join(base, "/".join(lit)) if not pattern.startswith("/")
-                                    else "/" + "/".join(lit).lstrip("/"))
-    if not ref_self and _engine_secret_path(base):
-        return "engine_build/.hidden, hidden_reveal.json, and reference/ are not readable by any task"
-    if _outside_runs_tree(base, root, tool):
-        return f"{tool} outside the current run directory into another run ({base}) is refused"
-    # A Grep/Glob inside the run dir that targets engine_build/ directly could reach .hidden/ or reference/
-    if tool in ("Grep", "Glob") and _within(base, root):
-        eb = os.path.join(root, "engine_build")
-        if _within(eb, base) or base == eb:
-            for sub in (".hidden", "reference", "hidden_reveal.json"):
-                if os.path.lexists(os.path.join(eb, sub)) and not _within(base, os.path.join(eb, "try")):
-                    return f"{tool} from {base} would reach engine_build/{sub}"
-    if kind == "build_reference":
-        repo = os.path.realpath(_REPO)
-        if _within(base, root):
-            rel = os.path.relpath(base, root).replace(os.sep, "/")
-            doss_rel = _declared_dossier_rel(run_dir)
-            allowed_ref = (
-                rel in ("decision_spec.yaml", "evidence_dossier.yaml", doss_rel, "_task_input.json",
-                        "engine_build/request.json", "engine_build/reference/reference.py")
-                or rel.startswith(("data/derived/", "data/inputs/acquired/_views/"))
-            )
-            if not allowed_ref:
-                return (f"build_reference may not read {rel} (works only from request, spec, dossier, schema views, "
-                        "and its own reference.py; candidate code and snapshots are withheld)")
-        elif _within(base, repo):
-            rel = os.path.relpath(base, repo).replace(os.sep, "/")
-            if rel not in ("toolkit/engines/contract.py", "toolkit/engines/built/oracles.py"):
-                return f"build_reference may read only toolkit/engines/contract.py and built/oracles.py in the repo, not {rel}"
-        else:
-            return f"build_reference may not read {base} outside the run directory and contract/oracles"
-    if kind == "build_engine":
-        repo = os.path.realpath(_REPO)
-        if _within(base, root):
-            rel = os.path.relpath(base, root).replace(os.sep, "/")
-            doss_rel = _declared_dossier_rel(run_dir)
-            work_ok = (
-                bool(engine_id)
-                and (rel == f"models/ext/engine_{engine_id}" or rel.startswith(f"models/ext/engine_{engine_id}/"))
-            )
-            allowed_run = (
-                rel in ("decision_spec.yaml", "evidence_dossier.yaml", doss_rel, "_task_input.json",
-                        "engine_build/request.json")
-                or rel.startswith(("engine_build/try/", "data/derived/", "data/inputs/acquired/_views/"))
-                or work_ok
-            )
-            if not allowed_run:
-                return f"build_engine may not read {rel} (only request, spec, dossier, schema views, try/, and its working copy)"
-        elif _within(base, repo):
-            rel = os.path.relpath(base, repo).replace(os.sep, "/")
-            if not (rel.startswith(("toolkit/engines/", ".claude/skills/starsim-dev")) or rel == "toolkit/engines"):
-                return f"build_engine may read only toolkit/engines/ and .claude/skills/starsim-dev*/ in the repo, not {rel}"
-        else:
-            # Allow installed starsim package source only outside run/repo
-            try:
-                import starsim as _ss
-                ss_dir = os.path.realpath(os.path.dirname(_ss.__file__))
-            except Exception:  # noqa: BLE001
-                ss_dir = None
-            if not (ss_dir and _within(base, ss_dir)):
-                return f"build_engine may not read {base} outside the run directory and allowed library sources"
-    return None
-
-
-def _allowed(path: str, run_dir: str, owns: tuple, kind: str | None = None) -> str | None:
-    p = os.path.realpath(os.path.join(run_dir, path))
-    root = os.path.realpath(run_dir)
-    if not p.startswith(root + os.sep):
-        return "outside the run directory"
-    rel = os.path.relpath(p, root).replace(os.sep, "/")
-    low = rel.lower()
-    ref_write_ok = (kind == "build_reference" and rel == "engine_build/reference/reference.py")
-    if not ref_write_ok and (
-        low in {h.lower() for h in HARNESS_FILES} or low.startswith(tuple(h.lower() for h in HARNESS_PREFIXES))
-    ):
-        return f"{rel} is written by the harness"
-    if low.startswith("models/ext/engine_") and kind != "build_engine":
-        return f"{rel} is an agent-built engine working copy: only build_engine may write models/ext/engine_*"
-    if kind == "build_engine" and low.startswith("models/ext/engine_"):
-        from toolkit.engines.built import snapshot as BSNAP
-        parts = rel.split("/")
-        if len(parts) != 4 or not BSNAP._allowed_filename(parts[3]):
-            return (f"{rel} is not an allowed built-engine file (write only top-level engine.py, sibling .py helpers, "
-                    "card.yaml, or ENGINE_NOTES.md inside models/ext/engine_<id>/)")
-    if os.path.exists(p):
+    @classmethod
+    def declared_dossier_rel(cls, run_dir: str) -> str:
+        """Resolve `evidence.dossier` from `decision_spec.yaml` when strictly inside `run_dir` (never a secret path)."""
+        import yaml as _yaml
+        default = "evidence_dossier.yaml"
         try:
-            if os.path.isfile(p) and os.stat(p).st_nlink > 1:
-                return f"{rel} is a hard link"
-            for h in HARNESS_FILES:
-                hp = os.path.join(root, h)
-                if os.path.exists(hp) and os.path.samefile(hp, p):
-                    return f"{rel} is the harness file {h}"
-        except OSError:
-            return f"{rel} cannot be checked"
-    # what the task owns matches as written (Codex r3 on #341, P1-2): a case variant of an owned path is another file
-    if low == OUT.lower() or any(rel.startswith(o) for o in owns if o.endswith("/")) or rel in owns:
+            raw, st = _sio().read_nofollow(run_dir, "decision_spec.yaml")
+            if st.st_nlink > 1:
+                return default
+            spec = _yaml.safe_load(raw.decode("utf-8"))
+        except Exception:  # noqa: BLE001
+            return default
+        if not isinstance(spec, dict):
+            return default
+        ev = spec.get("evidence")
+        doss = ev.get("dossier") if isinstance(ev, dict) else None
+        if not isinstance(doss, str) or not doss.strip() or os.path.isabs(doss):
+            return default
+        root = os.path.realpath(run_dir)
+        cand = os.path.realpath(os.path.join(root, doss.strip()))
+        if not cls.within(cand, root) or cand == root:
+            return default
+        rel = os.path.relpath(cand, root).replace(os.sep, "/")
+        if cls.engine_secret_path(rel) or cls.engine_secret_path(cand):
+            return default
+        return rel
+
+    @classmethod
+    def search_denied(cls, tool: str, ti: dict, run_dir: str) -> str | None:
+        """Refuse paths/patterns/roots reaching evals/ or _truth answer keys unless confined to run_dir or data/."""
+        root, target, _pat, filters, _rt, base = cls._extract_inputs(tool, ti, run_dir)
+        if (target and cls.answer_key(target, run_dir)) or any(
+            f and ("_truth" in f.lower() or cls.answer_key(f, run_dir)) for f in filters
+        ):
+            return "evaluation answer keys are not readable"
+        if tool == "Read":
+            return None
+        repo = os.path.realpath(enforcement.REPO_ROOT)
+        evals = os.path.join(repo, "evals")
+        confined = cls.within(base, root) or cls.within(base, os.path.join(repo, "data"))
+        if not confined and cls.within(evals, base):
+            return (f"{tool} from {base} would search the evaluation tree (evals/); confine it to the run directory "
+                    "or data/")
+        if os.path.isdir(base) and cls.reaches_answer_keys(base):
+            return f"{tool} from {base} can reach an answer-key file (a _truth tree or a link to one)"
         return None
-    return f"this task may write only {', '.join(owns + (OUT,))}"
+
+    @classmethod
+    def engine_read_denied(cls, tool: str, ti: dict, run_dir: str, kind: str | None = None,
+                           engine_id: str | None = None) -> str | None:
+        """Engine/cross-run read isolation for every task kind (answer keys, .hidden/reference, other runs, allowlists)."""
+        why = cls.search_denied(tool, ti, run_dir)
+        if why:
+            return why
+        root, target, pat, filters, _rt, base = cls._extract_inputs(tool, ti, run_dir)
+        if tool in ("Glob", "Grep") and (
+            any(s and ".." in s.replace("\\", "/").split("/") for s in (pat, str(ti.get("glob") or "")))
+            or (target and any(c in target for c in "*?[") and ".." in target.replace("\\", "/").split("/"))
+        ):
+            return f"{tool} pattern with '..' path traversal is refused"
+        ref_self = False
+        if kind == "build_reference":
+            cand_p = os.path.realpath(os.path.join(run_dir, os.path.expanduser(target))) if target else root
+            ref_file = os.path.realpath(os.path.join(root, "engine_build", "reference", "reference.py"))
+            ref_self = (tool == "Read" and bool(target) and cand_p == ref_file)
+        if not ref_self and (
+            (target and cls.engine_secret_path(target)) or any(f and cls.engine_secret_path(f) for f in filters)
+        ):
+            return "engine_build/.hidden, hidden_reveal.json, and reference/ are not readable by any task"
+        if not ref_self and cls.engine_secret_path(base):
+            return "engine_build/.hidden, hidden_reveal.json, and reference/ are not readable by any task"
+        if cls.outside_runs_tree(base, root, tool):
+            return f"{tool} outside the current run directory into another run ({base}) is refused"
+        if tool in ("Grep", "Glob") and cls.within(base, root):
+            eb = os.path.join(root, "engine_build")
+            if cls.within(eb, base) or base == eb:
+                for sub in (".hidden", "reference", "hidden_reveal.json"):
+                    if os.path.lexists(os.path.join(eb, sub)) and not cls.within(base, os.path.join(eb, "try")):
+                        return f"{tool} from {base} would reach engine_build/{sub}"
+        if kind == "build_reference":
+            repo = os.path.realpath(_REPO)
+            if cls.within(base, root):
+                rel = os.path.relpath(base, root).replace(os.sep, "/")
+                doss_rel = cls.declared_dossier_rel(run_dir)
+                allowed_ref = (
+                    rel in ("decision_spec.yaml", "evidence_dossier.yaml", doss_rel, "_task_input.json",
+                            "engine_build/request.json", "engine_build/reference/reference.py")
+                    or rel.startswith(("data/derived/", "data/inputs/acquired/_views/"))
+                )
+                if not allowed_ref:
+                    return (f"build_reference may not read {rel} (works only from request, spec, dossier, schema views, "
+                            "and its own reference.py; candidate code and snapshots are withheld)")
+            elif cls.within(base, repo):
+                rel = os.path.relpath(base, repo).replace(os.sep, "/")
+                if rel not in ("toolkit/engines/contract.py", "toolkit/engines/built/oracles.py"):
+                    return (f"build_reference may read only toolkit/engines/contract.py and built/oracles.py in the repo, "
+                            f"not {rel}")
+            else:
+                return f"build_reference may not read {base} outside the run directory and contract/oracles"
+        if kind == "build_engine":
+            repo = os.path.realpath(_REPO)
+            if cls.within(base, root):
+                rel = os.path.relpath(base, root).replace(os.sep, "/")
+                doss_rel = cls.declared_dossier_rel(run_dir)
+                work_ok = (
+                    bool(engine_id)
+                    and (rel == f"models/ext/engine_{engine_id}" or rel.startswith(f"models/ext/engine_{engine_id}/"))
+                )
+                allowed_run = (
+                    rel in ("decision_spec.yaml", "evidence_dossier.yaml", doss_rel, "_task_input.json",
+                            "engine_build/request.json")
+                    or rel.startswith(("engine_build/try/", "data/derived/", "data/inputs/acquired/_views/"))
+                    or work_ok
+                )
+                if not allowed_run:
+                    return (f"build_engine may not read {rel} (only request, spec, dossier, schema views, try/, and its "
+                            "working copy)")
+            elif cls.within(base, repo):
+                rel = os.path.relpath(base, repo).replace(os.sep, "/")
+                if not (rel.startswith(("toolkit/engines/", ".claude/skills/starsim-dev")) or rel == "toolkit/engines"):
+                    return (f"build_engine may read only toolkit/engines/ and .claude/skills/starsim-dev*/ in the repo, "
+                            f"not {rel}")
+            else:
+                try:
+                    import starsim as _ss
+                    ss_dir = os.path.realpath(os.path.dirname(_ss.__file__))
+                except Exception:  # noqa: BLE001
+                    ss_dir = None
+                if not (ss_dir and cls.within(base, ss_dir)):
+                    return f"build_engine may not read {base} outside the run directory and allowed library sources"
+        return None
+
+    @classmethod
+    def acquire_read_denied(cls, tool: str, ti: dict, run_dir: str) -> str | None:
+        """Read/Glob/Grep confinement for the `acquire` task: ONLY `_task_input.json` and `toolkit/engines/*/card.yaml`."""
+        why = cls.search_denied(tool, ti, run_dir)
+        if why:
+            return why
+        root, target, pattern, _filters, raw_target, base = cls._extract_inputs(tool, ti, run_dir)
+        repo = os.path.realpath(_REPO)
+        if ".." in target.replace("\\", "/").split("/") or ".." in pattern.replace("\\", "/").split("/"):
+            return "acquire: path traversal ('..') is refused"
+        if target and (os.path.islink(raw_target) or cls.has_symlink_component(raw_target, run_dir)
+                       or cls.has_symlink_component(raw_target, _REPO)):
+            return "acquire: reading or searching through a symlink is refused"
+        if cls.within(base, root):
+            rel = os.path.relpath(base, root).replace(os.sep, "/")
+            if rel == "_task_input.json" and tool == "Read":
+                return None
+            if rel == "_task_input.json" and tool in ("Grep", "Glob") and (
+                tool == "Grep" or pattern in ("", "_task_input.json")
+            ):
+                return None
+            return f"acquire: may read only _task_input.json in the run directory (not {rel!r})"
+        if cls.within(base, repo):
+            rel = os.path.relpath(base, repo).replace(os.sep, "/")
+            if tool in ("Read", "Grep") and cls._ACQ_CARD_RE.fullmatch(rel):
+                return None
+            if tool == "Glob":
+                pat_norm = pattern.replace("\\", "/")
+                if rel == "toolkit/engines" and pat_norm in ("*/card.yaml", "card.yaml"):
+                    return None
+                if cls._ACQ_CARD_RE.fullmatch(rel) and pat_norm in ("", "card.yaml"):
+                    return None
+                if re.fullmatch(r"toolkit/engines/[A-Za-z0-9_.-]+", rel) and pat_norm == "card.yaml":
+                    return None
+            return f"acquire: may read only toolkit/engines/*/card.yaml in the repository (not {rel!r})"
+        return f"acquire: reading or searching outside the run input and engine cards is refused ({base})"
+
+    @classmethod
+    def acquired_read_denied(cls, tool: str, ti: dict, run_dir: str, kind: str | None = None) -> str | None:
+        """Untrusted fetched-content read isolation for every non-`acquire` task (`acquire/` and raw acquired files)."""
+        root, target, _pat, filters, raw_target, base = cls._extract_inputs(tool, ti, run_dir)
+        acq_meta = os.path.join(root, "acquire")
+        acq_data = os.path.join(root, "data", "inputs", "acquired")
+        views_dir = os.path.join(acq_data, "_views")
+        for s in ([target] if target else []) + filters:
+            low = s.replace("\\", "/").lower()
+            parts = [p for p in low.split("/") if p]
+            if "acquire" in parts:
+                return f"{kind}: acquire/ is harness-only and not readable by any task"
+        if cls.within(base, acq_meta):
+            return f"{kind}: acquire/ is harness-only and not readable by any task"
+        if tool in ("Grep", "Glob") and os.path.lexists(acq_meta) and cls.within(acq_meta, base):
+            return f"{kind}: {tool} from {base} would reach acquire/"
+        if cls.within(base, acq_data) and not cls.within(base, views_dir):
+            if kind == "draft_evidence" and tool == "Read" and target and not os.path.islink(raw_target):
+                if os.path.isfile(base):
+                    ext = os.path.splitext(base)[1].lower()
+                    if ext in (".xml", ".txt"):
+                        try:
+                            from agents import acquire as ACQ
+                            rel = os.path.relpath(base, root).replace(os.sep, "/")
+                            prov = ACQ._load_provenance(run_dir)
+                            ent = (prov.get("inputs") or {}).get(rel)
+                            if not isinstance(ent, dict) or ent.get("content_type") in ACQ.TEXT_TYPES:
+                                return None
+                        except Exception:  # noqa: BLE001 -- fail closed on unreadable provenance
+                            return f"{kind}: could not verify acquired file type for {base}"
+                return (f"{kind}: raw acquired tabular/non-text file is not readable; use "
+                        "data/inputs/acquired/_views/ or evidence/acquired_manifest.json")
+            return (f"{kind}: raw acquired files under data/inputs/acquired/ are not readable; "
+                    "use data/inputs/acquired/_views/ and evidence/acquired_manifest.json")
+        if tool in ("Grep", "Glob") and os.path.lexists(acq_data) and cls.within(acq_data, base) and not cls.within(base, views_dir):
+            return f"{kind}: {tool} from {base} would reach raw acquired files under data/inputs/acquired/"
+        return None
+
+    @classmethod
+    def read_denied(cls, tool: str, ti: dict, run_dir: str, kind: str | None = None, owns: tuple = ()) -> str | None:
+        if kind == "acquire":
+            return cls.acquire_read_denied(tool, ti, run_dir)
+        eid = cls.engine_id_from_owns(owns) if kind == "build_engine" else None
+        return (
+            cls.engine_read_denied(tool, ti, run_dir, kind=kind, engine_id=eid)
+            or cls.acquired_read_denied(tool, ti, run_dir, kind=kind)
+        )
+
+    @staticmethod
+    def write_allowed(path: str, run_dir: str, owns: tuple, kind: str | None = None) -> str | None:
+        p = os.path.realpath(os.path.join(run_dir, path))
+        root = os.path.realpath(run_dir)
+        if not p.startswith(root + os.sep):
+            return "outside the run directory"
+        rel = os.path.relpath(p, root).replace(os.sep, "/")
+        low = rel.lower()
+        ref_write_ok = (kind == "build_reference" and rel == "engine_build/reference/reference.py")
+        if not ref_write_ok and (
+            low in {h.lower() for h in HARNESS_FILES} or low.startswith(tuple(h.lower() for h in HARNESS_PREFIXES))
+        ):
+            return f"{rel} is written by the harness"
+        if low.startswith("models/ext/engine_") and kind != "build_engine":
+            return f"{rel} is an agent-built engine working copy: only build_engine may write models/ext/engine_*"
+        if kind == "build_engine" and low.startswith("models/ext/engine_"):
+            from toolkit.engines.built import snapshot as BSNAP
+            parts = rel.split("/")
+            if len(parts) != 4 or not BSNAP._allowed_filename(parts[3]):
+                return (f"{rel} is not an allowed built-engine file (write only top-level engine.py, sibling .py "
+                        "helpers, card.yaml, or ENGINE_NOTES.md inside models/ext/engine_<id>/)")
+        if os.path.exists(p):
+            try:
+                if os.path.isfile(p) and os.stat(p).st_nlink > 1:
+                    return f"{rel} is a hard link"
+                for h in HARNESS_FILES:
+                    hp = os.path.join(root, h)
+                    if os.path.exists(hp) and os.path.samefile(hp, p):
+                        return f"{rel} is the harness file {h}"
+            except OSError:
+                return f"{rel} cannot be checked"
+        if low == OUT.lower() or any(rel.startswith(o) for o in owns if o.endswith("/")) or rel in owns:
+            return None
+        return f"this task may write only {', '.join(owns + (OUT,))}"
+
 
 
 def _no_session_when_sole(pick):
@@ -831,37 +786,6 @@ def _staged_list(run_dir: str) -> str:
             if staged else "")
 
 
-_ID = re.compile(r"^([A-Za-z]+)-(\d{3,6})$")     # any other form is left as written (Codex r2, r3)
-
-
-def _registered_ids(run_dir: str, before) -> set | None:
-    """Every finding id an earlier round registered: the gate's frozen tests, the findings ledger, and the critique file
-    the session replaced. None when one cannot be read (then nothing is renumbered: the gate decides)."""
-    import yaml
-    from agents import findings_ledger as FL
-    try:
-        for rel in (FL.LEDGER, "done_when_registry.json"):      # never block on what sits there (Codex r3: a FIFO)
-            if os.path.lexists(os.path.join(run_dir, rel)) and _file_bytes(run_dir, rel) is None:
-                return None
-        ids = set(FL.load(run_dir))
-        raw = _file_bytes(run_dir, "done_when_registry.json")
-        if raw is not None:
-            tests = json.loads(raw).get("tests")
-            if not isinstance(tests, dict):
-                return None
-            ids |= {str(k) for k in tests}
-        old = yaml.safe_load(before) if before else None
-    except Exception:  # noqa: BLE001 -- unreadable: no renumbering
-        return None
-    if isinstance(old, dict):
-        for k in ("blockers", "carried_forward"):
-            for x in old.get(k) if isinstance(old.get(k), list) else []:
-                i = x.get("id") if isinstance(x, dict) else x
-                if isinstance(i, str):
-                    ids.add(i)
-    return ids
-
-
 def _file_bytes(run_dir: str, rel: str) -> bytes | None:
     """The bytes of a regular file, read with no link followed and never blocking (a FIFO is refused; Codex r2); None
     for anything else."""
@@ -869,225 +793,6 @@ def _file_bytes(run_dir: str, rel: str) -> bytes | None:
         return _sio().read_nofollow(run_dir, rel)[0]
     except Exception:  # noqa: BLE001 -- missing, a link, not a regular file: no bytes
         return None
-
-
-def stamp_critique(run_dir: str, reviewer: str, before: bytes | None = None) -> bool:
-    """Baseline hb2 (§4.5): the harness, not the critic, owns `reviewer` and the id prefix. After a session that wrote
-    its critique file (`before`: the file's bytes before the session; an unchanged file is not stamped, so a file the
-    session did not write never becomes this critic's review), a file that is a mapping gets the literal reviewer, and
-    each blocker that defines an id of the form X-NNN (three to six digits) with another prefix gets the critic's
-    prefix (validate_critique_yaml.PREFIXES), its carried_forward references with it, when that stamped id is free: no
-    other blocker in the file and no earlier record uses it (frozen tests, the findings ledger, the replaced file).
-    When it is used, whether the critic meant a new finding or that one cannot be told, so the id is left for the
-    critic's repair (Codex r1-r3 of #355: a new number lost a resolved finding; the old id let a new finding inherit
-    its test). When those records cannot be read (or are not regular files), nothing is renamed. A file that is
-    missing, unreadable or not a mapping, and any id that is not a string, is left as it is for the gate to refuse
-    (fail closed). True when the file was rewritten."""
-    import yaml
-    import validate_critique_yaml as V
-    rel = CRITIQUE_FILE[reviewer]
-    p = os.path.join(run_dir, rel)
-    if os.path.islink(p) or not os.path.isfile(p):
-        return False
-    now = _file_bytes(run_dir, rel)
-    if now is None or now == before:
-        return False
-    try:
-        doc = yaml.safe_load(now)
-    except Exception:  # noqa: BLE001 -- unreadable: the gate reports it
-        return False
-    if not isinstance(doc, dict):
-        return False
-    from toolkit.spec import critique_checklist as CLst
-    if reviewer in CLst.CHECKLIST_REVIEWERS and CLst.strict_load(now)[1] is not None:
-        return False        # a duplicate key: a rewrite would drop one silently; the gate refuses it (Codex r3 of #366)
-    want = V.PREFIXES[reviewer]
-    blockers = [b for b in doc.get("blockers") or [] if isinstance(b, dict)] \
-        if isinstance(doc.get("blockers"), list) else []
-    cf = doc.get("carried_forward") if isinstance(doc.get("carried_forward"), list) else []
-    defined = [b.get("id") for b in blockers if isinstance(b.get("id"), str)]
-    ren: dict = {}
-    wrong = [i for i in defined if _ID.match(i) and not i.startswith(want)]
-    known = _registered_ids(run_dir, before) if wrong else set()
-    if known is not None:
-        used = set(defined) | known
-        for i in wrong:
-            if i in ren or defined.count(i) > 1:
-                continue                         # a duplicated id is the gate's to refuse
-            new = want + _ID.match(i).group(2)
-            if new in used:
-                # Codex r3: a new finding or that finding (resolved, carried, re-reviewed in the same round) cannot be
-                # told apart, so neither a new number nor the old id is given: the critic repairs it
-                continue
-            ren[i] = new
-            used.add(new)
-    if doc.get("reviewer") == reviewer and not ren:
-        return False
-    doc["reviewer"] = reviewer
-    for b in blockers:
-        i = b.get("id")
-        if isinstance(i, str) and i in ren:
-            b["id"] = ren[i]
-    for k, c in enumerate(cf):
-        i = c.get("id") if isinstance(c, dict) else c
-        if isinstance(i, str) and i in ren:
-            if isinstance(c, dict):
-                c["id"] = ren[i]
-            else:
-                cf[k] = ren[i]
-    ck = doc.get("checklist") if isinstance(doc.get("checklist"), dict) else {}
-    for e in ck.values():               # the structural checklist's finding references follow the renamed ids
-        if isinstance(e, dict) and isinstance(e.get("blockers"), list):
-            e["blockers"] = [ren.get(x, x) if isinstance(x, str) else x for x in e["blockers"]]
-    _sio().write_nofollow(run_dir, rel, yaml.safe_dump(doc, sort_keys=False, allow_unicode=True).encode(), atomic=True)
-    return True
-
-
-def checklist_text(run_dir: str, reviewer: str, repair: bool = False) -> tuple[str, str]:
-    """(system text, message text) of the structural checklist a domain or red-team review answers (owner
-    2026-11-23; toolkit/spec/critique_checklist.py): its fixed instructions and the five items in the system prompt;
-    on a repair, the critic-written text the schema errors name by marker, as one line of JSON data in the message
-    (critic text never enters the system prompt; Codex r2 of #366, P1-5). Both empty for other reviewers."""
-    from toolkit.spec import critique_checklist as CL
-    if reviewer not in CL.CHECKLIST_REVIEWERS:
-        return "", ""
-    data = CL.repair_data(run_dir, CRITIQUE_FILE[reviewer]) if repair else ""
-    return "\n\n" + CL.prompt_block(), ("\n\n" + data) if data else ""
-
-
-def _has_symlink_component(raw_path: str, anchor: str) -> bool:
-    """True when `raw_path` itself or any path component between `anchor` and `raw_path` is a symlink."""
-    cur = os.path.normpath(os.path.abspath(raw_path))
-    anc = os.path.normpath(os.path.abspath(anchor))
-    if os.path.islink(cur):
-        return True
-    if not _within(cur, anc):
-        return False
-    rel = os.path.relpath(cur, anc)
-    if rel in (".", ""):
-        return False
-    walk = anc
-    for part in rel.split(os.sep):
-        walk = os.path.join(walk, part)
-        if os.path.islink(walk):
-            return True
-    return False
-
-
-_ACQ_CARD_RE = re.compile(r"^toolkit/engines/[A-Za-z0-9_.-]+/card\.yaml$")
-
-
-def _acquire_read_denied(tool: str, ti: dict, run_dir: str) -> str | None:
-    """Read/Glob/Grep confinement for the `acquire` task (docs/design/acquire.md §3.1, S_ACQ_READ):
-    may read ONLY `<run_dir>/_task_input.json` and repo `toolkit/engines/*/card.yaml`. Refuses
-    ~/.aws/, ~/.netrc, other runs, evals/, acquire/quarantine/, symlinks, and recursive searches."""
-    import glob as _glob
-    why = _search_denied(tool, ti, run_dir)
-    if why:
-        return why
-    root = os.path.realpath(run_dir)
-    repo = os.path.realpath(_REPO)
-    target = str(ti.get("file_path") or ti.get("path") or "")
-    pattern = str(ti.get("pattern") or "") if tool == "Glob" else ""
-    if ".." in target.replace("\\", "/").split("/") or ".." in pattern.replace("\\", "/").split("/"):
-        return "acquire: path traversal ('..') is refused"
-    raw_target = os.path.join(run_dir, os.path.expanduser(target)) if target else run_dir
-    if target and (os.path.islink(raw_target) or _has_symlink_component(raw_target, run_dir)
-                   or _has_symlink_component(raw_target, _REPO)):
-        return "acquire: reading or searching through a symlink is refused"
-    base = os.path.realpath(raw_target)
-    if tool == "Glob" and pattern:
-        lit = []
-        for part in pattern.replace("\\", "/").split("/"):
-            if _glob.has_magic(part):
-                break
-            lit.append(part)
-        if lit:
-            base = os.path.realpath(os.path.join(base, "/".join(lit)) if not pattern.startswith("/")
-                                    else "/" + "/".join(lit).lstrip("/"))
-    if _within(base, root):
-        rel = os.path.relpath(base, root).replace(os.sep, "/")
-        if rel == "_task_input.json" and tool == "Read":
-            return None
-        if rel == "_task_input.json" and tool in ("Grep", "Glob") and (tool == "Grep" or pattern in ("", "_task_input.json")):
-            return None
-        return f"acquire: may read only _task_input.json in the run directory (not {rel!r})"
-    if _within(base, repo):
-        rel = os.path.relpath(base, repo).replace(os.sep, "/")
-        if tool == "Read" and _ACQ_CARD_RE.fullmatch(rel):
-            return None
-        if tool == "Grep" and _ACQ_CARD_RE.fullmatch(rel):
-            return None
-        if tool == "Glob":
-            pat_norm = pattern.replace("\\", "/")
-            if rel == "toolkit/engines" and pat_norm in ("*/card.yaml", "card.yaml"):
-                return None
-            if _ACQ_CARD_RE.fullmatch(rel) and pat_norm in ("", "card.yaml"):
-                return None
-            if re.fullmatch(r"toolkit/engines/[A-Za-z0-9_.-]+", rel) and pat_norm == "card.yaml":
-                return None
-        return f"acquire: may read only toolkit/engines/*/card.yaml in the repository (not {rel!r})"
-    return f"acquire: reading or searching outside the run input and engine cards is refused ({base})"
-
-
-def _acquired_read_denied(tool: str, ti: dict, run_dir: str, kind: str | None = None) -> str | None:
-    """Untrusted fetched-content read isolation for every non-`acquire` task (docs/design/acquire.md §3.3, S_ACQ_RAWREAD):
-    - `acquire/` is refused for EVERY task;
-    - raw files under `data/inputs/acquired/` (excluding `data/inputs/acquired/_views/`) are refused for every task
-      EXCEPT `draft_evidence` reading literature text files (.xml / .txt);
-    - recursive Glob/Grep whose root contains `acquire/` or `data/inputs/acquired/` is refused whenever those exist."""
-    import glob as _glob
-    root = os.path.realpath(run_dir)
-    target = str(ti.get("file_path") or ti.get("path") or "")
-    pattern = str(ti.get("pattern") or "") if tool == "Glob" else ""
-    filters = [str(ti.get(k) or "") for k in ("glob", "type")] + ([pattern] if pattern else [])
-    acq_meta = os.path.join(root, "acquire")
-    acq_data = os.path.join(root, "data", "inputs", "acquired")
-    views_dir = os.path.join(acq_data, "_views")
-    raw_target = os.path.join(run_dir, os.path.expanduser(target)) if target else run_dir
-    base = os.path.realpath(raw_target)
-    if tool == "Glob" and pattern:
-        lit = []
-        for part in pattern.replace("\\", "/").split("/"):
-            if _glob.has_magic(part):
-                break
-            lit.append(part)
-        if lit:
-            base = os.path.realpath(os.path.join(base, "/".join(lit)) if not pattern.startswith("/")
-                                    else "/" + "/".join(lit).lstrip("/"))
-    # Explicit path/filter naming acquire/
-    for s in ([target] if target else []) + filters:
-        low = s.replace("\\", "/").lower()
-        parts = [p for p in low.split("/") if p]
-        if "acquire" in parts:
-            return f"{kind}: acquire/ is harness-only and not readable by any task"
-    if _within(base, acq_meta):
-        return f"{kind}: acquire/ is harness-only and not readable by any task"
-    if tool in ("Grep", "Glob") and os.path.lexists(acq_meta) and _within(acq_meta, base):
-        return f"{kind}: {tool} from {base} would reach acquire/"
-    # Raw acquired inputs (everything under data/inputs/acquired/ except _views/)
-    if _within(base, acq_data) and not _within(base, views_dir):
-        if kind == "draft_evidence" and tool == "Read" and target and not os.path.islink(raw_target):
-            if os.path.isfile(base):
-                ext = os.path.splitext(base)[1].lower()
-                if ext in (".xml", ".txt"):
-                    # Verify against provenance content_type if recorded
-                    try:
-                        from agents import acquire as ACQ
-                        rel = os.path.relpath(base, root).replace(os.sep, "/")
-                        prov = ACQ._load_provenance(run_dir)
-                        ent = (prov.get("inputs") or {}).get(rel)
-                        if not isinstance(ent, dict) or ent.get("content_type") in ACQ.TEXT_TYPES:
-                            return None
-                    except Exception:  # noqa: BLE001 -- fail closed on unreadable provenance
-                        return f"{kind}: could not verify acquired file type for {base}"
-            return (f"{kind}: raw acquired tabular/non-text file is not readable; use "
-                    "data/inputs/acquired/_views/ or evidence/acquired_manifest.json")
-        return (f"{kind}: raw acquired files under data/inputs/acquired/ are not readable; "
-                "use data/inputs/acquired/_views/ and evidence/acquired_manifest.json")
-    if tool in ("Grep", "Glob") and os.path.lexists(acq_data) and _within(acq_data, base) and not _within(base, views_dir):
-        return f"{kind}: {tool} from {base} would reach raw acquired files under data/inputs/acquired/"
-    return None
 
 
 def _make_acquire_mcp_server(run_dir: str, fetcher=None, allowlist_path: str | None = None):
@@ -1340,8 +1045,6 @@ class SdkTasks:
     def __init__(self, run_dir: str, allow_cloud: bool = False, task_cap_usd: float = 3.0, max_turns: int | None = None,
                  query_fn=None, io_root: str | None = None, unsandboxed_ok: bool = False):
         self.run_dir = os.path.abspath(run_dir)
-        # lib.safe_io's trusted root: the run dir. A world-model seed session runs in <run>/world_model/seed/, and
-        # safe_io refuses a root inside a run dir (smoke4, 2026-11-16), so its root is the run dir itself.
         self.io_root = os.path.abspath(io_root or run_dir)
         self.cloud = allow_cloud
         self.unsandboxed_ok = bool(unsandboxed_ok)
@@ -1371,13 +1074,6 @@ class SdkTasks:
         if kind == "acquire":
             return ACQUIRE_MAX_TURNS
         return self.turns
-
-    def for_run_dir(self, run_dir: str) -> "SdkTasks":
-        """The same tasks for another run dir (lead-gaps β: the child run a provisional lead amendment continues in),
-        with this one's settings; its own budget ledger is the child's."""
-        return SdkTasks(run_dir, allow_cloud=self.cloud, task_cap_usd=self.cap,
-                        max_turns=self.turns if self.turns_explicit else None, query_fn=self.query_fn,
-                        unsandboxed_ok=self.unsandboxed_ok)
 
     def set_allowance(self, usd: float, readback_usd: float | None = None) -> None:
         """The call's dollar cap, and the cap of one crash read-back (0: none; the whole allowance
@@ -1424,19 +1120,11 @@ class SdkTasks:
                 # Fail closed (main #97): no shell, so no full pipeline build and no background call.
                 return enforcement.deny_output(f"{kind}: {name} is not one of this task's tools ({', '.join(allowed_tool_list)})")
             if name in ("Write", "Edit"):
-                why = _allowed(ti.get("file_path", ""), self.run_dir, owns, kind=kind)
+                why = PathPolicy.write_allowed(ti.get("file_path", ""), self.run_dir, owns, kind=kind)
                 if why:
                     return enforcement.deny_output(f"{kind}: {why}")
             if name in ("Read", "Grep", "Glob"):
-                if kind == "acquire":
-                    why = _acquire_read_denied(name, ti, self.run_dir)
-                else:
-                    eid = _engine_id_from_owns(owns) if kind == "build_engine" else None
-                    why = _engine_read_denied(name, ti, self.run_dir, kind=kind, engine_id=eid)
-                    if not why:
-                        why = _acquired_read_denied(name, ti, self.run_dir, kind=kind)
-                    if not why and kind == "seed_world_model":
-                        why = _seed_read_denied(name, ti, self.run_dir)
+                why = PathPolicy.read_denied(name, ti, self.run_dir, kind=kind, owns=owns)
                 if why:
                     return enforcement.deny_output(why)
             return {}
@@ -1685,21 +1373,13 @@ class SdkTasks:
         fb = ("\n\nThis is a repair: the gate refused your file. These are all of its errors; fix every one, "
               "check the whole file against the schema above, and keep the review:\n- "
               + "\n- ".join(feedback)) if feedback else ""
-        from toolkit.analysis import red_flag as RF       # heuristic notes the reviewer judges; never a gate
-        notes = RF.critic_notes(run_dir)
-        msg = f"Review round {round_n}." + ("\n\nHarness heuristics (notes, not findings; judge them):\n- "
-                                            + "\n- ".join(notes) if notes else "") + owner_held_note(run_dir, reviewer)
-        ck_sys, ck_msg = checklist_text(run_dir, reviewer, repair=bool(feedback))
-        msg += ck_msg
-        before = _file_bytes(run_dir, f)
-        res = self._session("critique", PROMPTS["critique"].format(
+        msg = f"Review round {round_n}." + owner_held_note(run_dir, reviewer)
+        return self._session("critique", PROMPTS["critique"].format(
             reviewer=reviewer, round=round_n, prev_round=max(round_n - 1, 0), file=f, prefix=PREFIX[reviewer],
             out=OUT, feedback=fb,
             severities=" | ".join(sorted(V.VALID_SEVERITY)), categories=" | ".join(sorted(V.VALID_CATEGORY)),
-            stages=" | ".join(sorted(V.VALID_TARGET_STAGE))) + ck_sys,
+            stages=" | ".join(sorted(V.VALID_TARGET_STAGE))),
                             msg, (f,), model)
-        stamp_critique(run_dir, reviewer, before)
-        return res
 
     def plan_fixes(self, packet):
         inp = self._input(packet)
@@ -1716,10 +1396,8 @@ class SdkTasks:
                                                            files=", ".join(task_scope(task))), "Make the fix.",
                              task_scope(task))       # the in-scope files its validated plan names (FIX_EDITABLE at most)
 
-    def write(self, run_dir, mode, feedback=None, findings=None):
-        fb = ("\n\nThis is a repair: the report was not accepted, and the harness will not deliver it while it "
-              "uses acceptance language. Rewrite these passages (say what was tested and what is declared), "
-              "keep everything else:\n- " + "\n- ".join(feedback)) if feedback else ""
+    def write(self, run_dir, mode, findings=None):
+        fb = ""
         if findings:     # F6 run 3: the fix loop leaves findings in the report text to the writer
             fb += ("\n\nOpen findings in the report text (no other task edits it): fix each one in manuscript.md.\n- "
                    + "\n- ".join(f"{f.get('id')}: {f.get('claim')}" + (f" Required: {f['fix_requires']}"
@@ -1727,25 +1405,6 @@ class SdkTasks:
                                   for f in findings))
         return self._session("write", PROMPTS["write"].format(mode=mode, out=OUT) + fb, "Write the draft.",
                              OWNS["write"])
-
-    def seed_world_model(self, context, feedback=None):
-        """The world model's version 0 (docs/design/v2-progressive-steps.md §4): beliefs and 5-8 pre-registrable
-        hypotheses written before any result exists, to world_model_seed.yaml. `context`: the question, the options,
-        the engine card and the sweep's design features (no results). `feedback`: the harness's refusal, for the one
-        repair."""
-        inp = self._input(context)
-        fb = ("\n\nThis is a repair: the harness refused your " + SEED_FILE + ". These are all of its errors; fix "
-              "every one and keep the rest of your world model:\n- " + "\n- ".join(feedback)) if feedback else ""
-        return self._session("seed_world_model", PROMPTS["seed_world_model"].format(out_in=inp, out=OUT) + fb,
-                             "Write the world-model seed.", OWNS["seed_world_model"])
-
-    def world_model_seed(self, run_dir, ctx, feedback, cap_usd):
-        """The stage machine's PREREGISTER seed (docs/design/v2c-orchestration.md §14): one session in `run_dir`
-        (the run's world_model/seed/), capped at `cap_usd`, through the same adapter the trials use."""
-        t = SdkTasks(run_dir, task_cap_usd=cap_usd, query_fn=self.query_fn, io_root=self.run_dir,
-                     max_turns=self.turns if self.turns_explicit else None)     # a caller's cap holds (Codex r2 P1-6)
-        t.set_allowance(cap_usd)
-        return t.seed_world_model(ctx, feedback)
 
 
 SdkTasks.pick_engine = _no_session_when_sole(SdkTasks.pick_engine)
@@ -1812,13 +1471,16 @@ def _self_test() -> int:
         ok(len(led["sessions"]) == 3 and abs(led["spent_usd"] - (0.42 + 0.42 + 1.25)) < 1e-9,
            f"S5 every charge is in budget_ledger.json ({led['spent_usd']})")
         R = enforcement.REPO_ROOT
-        ok(not _answer_key(os.path.join(R, "data", "evals", "q", "districts.csv"), d)
-           and _answer_key(os.path.join(R, "evals", "q", "rubric.yaml"), d) and _answer_key("x/_truth/truth.json", d)
-           and _answer_key("evals/q/generate.py", d),
+        ok(not PathPolicy.answer_key(os.path.join(R, "data", "evals", "q", "districts.csv"), d)
+           and PathPolicy.answer_key(os.path.join(R, "evals", "q", "rubric.yaml"), d)
+           and PathPolicy.answer_key("x/_truth/truth.json", d)
+           and PathPolicy.answer_key("evals/q/generate.py", d),
            "S9 the questions' public inputs (data/evals/) are readable; evals/ and _truth are not")
-        ok(_answer_key(os.path.join(R, "EVALS", "q", "rubric.yaml"), d) and _answer_key("data/_TRUTH/t.json", d)
-           and _allowed("data/inputs/x.csv", d, ("data/",)) and _allowed("data/inputs_provenance.json", d, ("data/",))
-           and _allowed("data/units.csv", d, ("data/",)) is None,
+        ok(PathPolicy.answer_key(os.path.join(R, "EVALS", "q", "rubric.yaml"), d)
+           and PathPolicy.answer_key("data/_TRUTH/t.json", d)
+           and PathPolicy.write_allowed("data/inputs/x.csv", d, ("data/",))
+           and PathPolicy.write_allowed("data/inputs_provenance.json", d, ("data/",))
+           and PathPolicy.write_allowed("data/units.csv", d, ("data/",)) is None,
            "S12 (Codex #95) answer keys refused in any case; the staged inputs and their manifest are the harness's")
         # S13: a search whose root contains the repository's evals/ tree is refused (a Grep at the repo
         # root reaches evals/**/_truth whatever its pattern); one confined to the run or data/ is not.
@@ -1833,7 +1495,7 @@ def _self_test() -> int:
             "glob data/": (("Glob", {"path": os.path.join(R, "data"), "pattern": "**/*.csv"}), False),
             "read a data file": (("Read", {"file_path": os.path.join(R, "data", "evals", "q", "a.csv")}), False),
         }
-        got = {k: bool(_search_denied(t, ti, rd)) == want for k, ((t, ti), want) in cases.items()}
+        got = {k: bool(PathPolicy.search_denied(t, ti, rd)) == want for k, ((t, ti), want) in cases.items()}
         ok(all(got.values()), f"S13 searches that reach evals/ are refused, confined ones are not {got}")
         # S14-S15: Codex round 2. A _truth tree or a link into one under an allowed root, a Grep glob
         # naming _truth, and a symlinked file resolving into _truth are refused.
@@ -1842,17 +1504,17 @@ def _self_test() -> int:
         open(os.path.join(rr, "data", "private", "_truth", "secret.json"), "w").write("{}")
         os.makedirs(os.path.join(rr, "run"))
         os.symlink(os.path.join(rr, "data", "private", "_truth", "secret.json"), os.path.join(rr, "run", "alias.json"))
-        ok(_search_denied("Grep", {"path": os.path.join(rr, "data"), "pattern": ".", "glob": "**/_truth/**"}, rr)
-           and _search_denied("Grep", {"path": os.path.join(rr, "data"), "pattern": "."}, rr)
-           and _search_denied("Grep", {"path": os.path.join(rr, "run"), "pattern": "."}, os.path.join(rr, "run")),
+        ok(PathPolicy.search_denied("Grep", {"path": os.path.join(rr, "data"), "pattern": ".", "glob": "**/_truth/**"}, rr)
+           and PathPolicy.search_denied("Grep", {"path": os.path.join(rr, "data"), "pattern": "."}, rr)
+           and PathPolicy.search_denied("Grep", {"path": os.path.join(rr, "run"), "pattern": "."}, os.path.join(rr, "run")),
            "S14 a search under an allowed root that can reach a _truth tree (directly, by glob, or by a link) is refused")
-        ok(_search_denied("Read", {"file_path": "alias.json"}, os.path.join(rr, "run")),
+        ok(PathPolicy.search_denied("Read", {"file_path": "alias.json"}, os.path.join(rr, "run")),
            "S15 a Read of a link resolving into _truth is refused")
         # BE20: write isolation — fix task refused on models/ext/engine_* and engine_build/*; build_engine allowed on its working copy
-        ok(_allowed("models/ext/engine_x/engine.py", d, FIX_EDITABLE, kind="fix") is not None
-           and _allowed("engine_build/admission.json", d, ("engine_build/",), kind="build_engine") is not None
-           and _allowed("models/ext/engine_x/engine.py", d, ("models/ext/engine_x/",), kind="build_engine") is None
-           and _allowed("models/ext/helper.py", d, FIX_EDITABLE, kind="fix") is None,
+        ok(PathPolicy.write_allowed("models/ext/engine_x/engine.py", d, FIX_EDITABLE, kind="fix") is not None
+           and PathPolicy.write_allowed("engine_build/admission.json", d, ("engine_build/",), kind="build_engine") is not None
+           and PathPolicy.write_allowed("models/ext/engine_x/engine.py", d, ("models/ext/engine_x/",), kind="build_engine") is None
+           and PathPolicy.write_allowed("models/ext/helper.py", d, FIX_EDITABLE, kind="fix") is None,
            "BE20 write rules refuse fix writes to models/ext/engine_* and all writes to engine_build/*; build_engine allowed on its working copy")
         # BE21: read isolation — Read of this run's .hidden/ or reference/ or another run's hidden_reveal.json refused
         other_run = os.path.join(d, "runs", "other_run")
@@ -1864,13 +1526,13 @@ def _self_test() -> int:
         os.makedirs(os.path.join(this_run, "engine_build", "reference"), exist_ok=True)
         open(os.path.join(this_run, "engine_build", ".hidden", "seed.json"), "w").write("{}")
         open(os.path.join(this_run, "engine_build", "reference", "reference.py"), "w").write("")
-        ok(_engine_read_denied("Read", {"file_path": "engine_build/.hidden/seed.json"}, this_run, kind="critique") is not None
-           and _engine_read_denied("Read", {"file_path": "engine_build/reference/reference.py"}, this_run, kind="build_engine") is not None
-           and _engine_read_denied("Read", {"file_path": os.path.join(other_run, "engine_build", "hidden_reveal.json")},
+        ok(PathPolicy.engine_read_denied("Read", {"file_path": "engine_build/.hidden/seed.json"}, this_run, kind="critique") is not None
+           and PathPolicy.engine_read_denied("Read", {"file_path": "engine_build/reference/reference.py"}, this_run, kind="build_engine") is not None
+           and PathPolicy.engine_read_denied("Read", {"file_path": os.path.join(other_run, "engine_build", "hidden_reveal.json")},
                                    this_run, kind="draft_spec") is not None
-           and _engine_read_denied("Read", {"file_path": os.path.join(other_run, "metadata.json")},
+           and PathPolicy.engine_read_denied("Read", {"file_path": os.path.join(other_run, "metadata.json")},
                                    this_run, kind="critique") is not None
-           and _engine_read_denied("Read", {"file_path": "engine_build/request.json"},
+           and PathPolicy.engine_read_denied("Read", {"file_path": "engine_build/request.json"},
                                    this_run, kind="build_engine", engine_id="x") is None,
            "BE21 read rules refuse .hidden/, reference/, and another run's hidden_reveal.json or files for every task")
         # BE21b (Codex r1 P1-10 & P1-11): recursive Grep/Glob from neutral parent above two marked runs refused;
@@ -1885,15 +1547,20 @@ def _self_test() -> int:
         open(os.path.join(r_oth, "run_state.json"), "w").write("{}")
         open(os.path.join(r_cur, "models", "ext", "engine_one", "engine.py"), "w").write("X=1\n")
         open(os.path.join(r_cur, "models", "ext", "engine_two", "engine.py"), "w").write("X=2\n")
-        eid_one = _engine_id_from_owns(("models/ext/engine_one/",))
-        ok(_engine_read_denied("Grep", {"path": neutral, "pattern": "x"}, r_cur, kind="critique") is not None
-           and _engine_read_denied("Glob", {"path": neutral, "pattern": "**/*.json"}, r_cur, kind="critique") is not None
+        eid_one = PathPolicy.engine_id_from_owns(("models/ext/engine_one/",))
+        ok(PathPolicy.engine_read_denied("Grep", {"path": neutral, "pattern": "x"}, r_cur, kind="critique") is not None
+           and PathPolicy.engine_read_denied("Glob", {"path": neutral, "pattern": "**/*.json"}, r_cur, kind="critique") is not None
+           and PathPolicy.engine_read_denied("Glob", {"pattern": "*/../../oth_case/*.json"}, r_cur, kind="critique") is not None
+           and PathPolicy.engine_read_denied("Glob", {"path": r_cur, "pattern": "sub/*/../../oth_case/*.json"}, r_cur, kind="critique") is not None
+           and PathPolicy.engine_read_denied("Grep", {"pattern": "s", "glob": "*/../../oth_case/*.json"}, r_cur, kind="critique") is not None
+           and PathPolicy.read_denied("Glob", {"pattern": "*/../../oth_case/*.json"}, r_cur, kind="critique") is not None
+           and PathPolicy.engine_read_denied("Grep", {"path": r_cur, "pattern": "a..b"}, r_cur, kind="critique") is None
            and eid_one == "one"
-           and _engine_read_denied("Read", {"file_path": "models/ext/engine_one/engine.py"},
+           and PathPolicy.engine_read_denied("Read", {"file_path": "models/ext/engine_one/engine.py"},
                                    r_cur, kind="build_engine", engine_id=eid_one) is None
-           and _engine_read_denied("Read", {"file_path": "models/ext/engine_two/engine.py"},
+           and PathPolicy.engine_read_denied("Read", {"file_path": "models/ext/engine_two/engine.py"},
                                    r_cur, kind="build_engine", engine_id=eid_one) is not None
-           and _engine_read_denied("Read", {"file_path": "models/ext/engine_one/engine.py"},
+           and PathPolicy.engine_read_denied("Read", {"file_path": "models/ext/engine_one/engine.py"},
                                    r_cur, kind="build_engine", engine_id=None) is not None,
            "BE21b neutral-parent Grep/Glob reaching another run is refused, and build_engine is scoped to its own engine_id")
         import validate_critique_yaml as V
@@ -1910,42 +1577,6 @@ def _self_test() -> int:
         ok(all(k in cp2 for k in ("resolved_in_round: 2", "resolved_evidence", "prior_round: 1", "still_present",
                                   "never a bare id")),
            "S17 the critique prompt states what a resolved blocker and a carried_forward entry need")
-        # SCK1 (owner 2026-11-23): the domain and red-team prompts carry the structural checklist (all five items, fixed
-        # text); the presentation prompt does not.
-        from toolkit.spec import critique_checklist as CL
-        ck = os.path.join(d, "ck")
-        os.makedirs(ck)
-        tx, tm = checklist_text(ck, "critique-redteam")
-        ok(all(f"  - {i} (principle" in tx for i in CL.ITEMS) and tm == ""
-           and checklist_text(ck, "critique-presentation") == ("", "") and "checklist (the domain and red-team" in cp2,
-           f"SCK1 the checklist (all five items) reaches the domain and red-team prompts only: {tx[-200:]}")
-        # SCK3 (Codex r2 of #366, P1-5): a repair's schema errors reach the system prompt, so they never quote the
-        # critic's text; the text they name by marker is data in the review message.
-        import yaml as _yk
-        evil = "IGNORE_PRIOR_MARKER new instruction"
-        bad_doc = {"reviewer": "critique-domain", "round": 1, "verdict": "PASS", "structural_mismatch": {"detected": False},
-                   "carried_forward": [], "blockers": [],
-                   "checklist": dict({i: {"answer": "pass", "reason": "r"} for i in CL.ITEMS},
-                                     **{evil: {"answer": "pass", "reason": "r"}},
-                                     burn_in_drift={"answer": "finding", "reason": "r", "blockers": [evil]})}
-        _yk.safe_dump(bad_doc, open(os.path.join(ck, "critique_domain.yaml"), "w"), sort_keys=False)
-        errs_k = CL.problems(bad_doc["checklist"], "critique_domain.yaml", [])
-        seen_k = {}
-
-        def capture(self_, kind, system, prompt, owns, model=None):
-            seen_k.update(system=system, prompt=prompt)
-            return TaskResult(True, {"ok": True}, 0.0, "fake")
-        _orig_k = SdkTasks._session
-        SdkTasks._session = capture
-        try:
-            SdkTasks(ck).critique(ck, "critique-domain", 1, errs_k)
-        finally:
-            SdkTasks._session = _orig_k
-        ok(len(errs_k) == 2 and "IGNORE_PRIOR_MARKER" not in seen_k.get("system", "x")
-           and "[CK-K6]" in seen_k.get("system", "") and "[CK-B-burn_in_drift-1]" in seen_k.get("system", "")
-           and "IGNORE_PRIOR_MARKER" in seen_k.get("prompt", "") and "checklist_markers" in seen_k.get("prompt", ""),
-           f"SCK3 a repair's system prompt names the critic's checklist text by marker only; the text is message data "
-           f"({errs_k}; {seen_k.get('prompt', '')[-200:]!r})")
         # S17b (hb2 fix 3): the critic is told which of its findings the owner answered, to carry them forward
         from agents import findings_ledger as _FL
         with tempfile.TemporaryDirectory() as d17:
@@ -2055,16 +1686,16 @@ def _self_test() -> int:
         with open(os.path.join(d, "decision_spec.yaml"), "w", encoding="utf-8") as _sf:
             _sf.write("schema_version: 1\nevidence:\n  dossier: supporting_evidence.yaml\n")
         ref_iso = {
-            "ref_writes_self": _allowed("engine_build/reference/reference.py", d, OWNS["build_reference"], kind="build_reference") is None,
-            "ref_write_cand_denied": _allowed("models/ext/engine_mod1/engine.py", d, OWNS["build_reference"], kind="build_reference") is not None,
-            "eng_write_ref_denied": _allowed("engine_build/reference/reference.py", d, ("models/ext/engine_mod1/",), kind="build_engine") is not None,
-            "ref_read_cand_denied": _engine_read_denied("Read", {"file_path": "models/ext/engine_mod1/engine.py"}, d, kind="build_reference") is not None,
-            "ref_read_snap_denied": _engine_read_denied("Read", {"file_path": "engine_build/snapshots/abc/engine.py"}, d, kind="build_reference") is not None,
-            "ref_read_hidden_denied": _engine_read_denied("Read", {"file_path": "engine_build/.hidden/seed.json"}, d, kind="build_reference") is not None,
-            "ref_read_self_ok": _engine_read_denied("Read", {"file_path": "engine_build/reference/reference.py"}, d, kind="build_reference") is None,
-            "ref_read_req_ok": _engine_read_denied("Read", {"file_path": "engine_build/request.json"}, d, kind="build_reference") is None,
-            "ref_read_custom_dossier_ok": _engine_read_denied("Read", {"file_path": "supporting_evidence.yaml"}, d, kind="build_reference") is None,
-            "eng_read_ref_denied": _engine_read_denied("Read", {"file_path": "engine_build/reference/reference.py"}, d, kind="build_engine", engine_id="mod1") is not None,
+            "ref_writes_self": PathPolicy.write_allowed("engine_build/reference/reference.py", d, OWNS["build_reference"], kind="build_reference") is None,
+            "ref_write_cand_denied": PathPolicy.write_allowed("models/ext/engine_mod1/engine.py", d, OWNS["build_reference"], kind="build_reference") is not None,
+            "eng_write_ref_denied": PathPolicy.write_allowed("engine_build/reference/reference.py", d, ("models/ext/engine_mod1/",), kind="build_engine") is not None,
+            "ref_read_cand_denied": PathPolicy.engine_read_denied("Read", {"file_path": "models/ext/engine_mod1/engine.py"}, d, kind="build_reference") is not None,
+            "ref_read_snap_denied": PathPolicy.engine_read_denied("Read", {"file_path": "engine_build/snapshots/abc/engine.py"}, d, kind="build_reference") is not None,
+            "ref_read_hidden_denied": PathPolicy.engine_read_denied("Read", {"file_path": "engine_build/.hidden/seed.json"}, d, kind="build_reference") is not None,
+            "ref_read_self_ok": PathPolicy.engine_read_denied("Read", {"file_path": "engine_build/reference/reference.py"}, d, kind="build_reference") is None,
+            "ref_read_req_ok": PathPolicy.engine_read_denied("Read", {"file_path": "engine_build/request.json"}, d, kind="build_reference") is None,
+            "ref_read_custom_dossier_ok": PathPolicy.engine_read_denied("Read", {"file_path": "supporting_evidence.yaml"}, d, kind="build_reference") is None,
+            "eng_read_ref_denied": PathPolicy.engine_read_denied("Read", {"file_path": "engine_build/reference/reference.py"}, d, kind="build_engine", engine_id="mod1") is not None,
         }
         ok(all(ref_iso.values()), f"BE20c build_engine and build_reference are strictly isolated ({ref_iso})")
         # DI1 (docs/design/v2-derived-inputs.md §3.1): the planner writes code, never tables. A Write to the derived
@@ -2125,8 +1756,6 @@ def _self_test() -> int:
         }
         # first, so plan_fixes' packet is the last _task_input.json written (PF4 reads it)
         calls = dict({"acquire": lambda: t.acquire("Q?", d, {"question": "Q?", "wanted": ["population"]}),
-                      "seed_world_model": lambda: t.seed_world_model({"question": "Q?", "packages": {"none": []}},
-                                                                     ["fb {x}"]),
                       "draft_evidence": lambda: t.draft_evidence(d, "evidence_dossier.yaml", {"required": {}},
                                                                  ["entry parameter:p {x}"])}, **calls)
         for k, call in calls.items():
@@ -2150,110 +1779,6 @@ def _self_test() -> int:
             SdkTasks._session = orig_session
         ok("R-030: overstates Required: say tested" in where.get("write", ("", "", 0, ""))[3],
            "PS1 the writer gets the write-up findings with their remedies")
-        # CS1-CS5 (baseline hb2 §4.5, three runs): the presentation critic wrote reviewer 'presentation' (or
-        # 'critique_presentation') and ids R-NNN; each cost a schema repair. The harness stamps the literal reviewer
-        # and the critic's id prefix after the session; the prompt states both literally.
-        import yaml as _y
-
-        def critic_writes(doc):
-            def fake(self_, kind, system, prompt, owns, model=None):
-                where["critique_prompt"] = system
-                if doc is not None:
-                    _y.safe_dump(doc, open(os.path.join(self_.run_dir, owns[0]), "w"), sort_keys=False)
-                return TaskResult(True, {"ok": True}, 0.0, "fake")
-            return fake
-
-        def blk(i, **k):
-            return dict({"id": i, "severity": "LOW", "category": "PRESENTATION", "target_stage": "WRITE",
-                         "first_seen_round": 1, "claim": "c", "evidence": "e", "fix_requires": "f",
-                         "resolved": False}, **k)
-        cs = {}
-        for name, rev, doc in (
-                ("run_a", "critique-presentation", {"reviewer": "presentation", "round": 2, "verdict": "PASS",
-                                                    "structural_mismatch": {"detected": False},
-                                                    "carried_forward": [{"id": "R-001", "prior_round": 1,
-                                                                         "still_present": True, "notes": "n"}],
-                                                    "blockers": [blk("R-001"), blk("R-002")]}),
-                ("run_b", "critique-presentation", {"reviewer": "critique_presentation", "round": 2,
-                                                         "verdict": "PASS", "structural_mismatch": {"detected": False},
-                                                         "carried_forward": [], "blockers": []}),
-                ("domain", "critique-domain", {"reviewer": "domain", "round": 2, "verdict": "PASS",
-                                               "structural_mismatch": {"detected": False}, "carried_forward": [],
-                                               "blockers": [blk("D-001", category="HYPOTHESES")]})):
-            cd = os.path.join(d, "cs_" + name)
-            os.makedirs(cd)
-            SdkTasks._session = critic_writes(doc)
-            try:
-                SdkTasks(cd).critique(cd, rev, 2)
-            finally:
-                SdkTasks._session = orig_session
-            try:
-                got = V.validate_critique(os.path.join(cd, CRITIQUE_FILE[rev]), rev, 2)
-                cs[name] = ("ok", [b["id"] for b in got["blockers"]], [c["id"] for c in got["carried_forward"]])
-            except V.SchemaError as e:
-                cs[name] = ("refused", getattr(e, "errors", None) or [str(e)])
-        ok(cs.get("run_a") == ("ok", ["P-001", "P-002"], ["P-001"]) and cs.get("run_b", ("",))[0] == "ok"
-           and cs.get("domain") == ("ok", ["D-001"], []),
-           f"CS1 the harness stamps each critic's reviewer and id prefix, carried_forward ids with them ({cs})")
-        # SCK2: a stamped id is renamed in the structural checklist's finding references too, so the file stays valid
-        from toolkit.spec import critique_checklist as CLs
-        cd = os.path.join(d, "cs_checklist")
-        os.makedirs(cd)
-        ckd = {i: {"answer": "pass", "reason": "r"} for i in CLs.ITEMS}
-        ckd["burn_in_drift"] = {"answer": "finding", "reason": "drift", "blockers": ["D-001"]}
-        SdkTasks._session = critic_writes({"reviewer": "redteam", "round": 1, "verdict": "REVISE",
-                                           "structural_mismatch": {"detected": False}, "carried_forward": [],
-                                           "checklist": ckd, "blockers": [blk("D-001", category="HYPOTHESES")]})
-        try:
-            SdkTasks(cd).critique(cd, "critique-redteam", 1)
-        finally:
-            SdkTasks._session = orig_session
-        try:
-            gotk = V.validate_critique(os.path.join(cd, CRITIQUE_FILE["critique-redteam"]), "critique-redteam", 1,
-                                       checklist=True)
-            sck2 = gotk["checklist"]["burn_in_drift"]["blockers"]
-        except V.SchemaError as e:
-            sck2 = getattr(e, "errors", None) or [str(e)]
-        ok(sck2 == ["R-001"], f"SCK2 the stamp renames the checklist's blocker references with the ids ({sck2})")
-        # SCK4 (Codex r3 of #366, P1-1): the stamp never rewrites a checklist file with a duplicate key (a rewrite
-        # would keep one entry silently); the gate refuses the file as written
-        cd = os.path.join(d, "cs_dup")
-        os.makedirs(cd)
-        dup_txt = ("reviewer: domain\nround: 1\nverdict: PASS\nstructural_mismatch: {detected: false}\n"
-                   "carried_forward: []\nblockers: []\nchecklist:\n  burn_in_drift: {answer: finding, reason: r}\n"
-                   "  burn_in_drift: {answer: pass, reason: r}\n").encode()
-        open(os.path.join(cd, "critique_domain.yaml"), "wb").write(dup_txt)
-        ok(stamp_critique(cd, "critique-domain", None) is False
-           and open(os.path.join(cd, "critique_domain.yaml"), "rb").read() == dup_txt,
-           "SCK4 the stamp leaves a checklist file with a duplicate key as written")
-        cd = os.path.join(d, "cs_collide")
-        os.makedirs(cd)
-        SdkTasks._session = critic_writes({"reviewer": "presentation", "round": 1, "verdict": "PASS",
-                                           "structural_mismatch": {"detected": False}, "carried_forward": [],
-                                           "blockers": [blk("P-001"), blk("R-001")]})
-        try:
-            SdkTasks(cd).critique(cd, "critique-presentation", 1)
-        finally:
-            SdkTasks._session = orig_session
-        raw = _y.safe_load(open(os.path.join(cd, "critique_presentation.yaml")))
-        ok(raw["reviewer"] == "critique-presentation" and [b["id"] for b in raw["blockers"]] == ["P-001", "R-001"],
-           f"CS2 an id whose stamped form is taken is left for the critic's repair, never merged or renumbered "
-           f"({raw['blockers']})")
-        for name, body in (("cs_missing", None), ("cs_list", ["not", "a", "mapping"])):
-            cd = os.path.join(d, name)
-            os.makedirs(cd)
-            SdkTasks._session = critic_writes(body)
-            try:
-                SdkTasks(cd).critique(cd, "critique-presentation", 1)
-                crashed = None
-            except Exception as e:  # noqa: BLE001 -- the test is that it does not raise
-                crashed = repr(e)
-            finally:
-                SdkTasks._session = orig_session
-            p = os.path.join(cd, "critique_presentation.yaml")
-            ok(crashed is None and (os.path.exists(p) == (body is not None))
-               and (body is None or _y.safe_load(open(p)) == body),
-               f"CS3 a missing or non-mapping critique file is left as it is for the gate to refuse ({name}, {crashed})")
         # SD1-SD2 (baseline hb2 §4.6): the drafter put digits in deliverable.decision.statements
         # and cited a question file by its repository path, not its staged copy. The prompt names the statements in
         # the no-digits rule, and the task's message lists the staged input paths.
@@ -2274,148 +1799,10 @@ def _self_test() -> int:
         dm = where.get("draft_msg") or ""
         ok("data/inputs/data/evals/q/districts.csv" in dm and "data/inputs/data/evals/q/sero.csv" in dm,
            f"SD1 the draft task's message lists the staged input paths to cite ({dm[-300:]!r})")
-        ok("deliverable.decision.statements" in " ".join(PROMPTS["draft_spec"].split()),
-           "SD2 the draft prompt's no-digits rule names deliverable.decision.statements")
-        # SD3 (baseline hb3 fix 4, flu_vaccine R2): the question asked to minimise an expected quantity and the drafter
-        # left deliverable.plan out, so the point plan was delivered
+        # SD3: the question asked to minimise an expected quantity -> deliverable.plan: expected_value
         _dp = " ".join(PROMPTS["draft_spec"].split())
-        ok("`deliverable.plan: expected_value`" in _dp and "check: expected_value_plan" in _dp,
-           "SD3 the draft prompt sets the expected-value plan for an objective stated in expectation, or declares it")
-        cpp = where.get("critique_prompt") or ""
-        ok("reviewer: critique-presentation" in cpp and "P-NNN" in cpp,
-           "CS4 the critique prompt states the literal reviewer value and id prefix")
-        # CS5-CS8 (Codex r1 of #355). CS5: an id an earlier round registered (a frozen test, a ledger row, the file the
-        # session replaced) is never given to a new finding: the old test would close it. The stamped id is the next
-        # free number.
-        cd = os.path.join(d, "cs_registered")
-        os.makedirs(cd)
-        json.dump({"tests": {"P-001": {"done_when": [{"file": "README.md", "exists": True}]}}},
-                  open(os.path.join(cd, "done_when_registry.json"), "w"))
-        _y.safe_dump({"blockers": [blk("P-002")]}, open(os.path.join(cd, "critique_presentation.yaml"), "w"))
-        SdkTasks._session = critic_writes({"reviewer": "presentation", "round": 2, "verdict": "REVISE",
-                                           "structural_mismatch": {"detected": False}, "carried_forward": [],
-                                           "blockers": [blk("R-001", severity="HIGH")]})
-        try:
-            SdkTasks(cd).critique(cd, "critique-presentation", 2)
-        finally:
-            SdkTasks._session = orig_session
-        raw = _y.safe_load(open(os.path.join(cd, "critique_presentation.yaml")))
-        # Codex r3 of #355: whether R-001 is a new finding or P-001 resolved (a same-round re-review has no
-        # carried_forward) cannot be told, so neither a new number nor the old id is given: the critic repairs it.
-        ok([b["id"] for b in raw["blockers"]] == ["R-001"],
-           f"CS5 an id whose stamped form an earlier round registered is left for the critic's repair "
-           f"({[b['id'] for b in raw['blockers']]})")
-        # CS11 (Codex r3): an id not in the NNN form (R-1) is left as written, so no second identity of P-001 passes.
-        # CS12 (Codex r3): a FIFO at the registry's or the ledger's name never blocks the stamp.
-        import threading
-        cs11 = {}
-        for name, fifo in (("short", None), ("fifo_registry", "done_when_registry.json"), ("fifo_ledger", "findings.jsonl")):
-            cd = os.path.join(d, "cs11_" + name)
-            os.makedirs(cd)
-            if fifo:
-                os.mkfifo(os.path.join(cd, fifo))
-            SdkTasks._session = critic_writes({"reviewer": "presentation", "round": 2, "verdict": "PASS",
-                                               "structural_mismatch": {"detected": False},
-                                               "carried_forward": [] if fifo else [{"id": "R-1", "prior_round": 1,
-                                                                                    "still_present": False, "notes": "n"}],
-                                               "blockers": [blk("R-1" if not fifo else "R-001")]})
-            th = threading.Thread(target=lambda: SdkTasks(cd).critique(cd, "critique-presentation", 2), daemon=True)
-            try:
-                th.start()
-                th.join(10)
-            finally:
-                SdkTasks._session = orig_session
-            if th.is_alive():
-                cs11[name] = "blocked"
-                try:
-                    os.close(os.open(os.path.join(cd, fifo), os.O_WRONLY | os.O_NONBLOCK))
-                except OSError:
-                    pass
-                th.join(5)
-            else:
-                cs11[name] = [b["id"] for b in _y.safe_load(open(os.path.join(cd, "critique_presentation.yaml")))["blockers"]]
-        ok(cs11 == {"short": ["R-1"], "fifo_registry": ["R-001"], "fifo_ledger": ["R-001"]},
-           f"CS11/CS12 an id outside the NNN form is left as written; an unreadable registry or ledger renumbers "
-           f"nothing and never blocks ({cs11})")
-        # CS6: an id that is not a string is left for the validator to name, never a crash.
-        cs6 = {}
-        for name, body in (("list_id", {"reviewer": "presentation", "blockers": [{"id": ["R-001"]}]}),
-                           ("map_cf", {"reviewer": "presentation", "blockers": [blk("R-001")],
-                                       "carried_forward": [{"id": {"x": 1}}]})):
-            cd = os.path.join(d, "cs_" + name)
-            os.makedirs(cd)
-            SdkTasks._session = critic_writes(body)
-            try:
-                SdkTasks(cd).critique(cd, "critique-presentation", 1)
-                cs6[name] = _y.safe_load(open(os.path.join(cd, "critique_presentation.yaml")))["reviewer"]
-            except Exception as e:  # noqa: BLE001 -- the test is that it does not raise
-                cs6[name] = repr(e)
-            finally:
-                SdkTasks._session = orig_session
-        ok(all(v == "critique-presentation" for v in cs6.values()),
-           f"CS6 a non-string id does not stop the stamp ({cs6})")
-        # CS7: a session that wrote nothing leaves the file it found as it was (another critic's document is not
-        # turned into this critic's review).
-        cd = os.path.join(d, "cs_stale")
-        os.makedirs(cd)
-        before = {"reviewer": "critique-domain", "round": 2, "verdict": "PASS",
-                  "structural_mismatch": {"detected": False}, "carried_forward": [], "blockers": []}
-        _y.safe_dump(before, open(os.path.join(cd, "critique_presentation.yaml"), "w"))
-
-        def no_write(self_, kind, system, prompt, owns, model=None):
-            return TaskResult(False, None, 0.0, "fake failure")
-        SdkTasks._session = no_write
-        try:
-            SdkTasks(cd).critique(cd, "critique-presentation", 2)
-        finally:
-            SdkTasks._session = orig_session
-        ok(_y.safe_load(open(os.path.join(cd, "critique_presentation.yaml"))) == before,
-           "CS7 a session that did not write its file gets no stamp: the file it found is unchanged")
-        # CS8-CS10 (Codex r2 of #355). CS8: a wrong-prefix id the critic also carries forward, whose stamped form an
-        # earlier round registered, is a reference to that finding: it is not given a new id (the old finding would be
-        # reported dropped); it is left for the gate's repair. CS9: an id too long to be one is left as written.
-        cs8 = {}
-        for name, doc, reg in (
-                ("carried", {"reviewer": "presentation", "round": 2, "verdict": "PASS",
-                             "structural_mismatch": {"detected": False},
-                             "carried_forward": [{"id": "R-001", "prior_round": 1, "still_present": False, "notes": "n"}],
-                             "blockers": [blk("R-001", resolved=True)]}, True),
-                ("long", {"reviewer": "presentation", "blockers": [blk("R-" + "9" * 5000)]}, False)):
-            cd = os.path.join(d, "cs8_" + name)
-            os.makedirs(cd)
-            if reg:
-                json.dump({"tests": {"P-001": {"done_when": [{"judgement": "j"}]}}},
-                          open(os.path.join(cd, "done_when_registry.json"), "w"))
-            SdkTasks._session = critic_writes(doc)
-            try:
-                SdkTasks(cd).critique(cd, "critique-presentation", 2)
-                raw = _y.safe_load(open(os.path.join(cd, "critique_presentation.yaml")))
-                cs8[name] = ([b["id"][:4] for b in raw["blockers"]],
-                             [c["id"] for c in raw.get("carried_forward") or []])
-            except Exception as e:  # noqa: BLE001 -- the test is that it does not raise
-                cs8[name] = repr(e)[:120]
-            finally:
-                SdkTasks._session = orig_session
-        ok(cs8 == {"carried": (["R-00"], ["R-001"]), "long": (["R-99"], [])},
-           f"CS8/CS9 a carried reference to a registered id, and an id too long to be one, are left for the gate ({cs8})")
-        # CS10: the snapshot before the session never blocks on what sits at the file's name (a FIFO).
-        import threading
-        cd = os.path.join(d, "cs_fifo")
-        os.makedirs(cd)
-        os.mkfifo(os.path.join(cd, "critique_presentation.yaml"))
-        SdkTasks._session = no_write
-        th = threading.Thread(target=lambda: SdkTasks(cd).critique(cd, "critique-presentation", 1), daemon=True)
-        try:
-            th.start()
-            th.join(10)
-        finally:
-            SdkTasks._session = orig_session
-        ok(not th.is_alive(), "CS10 a FIFO at the critique file's name does not block the snapshot")
-        if th.is_alive():                                 # release the blocked open so the test can end
-            try:
-                os.close(os.open(os.path.join(cd, "critique_presentation.yaml"), os.O_WRONLY | os.O_NONBLOCK))
-            except OSError:
-                pass
+        ok("`deliverable.plan: expected_value`" in _dp,
+           "SD3 the draft prompt sets the expected-value plan for an objective stated in expectation")
         ok(not errors and set(seen_prompts) == set(PROMPTS),
            f"PF2 every PROMPTS entry is assembled by its task method with real arguments "
            f"(errors {errors}; not driven {sorted(set(PROMPTS) - set(seen_prompts))})")
@@ -2487,17 +1874,11 @@ def _self_test() -> int:
            f"S_FIX_TASK_FILES a fix task owns the files its plan names, and its prompt says so ({got['fix']})")
         # Codex r3 P1-2: an owned path matches as written (case-sensitive): owning models/ext/rates.py is not owning
         # models/ext/RATES.py, a different module on a case-sensitive filesystem
-        ok(_allowed("models/ext/rates.py", d, ("models/ext/rates.py",)) is None
-           and _allowed("models/ext/RATES.py", d, ("models/ext/rates.py",)) is not None
-           and _allowed("MODELS/ext/x.py", d, ("models/ext/",)) is not None
-           and _allowed("models/ext/sub/x.py", d, ("models/ext/",)) is None,
+        ok(PathPolicy.write_allowed("models/ext/rates.py", d, ("models/ext/rates.py",)) is None
+           and PathPolicy.write_allowed("models/ext/RATES.py", d, ("models/ext/rates.py",)) is not None
+           and PathPolicy.write_allowed("MODELS/ext/x.py", d, ("models/ext/",)) is not None
+           and PathPolicy.write_allowed("models/ext/sub/x.py", d, ("models/ext/",)) is None,
            "S_OWNS_CASE an owned file or folder matches case-sensitively")
-        # S_FOR_RUN_DIR (lead-gaps β): the tasks move to a child run with the same settings, rooted in the child
-        t5 = SdkTasks(d, allow_cloud=True, task_cap_usd=2.5, max_turns=7, query_fn=rec_session)
-        c5 = t5.for_run_dir(os.path.join(d, "child"))
-        ok(c5.run_dir == os.path.join(os.path.abspath(d), "child") and c5.io_root == c5.run_dir
-           and (c5.cloud, c5.cap, c5.turns, c5.query_fn) == (True, 2.5, 7, rec_session),
-           "S_FOR_RUN_DIR the tasks for a child run keep the settings and are rooted in the child")
         # S_EVIDENCE_OWNS (v2 autonomy 1B-ii): the evidence task owns the default dossier only, never another file a
         # spec names, and gets the check's problems; the spec task may not write the dossier
         SdkTasks._session = rec_session
@@ -2510,52 +1891,10 @@ def _self_test() -> int:
             SdkTasks._session = orig_session
         ok(own1 == ("evidence_dossier.yaml",) and own2 == () and "no_data.reason" in p1,
            f"S_EVIDENCE_OWNS the evidence task owns evidence_dossier.yaml only ({own1}, {own2})")
-        ok(_allowed("evidence_dossier.yaml", d, OWNS["draft_spec"]) is not None
-           and _allowed("evidence_dossier.yaml", d, OWNS["draft_evidence"]) is None
-           and _allowed("decision_spec.yaml", d, OWNS["draft_evidence"]) is not None,
+        ok(PathPolicy.write_allowed("evidence_dossier.yaml", d, OWNS["draft_spec"]) is not None
+           and PathPolicy.write_allowed("evidence_dossier.yaml", d, OWNS["draft_evidence"]) is None
+           and PathPolicy.write_allowed("decision_spec.yaml", d, OWNS["draft_evidence"]) is not None,
            "S_EVIDENCE_WRITE the spec task cannot write the dossier; the evidence task can write nothing else")
-    # World-model seed task (F6 world-model trials): the world model's own seed documentation in the prompt, no results
-    # readable, one owned output outside the harness's analysis/ tree.
-    try:
-        import ast
-        wm_doc = ast.get_docstring(ast.parse(open(os.path.join(_REPO, "toolkit", "analysis", "world_model.py")).read()))
-        sp = seed_prompt_text()
-        ok("Seed (YAML)" in sp and "effect_band {package, band, min_share, where?}" in sp
-           and wm_doc[wm_doc.index("Tests (each declares"):wm_doc.index("Statuses:")] in sp and PRINCIPLES in sp,
-           "SW1 the seed prompt carries the world model's own seed and test documentation (read from world_model.py) "
-           "and the decision design principles")
-        ok("results" in sp.lower() and "5 to 8" in sp and SEED_FILE in sp,
-           "SW1b the seed prompt says no results are readable, asks for 5 to 8 hypotheses and names its output file")
-        from toolkit.analysis import belief_table as _BT
-        ok("decision_run" in sp and _BT.DECISION_SEED_FORMAT in sp,
-           "SW1c the seed prompt carries the belief table's decision-run format, for an input that names a decision run "
-           "instead of a sweep")
-        with tempfile.TemporaryDirectory() as d:
-            rd = os.path.join(d, "run")
-            os.makedirs(os.path.join(rd, "analysis", "batch"))
-            got = {
-                "results": _seed_read_denied("Read", {"file_path": "analysis/batch/results.jsonl"}, rd),
-                "analysis glob": _seed_read_denied("Glob", {"pattern": "analysis/**"}, rd),
-                "grep root": _seed_read_denied("Grep", {"pattern": "rho"}, rd) is None,
-                "spec": _seed_read_denied("Read", {"file_path": "decision_spec.yaml"}, rd),
-                "input": _seed_read_denied("Read", {"file_path": "_task_input.json"}, rd) is None,
-                "sibling run": _seed_read_denied("Read", {"file_path": os.path.join(d, "other", "analysis",
-                                                                                     "hypotheses.yaml")}, rd),
-                "climb": _seed_read_denied("Glob", {"pattern": "../**/world_model.yaml"}, rd),
-                "repo world model": _seed_read_denied("Read", {"file_path": os.path.join(
-                    _REPO, "toolkit", "analysis", "world_model.py")}, rd) is None,
-            }
-            want = {"results": True, "analysis glob": True, "grep root": False, "spec": True, "input": True, "sibling run": True,
-                    "climb": True, "repo world model": True}
-            ok({k: bool(v) for k, v in got.items()} == want,
-               f"SW2 the seed task cannot read results (analysis/, other runs, a climb out of the run) or the spec, and "
-               f"can read its input and the repository's code: {got}")
-            # a recursive search at the run root would reach analysis/: refused unless it is confined elsewhere
-            ok(_allowed(SEED_FILE, rd, OWNS["seed_world_model"]) is None
-               and _allowed("analysis/world_model_seed.yaml", rd, OWNS["seed_world_model"]) is not None,
-               "SW3 the seed task writes only its own seed file; analysis/ stays the harness's")
-    except Exception as e:  # noqa: BLE001 -- before the task exists this is the failure
-        ok(False, f"SW1-SW3 seed task: {type(e).__name__}: {e}")
     # Acquire task self-tests (docs/design/acquire.md §9.1: S_ACQ_TOOLS, S_ACQ_RESULT, S_ACQ_READ,
     # S_ACQ_ENV, S_ACQ_NOPROSE, S_ACQ_RAWREAD)
     try:
@@ -2667,16 +2006,16 @@ def _self_test() -> int:
             os.symlink(os.path.join(rd_r, "acquire", "quarantine", "q.bin"), os.path.join(rd_r, "link_q.json"))
             card_p = os.path.join(_REPO, "toolkit", "engines", "compartmental", "card.yaml")
             read_cases = {
-                "aws": _acquire_read_denied("Read", {"file_path": "~/.aws/credentials"}, rd_r) is not None,
-                "netrc": _acquire_read_denied("Read", {"file_path": "~/.netrc"}, rd_r) is not None,
-                "other_run": _acquire_read_denied("Read", {"file_path": os.path.join(other_r, "run_state.json")}, rd_r) is not None,
-                "evals": _acquire_read_denied("Read", {"file_path": os.path.join(_REPO, "evals", "suite.yaml")}, rd_r) is not None,
-                "quarantine": _acquire_read_denied("Read", {"file_path": "acquire/quarantine/q.bin"}, rd_r) is not None,
-                "link_q": _acquire_read_denied("Read", {"file_path": "link_q.json"}, rd_r) is not None,
-                "glob_root": _acquire_read_denied("Glob", {"pattern": "**/*"}, rd_r) is not None,
-                "grep_root": _acquire_read_denied("Grep", {"pattern": "raw"}, rd_r) is not None,
-                "input_ok": _acquire_read_denied("Read", {"file_path": "_task_input.json"}, rd_r) is None,
-                "card_ok": _acquire_read_denied("Read", {"file_path": card_p}, rd_r) is None,
+                "aws": PathPolicy.acquire_read_denied("Read", {"file_path": "~/.aws/credentials"}, rd_r) is not None,
+                "netrc": PathPolicy.acquire_read_denied("Read", {"file_path": "~/.netrc"}, rd_r) is not None,
+                "other_run": PathPolicy.acquire_read_denied("Read", {"file_path": os.path.join(other_r, "run_state.json")}, rd_r) is not None,
+                "evals": PathPolicy.acquire_read_denied("Read", {"file_path": os.path.join(_REPO, "evals", "suite.yaml")}, rd_r) is not None,
+                "quarantine": PathPolicy.acquire_read_denied("Read", {"file_path": "acquire/quarantine/q.bin"}, rd_r) is not None,
+                "link_q": PathPolicy.acquire_read_denied("Read", {"file_path": "link_q.json"}, rd_r) is not None,
+                "glob_root": PathPolicy.acquire_read_denied("Glob", {"pattern": "**/*"}, rd_r) is not None,
+                "grep_root": PathPolicy.acquire_read_denied("Grep", {"pattern": "raw"}, rd_r) is not None,
+                "input_ok": PathPolicy.acquire_read_denied("Read", {"file_path": "_task_input.json"}, rd_r) is None,
+                "card_ok": PathPolicy.acquire_read_denied("Read", {"file_path": card_p}, rd_r) is None,
             }
             ok(all(read_cases.values()), f"S_ACQ_READ acquire read isolation enforced ({read_cases})")
 
@@ -2698,15 +2037,15 @@ def _self_test() -> int:
                 xml_p: {"origin": "acquired", "content_type": "application/xml", "sha256": "1" * 64},
             }}, open(os.path.join(rr_d, "data", "inputs_provenance.json"), "w"))
             raw_cases = {
-                "spec_csv_denied": _acquired_read_denied("Read", {"file_path": csv_p}, rr_d, "draft_spec") is not None,
-                "spec_xml_denied": _acquired_read_denied("Read", {"file_path": xml_p}, rr_d, "draft_spec") is not None,
-                "spec_view_ok": _acquired_read_denied("Read", {"file_path": view_p}, rr_d, "draft_spec") is None,
-                "crit_csv_denied": _acquired_read_denied("Read", {"file_path": csv_p}, rr_d, "critique") is not None,
-                "write_xml_denied": _acquired_read_denied("Read", {"file_path": xml_p}, rr_d, "write") is not None,
-                "ev_xml_ok": _acquired_read_denied("Read", {"file_path": xml_p}, rr_d, "draft_evidence") is None,
-                "ev_csv_denied": _acquired_read_denied("Read", {"file_path": csv_p}, rr_d, "draft_evidence") is not None,
-                "ev_acq_dir_denied": _acquired_read_denied("Read", {"file_path": "acquire/record.json"}, rr_d, "draft_evidence") is not None,
-                "glob_acq_denied": _acquired_read_denied("Glob", {"path": "data/inputs", "pattern": "**/*"}, rr_d, "draft_spec") is not None,
+                "spec_csv_denied": PathPolicy.acquired_read_denied("Read", {"file_path": csv_p}, rr_d, "draft_spec") is not None,
+                "spec_xml_denied": PathPolicy.acquired_read_denied("Read", {"file_path": xml_p}, rr_d, "draft_spec") is not None,
+                "spec_view_ok": PathPolicy.acquired_read_denied("Read", {"file_path": view_p}, rr_d, "draft_spec") is None,
+                "crit_csv_denied": PathPolicy.acquired_read_denied("Read", {"file_path": csv_p}, rr_d, "critique") is not None,
+                "write_xml_denied": PathPolicy.acquired_read_denied("Read", {"file_path": xml_p}, rr_d, "write") is not None,
+                "ev_xml_ok": PathPolicy.acquired_read_denied("Read", {"file_path": xml_p}, rr_d, "draft_evidence") is None,
+                "ev_csv_denied": PathPolicy.acquired_read_denied("Read", {"file_path": csv_p}, rr_d, "draft_evidence") is not None,
+                "ev_acq_dir_denied": PathPolicy.acquired_read_denied("Read", {"file_path": "acquire/record.json"}, rr_d, "draft_evidence") is not None,
+                "glob_acq_denied": PathPolicy.acquired_read_denied("Glob", {"path": "data/inputs", "pattern": "**/*"}, rr_d, "draft_spec") is not None,
             }
             ok(all(raw_cases.values()), f"S_ACQ_RAWREAD raw acquired read rules enforced ({raw_cases})")
 

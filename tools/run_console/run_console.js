@@ -34,8 +34,8 @@ const HASH = new URLSearchParams(String(location.hash || "").slice(1));   // the
 function setHash() { if (typeof history !== "undefined" && history.replaceState && S.runId) history.replaceState(null, "", "#" + q({ run: S.runId, view: S.view })); }
 
 // ---- words: stage labels, run state, short title, times
-const STAGE = { SPEC: "Spec", SIGN: "Sign", EVIDENCE: "Evidence", ENGINE_CHOICE: "Engine", CONFIGURE: "Configure", ANALYZE: "Analyze",
-  CRITIQUE: "Critique", GATE: "Gate", FIX_LOOP: "Fix loop", OWNER_DECISION: "Owner", WRITE: "Write", PRESENTATION: "Present", FINAL: "Final" };
+const STAGE = { SPEC: "Spec", SIGN: "Sign", EVIDENCE: "Evidence", ENGINE_CHOICE: "Engine", ANALYZE: "Analyze",
+  CRITIQUE: "Critique", GATE: "Gate", FIX_LOOP: "Fix loop", OWNER_DECISION: "Owner", WRITE: "Write", FINAL: "Final" };
 const stage = (s) => STAGE[s] || String(s || "").toLowerCase().replace(/_/g, " ").replace(/^./, (c) => c.toUpperCase());
 const FAIL = ["run_failed", "completed_gate_error", "completed_gate_not_accepted", "completed_scope_declined"];
 function runState(r) {   // r: a run summary or a run's state; returns [class, words]

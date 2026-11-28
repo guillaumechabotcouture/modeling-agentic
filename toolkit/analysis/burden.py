@@ -1071,7 +1071,7 @@ def anchor_step(A, out, events) -> dict | None:
 
 
 def restore_anchor(A, run_dir) -> None:
-    """A fresh Analysis of a finished run (figure_data.rebuild) takes the run's anchor from analysis/burden_anchor.yaml
+    """A fresh Analysis of a finished run takes the run's anchor from analysis/burden_anchor.yaml
     when the spec declares anchor rows (fail closed when it cannot be read)."""
     if section(A.spec.raw) is None:
         return
@@ -1958,23 +1958,6 @@ def _self_test_s25b(ok, th):
                                and not b[0]["scope_declarable"] for b in bf[1:])
            and block_findings(s0, {"arm": "none", "window": [8, 10]}) == [],
            f"BV36 an artifact whose arm, window or window metrics differ from the signed spec is inconsistent: {bf}")
-        # Codex S2-5b r1 P1-1: a stored batch computed over another burden window is not adopted
-        rawT["validation"] = {"burden": {"csv": "w.csv", "window": [1, 2], "window_metrics": {"cases": "prev"}}}
-        sT = schema.Spec(rawT, d)
-        dz, jobs = B.design(sT)
-        import json
-        for n_, rows_ in (("sd.json", dict(dz, burden_window=None)), ("sj.jsonl", jobs),
-                          ("sr.jsonl", [{"id": j["id"], "ok": True, "result": {}} for j in jobs])):
-            open(os.path.join(d, n_), "w").write(json.dumps(rows_) if n_.endswith(".json") else
-                                                 "".join(json.dumps(x) + "\n" for x in rows_))
-        try:
-            B.adopt(d, os.path.join(d, "sr.jsonl"), os.path.join(d, "sj.jsonl"), os.path.join(d, "sd.json"), jobs, dz,
-                    sT.engine(), sample=len(jobs))
-            why = "adopted"
-        except ValueError as e:
-            why = str(e)
-        ok(dz.get("burden_window") == [1.0, 2.0] and "burden window" in why,
-           f"BV35 a stored batch whose design has another burden window is refused at adoption: {why[:160]}")
         # report-only rows and rows with no published interval
         lines = [row(9, "estimated,s,ratio,,,WMR-X,,report_only,"), row(9, "estimated,s,ratio,,,WMR-Y,,,none", lo=",")
                  .replace("a,", "b,", 1)]
