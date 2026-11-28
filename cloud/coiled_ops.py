@@ -283,7 +283,7 @@ def tarball_filter(ti: tarfile.TarInfo) -> tarfile.TarInfo | None:
 
 
 def tarball_from_tree(tree: str | None = None, src_dir: str | None = None, *, required_files: tuple = (),
-                      check_hidden: bool = False, require_main: bool = False,
+                      check_clean: bool = True, check_hidden: bool = False, require_main: bool = False,
                       tarball_filter_fn=None) -> bytes | None:
     """Build a `.tar.gz` archive from a git tree (HEAD) or plain directory."""
     if tree:
@@ -291,7 +291,7 @@ def tarball_from_tree(tree: str | None = None, src_dir: str | None = None, *, re
         if require_main:
             subprocess.run(["git", "-C", tree, "fetch", "-q", "origin"], check=True)
         head = git("rev-parse", "HEAD")
-        if git("status", "--porcelain"):
+        if check_clean and git("status", "--porcelain"):
             raise SystemExit(f"{tree} has uncommitted changes: refusing")
         if require_main:
             main_ = git("rev-parse", "origin/main")
@@ -392,6 +392,36 @@ def _self_test() -> int:
         with tarfile.open(fileobj=io.BytesIO(blob), mode="r:gz") as t:
             names = [m.name for m in t.getmembers()]
         ok(any(n.endswith("a.py") for n in names) and not any(".git" in n for n in names), f"CO6 tarball_from_tree: {names}")
+
+        repo = os.path.join(os.path.realpath(td), "repo")
+        os.makedirs(repo)
+
+        def _git(*args):
+            subprocess.run(["git", "-C", repo, *args], check=True, stdout=subprocess.DEVNULL)
+
+        _git("init", "-q", "-b", "main")
+        _git("config", "user.email", "t@example.invalid")
+        _git("config", "user.name", "t")
+        _git("config", "commit.gpgsign", "false")
+        with open(os.path.join(repo, "a.py"), "w", encoding="utf-8") as f:
+            f.write("X = 1\n")
+        _git("add", "a.py")
+        _git("commit", "-q", "-m", "init")
+        with open(os.path.join(repo, "a.py"), "w", encoding="utf-8") as f:
+            f.write("X = 2\n")
+        with open(os.path.join(repo, "untracked.txt"), "w", encoding="utf-8") as f:
+            f.write("dirty\n")
+        for label, kw in (("default", {}), ("explicit", {"check_clean": True})):
+            try:
+                tarball_from_tree(repo, **kw)
+                ok(False, f"CO7 tarball_from_tree ({label}) refuses dirty git tree")
+            except SystemExit as e:
+                ok("uncommitted changes" in str(e), f"CO7 tarball_from_tree ({label}) refuses dirty git tree: {e}")
+        git_blob = tarball_from_tree(repo, check_clean=False)
+        with tarfile.open(fileobj=io.BytesIO(git_blob), mode="r:gz") as t:
+            git_names = [m.name.removeprefix("./") for m in t.getmembers()]
+        ok(_archive_member(git_blob, "a.py") == b"X = 1\n" and "untracked.txt" not in git_names,
+           f"CO8 tarball_from_tree(check_clean=False) archives committed HEAD only: {git_names}")
 
     if fails:
         print("SELF-TEST FAILURES:", *fails, sep="\n  - ")
