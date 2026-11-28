@@ -249,7 +249,7 @@ def _self_test() -> int:
         rd2 = os.path.join(d, "abort"); os.makedirs(os.path.join(rd2, "models"))
         def boom(*a, progress=None, **k):
             progress.update(slots=2, cores_per_slot=1, core_s=1.0)
-            time.sleep(0.2)
+            time.sleep(0.5)
             raise KeyboardInterrupt
         with mock.patch.object(C, "_map_local", boom):
             try:

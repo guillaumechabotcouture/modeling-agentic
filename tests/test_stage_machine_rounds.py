@@ -1182,42 +1182,41 @@ def _self_test_derived(ok, td: str) -> None:
         r["decision_units"]["defaults_accepted"] = {"group": "the toy units carry no group label"}
         r["calibration"]["target_frame"] = {"band": "prev", "source": "the engine's own window metric"}
         return r
+    from unittest import mock as _mock
     d = os.path.join(td, "di8")
     os.makedirs(d)
-    global REPO
-    old_repo, REPO = REPO, fake
     try:
-        st = init_run(d, "Which package per unit? Inputs: toyraw/units_raw.csv", 3, "owner", "v2", None,
-                      derived_inputs=True, derive_unsandboxed=flag)
-        m = Machine(d, StubTasks({"spec": draft}), st,
-                    backend=toolkit, log=lambda *a: None, cross_engine_check=False)
-        m.run(max_steps=4)
-        from toolkit.spec import signoff as _SO
-        sheet = _SO.sheet(d, getattr(toolkit, "candidates", None))
-        ok(m.st.state == "SIGN" and m.st.paused == "awaiting_signoff" and "NeedsGroup" in sheet
-           and "engine_attribute_unbound" in sheet and "group" in sheet,
-           f"DI8a engine auto: the full checks run per candidate in SPEC, before SIGN; the candidate that needs an "
-           f"unbound attribute is shown ineligible with the reason ({m.st.state}, {m.st.tries.get('spec_feedback')})")
-        toolkit.sign(d, "owner")
-        for _ in range(6):
-            if m.st.state in ("ANALYZE", "FINAL"):
-                break
-            m.step()
-        ec = json.load(open(os.path.join(d, AB.ENGINE_CHOICE)))
-        rows = {r["ref"]: r for r in ec["candidates"]}
-        ng = rows.get("di8_engines:NeedsGroup") or {}
-        ok(ec["engine"]["ref"] == "toolkit.engines.contract:ToyEngine" and ng.get("eligible") is False
-           and any("engine_attribute_unbound" in w and "group" in w for w in ng.get("why_not") or []),
-           f"DI8b engine_choice.json records that candidate as ineligible with the unbound list: {ng.get('why_not')}")
-        kinds = {f["kind"]: f for f in m.harness_findings()}
-        rec_kind = json.load(open(os.path.join(d, P.DERIVATIONS_RECORD)))["derivations"]["units"]["sandbox"]["kind"]
-        ok(("derivation_unsandboxed" in kinds and kinds["derivation_unsandboxed"]["severity"] == "HIGH"
-            and not kinds["derivation_unsandboxed"]["scope_declarable"]) if rec_kind == "none"
-           else "derivation_unsandboxed" not in kinds,
-           f"DI-U3 a run that used the development flag carries a HIGH non-declarable gate finding (no ACCEPT); a "
-           f"sandboxed one does not (sandbox {rec_kind}; {sorted(kinds)})")
+        with _mock.patch.object(sm, "REPO", fake):
+            st = init_run(d, "Which package per unit? Inputs: toyraw/units_raw.csv", 3, "owner", "v2", None,
+                          derived_inputs=True, derive_unsandboxed=flag)
+            m = Machine(d, StubTasks({"spec": draft}), st,
+                        backend=toolkit, log=lambda *a: None, cross_engine_check=False)
+            m.run(max_steps=4)
+            from toolkit.spec import signoff as _SO
+            sheet = _SO.sheet(d, getattr(toolkit, "candidates", None))
+            ok(m.st.state == "SIGN" and m.st.paused == "awaiting_signoff" and "NeedsGroup" in sheet
+               and "engine_attribute_unbound" in sheet and "group" in sheet,
+               f"DI8a engine auto: the full checks run per candidate in SPEC, before SIGN; the candidate that needs an "
+               f"unbound attribute is shown ineligible with the reason ({m.st.state}, {m.st.tries.get('spec_feedback')})")
+            toolkit.sign(d, "owner")
+            for _ in range(6):
+                if m.st.state in ("ANALYZE", "FINAL"):
+                    break
+                m.step()
+            ec = json.load(open(os.path.join(d, AB.ENGINE_CHOICE)))
+            rows = {r["ref"]: r for r in ec["candidates"]}
+            ng = rows.get("di8_engines:NeedsGroup") or {}
+            ok(ec["engine"]["ref"] == "toolkit.engines.contract:ToyEngine" and ng.get("eligible") is False
+               and any("engine_attribute_unbound" in w and "group" in w for w in ng.get("why_not") or []),
+               f"DI8b engine_choice.json records that candidate as ineligible with the unbound list: {ng.get('why_not')}")
+            kinds = {f["kind"]: f for f in m.harness_findings()}
+            rec_kind = json.load(open(os.path.join(d, P.DERIVATIONS_RECORD)))["derivations"]["units"]["sandbox"]["kind"]
+            ok(("derivation_unsandboxed" in kinds and kinds["derivation_unsandboxed"]["severity"] == "HIGH"
+                and not kinds["derivation_unsandboxed"]["scope_declarable"]) if rec_kind == "none"
+               else "derivation_unsandboxed" not in kinds,
+               f"DI-U3 a run that used the development flag carries a HIGH non-declarable gate finding (no ACCEPT); a "
+               f"sandboxed one does not (sandbox {rec_kind}; {sorted(kinds)})")
     finally:
-        REPO = old_repo
         sys.path.remove(mods)
 
 

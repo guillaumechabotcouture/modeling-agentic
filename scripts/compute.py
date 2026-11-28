@@ -342,12 +342,38 @@ WORKER_VM_TYPES = ["Standard_E8s_v5", "Standard_E8as_v5", "Standard_E8ds_v5"]
 ADAPT_OPTIONS = {"target_duration": "20s", "interval": "15s", "wait_count": 40}
 
 
+def _upload_compute(c) -> None:
+    """Ship compute_worker.py then compute.py to remote nodes without reloading an in-process scheduler."""
+    import uuid
+    cw_path = os.path.abspath(compute_worker.__file__)
+    c_path = os.path.abspath(__file__)
+    has_sched = False
+    if hasattr(c, "run_on_scheduler"):
+        try:
+            has_sched = bool(c.run_on_scheduler(
+                lambda: "compute" in sys.modules and "compute_worker" in sys.modules
+            ))
+        except Exception:  # noqa: BLE001
+            has_sched = False
+    if not has_sched:
+        c.upload_file(cw_path)
+        c.upload_file(c_path)
+        return
+    try:
+        from distributed.diagnostics.plugin import UploadFile
+        c.register_plugin(UploadFile(cw_path, load=True), name=f"{cw_path}{uuid.uuid4()}")
+        c.register_plugin(UploadFile(c_path, load=True), name=f"{c_path}{uuid.uuid4()}")
+    except Exception:  # noqa: BLE001
+        c.upload_file(cw_path)
+        c.upload_file(c_path)
+
+
 def register_compute_tags(client, exclude: list[str] | tuple = (), resource: str = "compute") -> None:
     """Tag compute workers on an autoscaling cluster. Uploads this module first
     (as a worker plugin, so workers that join later get it too): the plugin is
     pickled by reference to `compute`, which cluster workers cannot otherwise
     import (Coiled check, Phase 30; same class of bug as PR #20)."""
-    client.upload_file(os.path.abspath(__file__))
+    _upload_compute(client)
     client.register_plugin(ComputeTagPlugin(resource, exclude=list(exclude)), name=ComputeTagPlugin.name)
     client.register_plugin(BusyWorkerGuard(), name=BusyWorkerGuard.name)
 
@@ -567,8 +593,7 @@ def _map_dask(run_dir, fn_spec, inputs, max_workers, chunks_per_worker=4, deadli
     with Client(addr, timeout="60s", security=_security()) as c:
         # Dask pickles functions by reference when it can, so the scheduler and
         # workers must be able to import this module: ship it to them.
-        c.upload_file(os.path.abspath(__file__))
-        c.upload_file(os.path.abspath(compute_worker.__file__))
+        _upload_compute(c)
         # The autoscaler must not retire a worker under a running chunk. Not installed
         # (the scheduler refuses it): the call goes on, recovery below still applies,
         # and the summary says why.

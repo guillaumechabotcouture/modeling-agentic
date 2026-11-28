@@ -2592,12 +2592,12 @@ def _self_test_reserve(ok, A, R, u_unc):
     check finds nothing; the reserve and the value given up are reported; an unreachable rule blocks."""
     import tempfile
     import yaml
-    from toolkit.analysis import contract, uncertainty as U
+    from toolkit.analysis import contract, run as _run_mod, uncertainty as U
     plan0 = R["point"]["plan"]
     z0 = {i: v["z"] for i, v in R["point"]["per_unit"].items()}
     _o, ben0, cost0 = A.evaluate(A.theta0, z0)
     sol0 = A.solve(ben0, cost0)
-    fn = getattr(R, "affordable_plan", None)
+    fn = getattr(_run_mod, "affordable_plan", None)
     ok(callable(fn) and sol0["choice"] == plan0, "R5g affordable_plan() exists; the point plan re-solves unchanged")
     if not callable(fn):
         return

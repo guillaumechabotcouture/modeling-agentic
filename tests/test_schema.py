@@ -474,8 +474,8 @@ def _self_test() -> int:
                 _yaml.safe_dump(r_ec, f)
             with open(os.path.join(dc, ENGINE_CHOICE), "w") as f:
                 _json.dump({"engine": {"ref": "toolkit.engines.contract:ToyEngine"}}, f)
-            with _mock.patch(f"{__name__}._auto_cards", create=True, new=
-                             lambda raw: [("planted", _ty.SimpleNamespace(valid_ranges={"seed": [-1, 1]}))]):
+            with _mock.patch.object(schema, "_auto_cards", new=
+                                    lambda raw: [("planted", _ty.SimpleNamespace(valid_ranges={"seed": [-1, 1]}))]):
                 s_ec = load(os.path.join(dc, "decision_spec.yaml"))
                 ec_bad = spec_scale_problems(s_ec)
             ok(not s_ec.engine_pending and any("below 0" in e and "planted" in e for e in ec_bad),

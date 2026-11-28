@@ -1715,10 +1715,16 @@ class Machine(EngineBuildMixin):
                               "critique_engine.yaml"):
                 remove_nofollow(self.run_dir, stale_rel, missing_ok=True)
             prev_eb = self.st.engine_build if isinstance(self.st.engine_build, dict) else {}
+            req_ref = (
+                bool(prev_eb["require_reference"])
+                if "require_reference" in prev_eb
+                else bool(build_decl.get("require_reference"))
+            )
             self.st.engine_build = {
                 "id": bid,
                 "kind": str(build_decl.get("kind") or "starsim_module"),
                 "status": "requested",
+                "require_reference": req_ref,
                 "tries": int(prev_eb.get("tries") or 0),
                 "repairs": int(prev_eb.get("repairs") or 0),
                 "spent_usd": float(prev_eb.get("spent_usd") or 0.0),

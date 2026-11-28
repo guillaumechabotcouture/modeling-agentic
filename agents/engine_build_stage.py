@@ -474,7 +474,7 @@ class EngineBuildMixin:
                 eb["compute_reserved_usd"] = 0.0
                 _withhold_report(self.run_dir)
                 return self._go("FINAL", f"reference snapshot tampered: {e}", "artifact_tampered")
-        elif eb.get("reference_status") != "failed":
+        else:
             ref_dir = os.path.join(self.run_dir, "engine_build", "reference")
             if os.path.isdir(ref_dir) and os.path.isfile(os.path.join(ref_dir, "reference.py")):
                 try:
@@ -581,7 +581,7 @@ class EngineBuildMixin:
         if adm.get("static_problems"):
             fb_lines += [f"static: {p}" for p in adm["static_problems"][:12]]
         failed_ids = list((adm.get("feedback") or {}).get("failed_checks") or [])
-        if (checks.get("A11") or {}).get("status") == "unavailable" and eb.get("reference_status") == "failed":
+        if (checks.get("A11") or {}).get("status") == "unavailable":
             fb_lines.append("A11 independent reference implementation failed to build; cannot admit without reference")
             eb["status"] = "refused"
             self._write_request_for_owner(f"admission failed on checks {failed_ids}", fb_lines)

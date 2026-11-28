@@ -145,12 +145,14 @@ WEIGHTS_S = {
 for _old in ("agents/stage_machine.py", "cloud/vm_job.py", "scripts/compute.py", "toolkit/analysis/run.py"):
     WEIGHTS_S.pop(_old, None)
 WEIGHTS_S.update({
+    "toolkit/engines/built/admission.py": 747,
+    "toolkit/analysis/estimates.py": 649,
     "tests/test_stage_machine_rounds.py": 260,
     "tests/test_stage_machine_core.py": 250,
     "tests/test_vm_job.py": 239,
-    "tests/test_analysis_run.py": 176,
+    "tests/test_analysis_run.py": 330,
     "tests/test_compute.py": 140,
-    "tests/test_compute_dask.py": 97,
+    "tests/test_compute_dask.py": 65,
     "tests/test_run_cluster.py": 60,
     "tests/test_schema.py": 30,
     "agents/engine_build_stage.py": 150,

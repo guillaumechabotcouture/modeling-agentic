@@ -1138,7 +1138,7 @@ def check_a6(cand: BADAPT.BuiltEngine, build_decl: Mapping, spec_raw: Mapping,
         elif pname in reads_outcomes_all and pname not in reads_build_all and pname not in param_roles:
             a6_probs.append(f"parameter {pname!r} was read ONLY in read_outcomes() without a signed parameter_roles entry")
             p_ok = False
-        if st_rec["moved_bases"] < need_moving:
+        if st_rec["moved_bases"] < need_moving and len(_domain_points_param(param_specs[pname])) >= 2:
             a6_probs.append(f"parameter {pname!r} moved no declared output above floor "
                             f"({st_rec['moved_bases']}/{n_bases} bases, max_rel={st_rec['max_rel']:.3g}, floor={rel_floor})")
             p_ok = False
@@ -2135,6 +2135,46 @@ def _self_test() -> int:
     ok(a6_lg["status"] == "pass" and a6_ld["status"] == "fail",
        f"BE_A6_LAZY active-mode fallback passes intervention-gated param while dead fails "
        f"(good={a6_lg['status']}, dead={a6_ld['status']})")
+
+    # BE_A6_SINGLETON_PARAM: a read singleton-domain parameter passes A6 without perturbation movement,
+    # while an unread singleton-domain parameter still fails A6 as a dead parameter.
+    b_sg = {
+        "id": "stub_sg", "kind": "closed_form",
+        "request": {
+            "components": {"act": {"values": [0, 1], "absent": 0}},
+            "unit_attributes": {"x": {"type": "continuous", "range": [0.1, 1.0]}},
+            "outputs": {"per_capita": ["y"], "windows": {}, "cost_drivers": []},
+            "age_groups": ["g0"],
+            "parameters": [
+                {"name": "n_groups", "kind": "fixed", "value": 4, "domain": {"type": "integer", "values": [4]}, "source": "t"},
+            ],
+            "stochastic": False,
+        },
+    }
+
+    class _SingletonStub:
+        kind = "closed_form"
+
+        def __init__(self, read_param: bool):
+            self._read_param = read_param
+
+        def run_many(self, cases):
+            out = []
+            for _prm, u, pk, _h, _s in cases:
+                x = float(u.attributes["x"])
+                on = int(pk.components.get("act", 0))
+                reads = ["n_groups"] if self._read_param else []
+                val = x * (1.0 - 0.5 * on)
+                out.append(Outcomes({"y": {"g0": val}}, {}, {},
+                                    meta={"age_shares": {"g0": 1.0}, "param_reads": {"build": reads, "read_outcomes": []}}))
+            return out
+
+    a6_sg_read = check_a6(_SingletonStub(True), b_sg, {}, np.random.default_rng(5), n_bases=3, min_moving=2, th=th_cd)
+    a6_sg_dead = check_a6(_SingletonStub(False), b_sg, {}, np.random.default_rng(5), n_bases=3, min_moving=2, th=th_cd)
+    ok(a6_sg_read["status"] == "pass" and a6_sg_dead["status"] == "fail"
+       and any("n_groups" in p and "dead parameter" in p for p in a6_sg_dead["problems"]),
+       f"BE_A6_SINGLETON_PARAM read singleton param passes A6 while unread fails as dead "
+       f"(read={a6_sg_read['status']}, dead={a6_sg_dead['status']}, probs={a6_sg_dead['problems'][:1]})")
 
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
